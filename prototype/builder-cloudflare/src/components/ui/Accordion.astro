@@ -1,0 +1,16 @@
+---
+interface Props {
+	class?: string;
+	label?: string;
+}
+
+const { class: className, label } = Astro.props;
+---
+
+<div
+	class:list={["divide-y divide-line", className]}
+	role={label ? "region" : undefined}
+	aria-label={label}
+>
+	<slot />
+</div>

@@ -1,0 +1,37 @@
+---
+interface Props {
+	id: string;
+	name: string;
+	class?: string;
+	rows?: number;
+	required?: boolean;
+	disabled?: boolean;
+	placeholder?: string;
+	describedBy?: string;
+}
+
+const {
+	id,
+	name,
+	class: className,
+	rows = 5,
+	required = false,
+	disabled = false,
+	placeholder,
+	describedBy,
+} = Astro.props;
+---
+
+<textarea
+	{id}
+	{name}
+	{rows}
+	{required}
+	{disabled}
+	{placeholder}
+	aria-describedby={describedBy}
+	class:list={[
+		"w-full rounded-md border border-line bg-surface px-3 py-2 text-ink placeholder:text-muted disabled:cursor-not-allowed disabled:opacity-60",
+		className,
+	]}
+></textarea>

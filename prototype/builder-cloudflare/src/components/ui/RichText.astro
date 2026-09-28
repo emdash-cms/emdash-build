@@ -1,0 +1,112 @@
+---
+import type { ComponentProps } from "astro/types";
+import { PortableText } from "emdash/ui";
+
+type Props = ComponentProps<typeof PortableText> & { class?: string };
+
+const { class: className, ...props } = Astro.props;
+---
+
+<div class:list={["rich-text", className]}>
+	<PortableText {...props} />
+</div>
+
+<style>
+	/*
+	 * Tailwind's reset removes heading sizes, list markers, and link styling.
+	 * These rules sit in Tailwind's `components` layer (order restated in case
+	 * this loads first): above the reset, below utilities and EmDash's own
+	 * block styles (images, galleries, code, tables, buttons). Spacing uses
+	 * descendant selectors so the inline editor gets it too.
+	 */
+	@layer theme, base, components, utilities;
+
+	@layer components {
+		.rich-text {
+			line-height: 1.75;
+		}
+
+		.rich-text :global(:is(p, ul, ol, blockquote)) {
+			margin-block: 0 1.25em;
+		}
+
+		.rich-text :global(:is(h1, h2, h3, h4, h5, h6)) {
+			margin-block: 1.75em 0.5em;
+			line-height: 1.25;
+			font-weight: 600;
+			letter-spacing: -0.01em;
+			text-wrap: balance;
+		}
+
+		.rich-text :global(h1) {
+			font-size: 2em;
+		}
+
+		.rich-text :global(h2) {
+			font-size: 1.5em;
+		}
+
+		.rich-text :global(h3) {
+			font-size: 1.25em;
+		}
+
+		.rich-text :global(h4) {
+			font-size: 1.1em;
+		}
+
+		.rich-text :global(:is(h5, h6)) {
+			font-size: 1em;
+		}
+
+		.rich-text :global(:is(h1, h2, h3, h4, h5, h6):first-child) {
+			margin-top: 0;
+		}
+
+		.rich-text :global(:is(p, ul, ol, blockquote):last-child) {
+			margin-bottom: 0;
+		}
+
+		.rich-text :global(:is(ul, ol)) {
+			padding-left: 1.5em;
+		}
+
+		.rich-text :global(ul) {
+			list-style-type: disc;
+		}
+
+		.rich-text :global(ol) {
+			list-style-type: decimal;
+		}
+
+		.rich-text :global(li + li) {
+			margin-top: 0.5em;
+		}
+
+		.rich-text :global(li > :is(ul, ol)) {
+			margin-block: 0.5em 0;
+		}
+
+		.rich-text :global(li::marker) {
+			color: var(--site-muted, color-mix(in srgb, currentColor 60%, transparent));
+		}
+
+		.rich-text :global(a) {
+			color: inherit;
+			text-decoration: underline;
+			text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+			text-underline-offset: 0.2em;
+		}
+
+		.rich-text :global(a:hover) {
+			text-decoration-color: currentColor;
+		}
+
+		/* EmDash's classed quotes (pull quotes) keep their own layout. */
+		.rich-text :global(blockquote:not([class])) {
+			border-left: 3px solid var(--site-line, color-mix(in srgb, currentColor 20%, transparent));
+			padding-left: 1.25em;
+			color: var(--site-muted, color-mix(in srgb, currentColor 70%, transparent));
+			font-style: italic;
+		}
+	}
+</style>

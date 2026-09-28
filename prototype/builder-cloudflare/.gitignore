@@ -1,0 +1,14 @@
+node_modules
+dist
+.astro
+.wrangler/state/v3/observability/
+.emdash/migrations.json
+uploads
+data.db
+
+# Environment / Wrangler secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*

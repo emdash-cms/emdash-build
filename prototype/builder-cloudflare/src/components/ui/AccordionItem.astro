@@ -1,0 +1,28 @@
+---
+interface Props {
+	title: string;
+	name?: string;
+	open?: boolean;
+	class?: string;
+}
+
+const { title, name, open = false, class: className } = Astro.props;
+---
+
+<details name={name} open={open} class:list={["group py-1", className]}>
+	<summary
+		class="flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 py-3 font-semibold text-ink marker:hidden [&::-webkit-details-marker]:hidden"
+	>
+		<span>{title}</span>
+		<svg
+			aria-hidden="true"
+			viewBox="0 0 20 20"
+			class="size-5 shrink-0 transition-transform group-open:rotate-180 motion-reduce:transition-none"
+		>
+			<path d="m5 7.5 5 5 5-5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75"></path>
+		</svg>
+	</summary>
+	<div class="pb-5 leading-7 text-muted">
+		<slot />
+	</div>
+</details>

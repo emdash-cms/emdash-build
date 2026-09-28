@@ -1,0 +1,7 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "emdash-build-fixture-placeholder",
+	"main": "./site.ts",
+	"compatibility_date": "2026-09-13",
+	"workers_dev": false,
+}

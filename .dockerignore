@@ -1,0 +1,11 @@
+.git
+.codex
+.agents
+node_modules
+dist
+.wrangler
+.dev.vars
+prototype/**/node_modules
+prototype/**/dist
+prototype/**/.astro
+prototype/**/.wrangler

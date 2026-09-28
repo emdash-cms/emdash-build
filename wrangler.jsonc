@@ -1,0 +1,235 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "emdash-build",
+	"account_id": "1f74638c495bc9f0330ce5c8e64c1b6b",
+	"compatibility_date": "2026-03-24",
+	"compatibility_flags": ["nodejs_compat", "enable_abortsignal_rpc"],
+	"main": "./src/worker/index.ts",
+	"observability": {
+		"enabled": true,
+	},
+	"workers_dev": true,
+	"preview_urls": true,
+	"assets": {
+		"directory": "./public",
+		"not_found_handling": "single-page-application",
+		"binding": "ASSETS",
+		"run_worker_first": true,
+	},
+	"containers": [
+		{
+			"class_name": "Sandbox",
+			"image": "./Dockerfile",
+			"instance_type": {
+				"vcpu": 4,
+				"memory_mib": 12288,
+				"disk_mb": 10240,
+			},
+			"max_instances": 10,
+		},
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "BuilderAgent",
+				"class_name": "BuilderAgent",
+			},
+			{
+				"name": "Sandbox",
+				"class_name": "Sandbox",
+			},
+			{
+				"name": "ProjectCatalog",
+				"class_name": "ProjectCatalog",
+			},
+			{
+				"name": "ProviderControlPlane",
+				"class_name": "ProviderControlPlane",
+			},
+			{
+				"name": "SiteService",
+				"class_name": "SiteService",
+			},
+		],
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["BuilderAgent", "Sandbox"],
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["ProjectCatalog"],
+		},
+		{
+			"tag": "v3",
+			"new_sqlite_classes": ["ProviderControlPlane"],
+		},
+		{
+			"tag": "v4",
+			"new_sqlite_classes": ["SiteService"],
+		},
+	],
+	"ai": {
+		"binding": "AI",
+		"remote": true,
+	},
+	// Session persistence: each session's site dir is snapshotted to its own
+	// Artifacts git repo (see BuilderAgent.backupSite/recoverSite).
+	"artifacts": [
+		{
+			"binding": "ARTIFACTS",
+			"namespace": "emdash-build",
+			"remote": true,
+		},
+	],
+	"d1_databases": [
+		{
+			"binding": "AUTH_DB",
+			"database_name": "emdash-build-auth",
+			"database_id": "926cce24-5820-4c9f-adb9-59f4f56ad7dd",
+			"preview_database_id": "20f40c6a-3fa5-498b-b09e-be6f0bbcf9cf",
+			"migrations_dir": "migrations",
+		},
+	],
+	"r2_buckets": [
+		{
+			"binding": "WFP_RELEASES",
+			"bucket_name": "emdash-build-wfp-releases",
+		},
+		{
+			"binding": "SITE_MEDIA",
+			"bucket_name": "emdash-build-wfp-site-rehearsal-media",
+		},
+	],
+	"dispatch_namespaces": [
+		{
+			"binding": "WFP_DISPATCHER",
+			"namespace": "emdash-build-prerelease",
+		},
+	],
+	"routes": [
+		{
+			"pattern": "build.emdashcms.com",
+			"zone_name": "emdashcms.com",
+			"custom_domain": true,
+		},
+		{
+			"pattern": "*.build.emdashcms.com/*",
+			"zone_name": "emdashcms.com",
+		},
+		{
+			"pattern": "*.em-da.sh/*",
+			"zone_name": "em-da.sh",
+		},
+	],
+	"vars": {
+		"APP_HOSTNAME": "build.emdashcms.com",
+		"IDENTITY_AUDIENCE": "a0d59c28e4db1654f375098da9065f7cf5757d976e517554265b826e895b6b25",
+		"IDENTITY_BROKER_URL": "https://build.emdashcms.com/api/auth/callback",
+		"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
+		"PREVIEW_HOSTNAME": "build.emdashcms.com",
+		"ENABLE_PUBLIC_PUBLISHING": "false",
+		"SITES_HOSTNAME": "build.emdashcms.com",
+		"BRANDED_SITES_HOSTNAME": "em-da.sh",
+		"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
+		"WFP_ACCOUNT_ID": "1f74638c495bc9f0330ce5c8e64c1b6b",
+	},
+	"secrets": {
+		"required": [
+			"UNSPLASH_ACCESS_KEY",
+			"AI_GATEWAY_TOKEN",
+			"AI_GATEWAY_ACCOUNT_ID",
+			"AI_GATEWAY_ID",
+			"WFP_API_TOKEN",
+		],
+	},
+	"previews": {
+		"observability": {
+			"enabled": true,
+		},
+		"containers": [
+			{
+				"class_name": "Sandbox",
+				"image": "./Dockerfile",
+				"instance_type": {
+					"vcpu": 4,
+					"memory_mib": 12288,
+					"disk_mb": 10240,
+				},
+				"max_instances": 10,
+			},
+		],
+		"durable_objects": {
+			"bindings": [
+				{
+					"name": "BuilderAgent",
+					"class_name": "BuilderAgent",
+				},
+				{
+					"name": "Sandbox",
+					"class_name": "Sandbox",
+				},
+				{
+					"name": "ProjectCatalog",
+					"class_name": "ProjectCatalog",
+				},
+				{
+					"name": "ProviderControlPlane",
+					"class_name": "ProviderControlPlane",
+				},
+				{
+					"name": "SiteService",
+					"class_name": "SiteService",
+				},
+			],
+		},
+		"ai": {
+			"binding": "AI",
+			"remote": true,
+		},
+		"artifacts": [
+			{
+				"binding": "ARTIFACTS",
+				"namespace": "emdash-build-preview",
+				"remote": true,
+			},
+		],
+		"d1_databases": [
+			{
+				"binding": "AUTH_DB",
+				"database_name": "emdash-build-preview-auth",
+				"database_id": "20f40c6a-3fa5-498b-b09e-be6f0bbcf9cf",
+				"migrations_dir": "migrations",
+			},
+		],
+		"r2_buckets": [
+			{
+				"binding": "WFP_RELEASES",
+				"bucket_name": "emdash-build-preview-wfp-releases",
+			},
+			{
+				"binding": "SITE_MEDIA",
+				"bucket_name": "emdash-build-preview-site-media",
+			},
+		],
+		"dispatch_namespaces": [
+			{
+				"binding": "WFP_DISPATCHER",
+				"namespace": "emdash-build-prerelease",
+			},
+		],
+		"vars": {
+			"APP_HOSTNAME": "build.emdashcms.com",
+			"IDENTITY_AUDIENCE": "a0d59c28e4db1654f375098da9065f7cf5757d976e517554265b826e895b6b25",
+			"IDENTITY_BROKER_URL": "request-origin",
+			"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
+			"PREVIEW_HOSTNAME": "build.emdashcms.com",
+			"ENABLE_PUBLIC_PUBLISHING": "false",
+			"SANDBOX_PREVIEW_MODE": "quick-tunnel",
+			"SITES_HOSTNAME": "build.emdashcms.com",
+			"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
+			"WFP_ACCOUNT_ID": "1f74638c495bc9f0330ce5c8e64c1b6b",
+		},
+	},
+}

@@ -1,0 +1,44 @@
+---
+import type { HTMLAttributes } from "astro/types";
+
+// Other attributes (data-dialog-trigger, target, rel, name, value, ...) pass through.
+type Props = Omit<HTMLAttributes<"a">, "type"> &
+	Omit<HTMLAttributes<"button">, "type"> & {
+		href?: string;
+		type?: "button" | "submit" | "reset";
+		variant?: "solid" | "outline" | "ghost";
+		ariaLabel?: string;
+		disabled?: boolean;
+	};
+
+const {
+	href,
+	type = "button",
+	variant = "solid",
+	class: className,
+	ariaLabel,
+	"aria-label": ariaLabelAttribute,
+	disabled = false,
+	...attrs
+} = Astro.props;
+const label = ariaLabel ?? ariaLabelAttribute;
+const classes = [
+	"inline-flex min-h-11 items-center justify-center gap-2 rounded-md px-5 py-2.5 text-sm font-semibold transition-colors focus-visible:outline focus-visible:outline-3 focus-visible:outline-offset-3 disabled:pointer-events-none disabled:opacity-50",
+	variant === "solid" && "bg-brand text-on-brand hover:opacity-90",
+	variant === "outline" && "border border-line bg-transparent text-ink hover:bg-surface",
+	variant === "ghost" && "bg-transparent text-ink hover:bg-surface",
+	className,
+];
+---
+
+{
+	href ? (
+		<a {...attrs} href={href} class:list={classes} aria-label={label}>
+			<slot />
+		</a>
+	) : (
+		<button {...attrs} type={type} class:list={classes} aria-label={label} disabled={disabled}>
+			<slot />
+		</button>
+	)
+}

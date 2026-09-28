@@ -1,0 +1,68 @@
+---
+interface Props {
+	id: string;
+	title: string;
+	description?: string;
+	class?: string;
+	closeLabel?: string;
+}
+
+const { id, title, description, class: className, closeLabel = "Close dialog" } = Astro.props;
+const titleId = `${id}-title`;
+const descriptionId = `${id}-description`;
+---
+
+<dialog
+	id={id}
+	data-ui-dialog
+	class:list={[
+		"m-auto w-[min(92vw,42rem)] rounded-xl border border-line bg-surface p-0 text-ink shadow-2xl backdrop:bg-black/55 open:block",
+		className,
+	]}
+	aria-labelledby={titleId}
+	aria-describedby={description ? descriptionId : undefined}
+>
+	<div class="relative p-6 sm:p-8">
+		<header class="pr-12">
+			<h2 id={titleId} class="text-2xl font-semibold tracking-tight">{title}</h2>
+			{description && <p id={descriptionId} class="mt-2 leading-7 text-muted">{description}</p>}
+		</header>
+		<div class="mt-6">
+			<slot />
+		</div>
+		<button
+			type="button"
+			data-dialog-close
+			class="absolute top-4 right-4 grid size-11 place-items-center rounded-md text-ink hover:bg-canvas"
+			aria-label={closeLabel}
+		>
+			<svg aria-hidden="true" viewBox="0 0 20 20" class="size-5">
+				<path d="m5 5 10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.75"></path>
+			</svg>
+		</button>
+	</div>
+</dialog>
+
+<script>
+	const initialiseDialogs = () => {
+		document.querySelectorAll<HTMLDialogElement>("dialog[data-ui-dialog][id]").forEach((dialog) => {
+			if (dialog.dataset.initialised === "true") return;
+			dialog.dataset.initialised = "true";
+			let trigger: HTMLElement | null = null;
+			document.querySelectorAll<HTMLElement>(`[data-dialog-trigger="${CSS.escape(dialog.id)}"]`).forEach((candidate) => {
+				candidate.addEventListener("click", () => {
+					trigger = candidate;
+					dialog.showModal();
+				});
+			});
+			dialog.querySelector<HTMLElement>("[data-dialog-close]")?.addEventListener("click", () => dialog.close());
+			dialog.addEventListener("click", (event) => {
+				if (event.target === dialog) dialog.close();
+			});
+			dialog.addEventListener("close", () => trigger?.focus());
+		});
+	};
+
+	initialiseDialogs();
+	document.addEventListener("astro:after-swap", initialiseDialogs);
+</script>

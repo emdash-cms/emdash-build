@@ -1,0 +1,19 @@
+{
+	"version": 3,
+	"providerId": "example-host",
+	"zoneName": "example.com",
+	"appHostname": "build.example.com",
+	"previewHostname": "preview.build.example.com",
+	"sitesHostname": "sites.example.com",
+	"artifactsNamespace": "example-emdash-build",
+	"dispatchNamespace": "example-emdash-production",
+	"accountId": "00000000000000000000000000000000",
+	"releaseBucketName": "example-emdash-wfp-releases",
+	"siteMediaBucketName": "example-emdash-site-media",
+	"sandboxMaxInstances": 10,
+	"identityBrokerUrl": "https://build.example.com/api/auth/callback",
+	"identityIssuer": "https://example.cloudflareaccess.com",
+	"identityAudience": "access-application-aud-tag",
+	"identityDatabaseName": "example-emdash-build-auth",
+	"identityDatabaseId": "11111111-1111-4111-8111-111111111111"
+}

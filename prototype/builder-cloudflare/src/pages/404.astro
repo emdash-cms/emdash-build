@@ -1,0 +1,17 @@
+---
+import SiteLayout from "../layouts/SiteLayout.astro";
+
+Astro.response.status = 404;
+---
+
+<SiteLayout title="Page not found" description="The page you were looking for does not exist.">
+	<section class="mx-auto max-w-3xl px-5 py-24 text-center">
+		<h1 class="text-3xl font-semibold tracking-tight sm:text-4xl">Page not found</h1>
+		<p class="mx-auto mt-4 max-w-xl leading-7 opacity-70">
+			The page you were looking for has moved or no longer exists.
+		</p>
+		<p class="mt-8">
+			<a href="/" class="font-semibold underline underline-offset-4">Go to the homepage</a>
+		</p>
+	</section>
+</SiteLayout>

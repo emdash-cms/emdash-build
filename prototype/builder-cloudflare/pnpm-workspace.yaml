@@ -1,0 +1,21 @@
+# Match the standalone EmDash templates' supply-chain policy.
+allowBuilds:
+  esbuild: true
+  workerd: true
+  sharp: false
+
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - emdash
+  - "@emdash-cms/*"
+  # PR cloudflare/workers-sdk#15574: ignore D1 WAL/SHM writes under .wrangler.
+  # Keep the exception scoped to the first fixed release and its exact,
+  # release-coupled Worker runtime dependencies.
+  - "@cloudflare/vite-plugin@1.54.9"
+  - "miniflare@5.20260911.1-alpha"
+  - "workerd@1.20260911.1"
+  - "wrangler@4.131.2"
+blockExoticSubdeps: true
+
+overrides:
+  "@cloudflare/vite-plugin": "1.54.9"

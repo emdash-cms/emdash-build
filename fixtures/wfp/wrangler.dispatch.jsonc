@@ -1,0 +1,39 @@
+{
+	"$schema": "../../node_modules/wrangler/config-schema.json",
+	"name": "s-000000000000400080000000000000a1",
+	"main": "./dispatch-entry.ts",
+	"compatibility_date": "2026-09-13",
+	"workers_dev": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SiteService",
+				"class_name": "SiteService",
+			},
+		],
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["SiteService"],
+		},
+	],
+	"r2_buckets": [
+		{
+			"binding": "SITE_MEDIA",
+			"bucket_name": "emdash-build-wfp-site-rehearsal-media",
+		},
+	],
+	"dispatch_namespaces": [
+		{
+			"binding": "DISPATCHER",
+			"namespace": "emdash-build-prerelease",
+		},
+	],
+	"vars": {
+		"SITES_HOSTNAME": "emdash-cms.workers.dev",
+	},
+	"observability": {
+		"enabled": true,
+	},
+}

@@ -1,0 +1,25 @@
+{
+	"stargazing": {
+		"prompt": "Build a concise marketing site for Acme Observatory, a community stargazing club in Bristol. Use a dark navy palette, a bright amber accent, an events section, and a friendly call to action to join the next observing night.",
+		"answer": "Use a welcoming, practical science-club direction with clear event discovery. Include upcoming observing nights grouped by date, a short club introduction, membership information, and a contact page. Keep any unsupplied venue or contact details as clearly editable placeholders rather than facts.",
+		"followUp": "Make the site header stay visible at the top while scrolling, and change the main call to action to \"Join our next night\".",
+		"followUpExpect": "Join our next night"
+	},
+	"bakery": {
+		"prompt": "Build the website for Crumb & Crust, an independent sourdough bakery at 14 Cheapside, Bristol BS2 8JD, open Wednesday to Sunday 8am-3pm. It sells a small daily menu: country sourdough loaf £5.00, seeded rye £5.50, cardamom bun £3.20, and a seasonal fruit tart £4.50. The audience is local neighbours and weekend visitors; the site should drive them to see today's menu and visit the shop, with a secondary action to order a celebration cake by email at hello@crumbandcrust.test. Include a short story about the bakers and their slow fermentation. The feel is warm, handmade and unfussy, on a light background. No brand assets exist, so choose fitting typography and photography. Placeholder content is fine where I have not given details.",
+		"answer": "Build it as described. Keep the menu and opening hours easy to update, and use clearly editable placeholders for anything I did not supply.",
+		"followUp": "The country sourdough loaf now costs £5.20. Please update the price on the site.",
+		"followUpExpect": "5.20"
+	},
+	"editorial": {
+		"prompt": "Create a site for Field Notes, an independent online magazine about urban ecology in Manchester. It publishes long-form stories by a small group of writers, organised into sections such as Birds, Green Spaces and Waterways. Readers browse sections at /stories?section=<slug>, read stories at /stories/<slug>, explore an author's other work, and sign up to a monthly newsletter.",
+		"answer": "The tone is thoughtful and literary, with generous reading typography and strong photography. Start with six sample stories across the three sections and three authors. Include a story titled Canal Wildlife at /stories/canal-wildlife in Waterways. Placeholder content is fine, but do not invent quotes from real people.",
+		"followUp": "Add a new section called Brookwatch, move Canal Wildlife from Waterways into it, and make it browsable at /stories?section=brookwatch.",
+		"followUpExpect": "Brookwatch",
+		"followUpStoryMove": {
+			"storyPath": "/stories/canal-wildlife",
+			"from": "/stories?section=waterways",
+			"to": "/stories?section=brookwatch"
+		}
+	}
+}

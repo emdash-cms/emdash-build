@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.dev-ca/*.pem
+provider.config.json
+wrangler.provider.jsonc
+reference
+
+# Local implementation specifications
+.tech-specs/

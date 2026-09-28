@@ -1,0 +1,66 @@
+---
+import { getMenu, getSiteSettings } from "emdash";
+import { EmDashBodyEnd, EmDashBodyStart, EmDashHead } from "emdash/ui";
+import { createPublicPageContext } from "emdash/page";
+import SkipLink from "../components/ui/SkipLink.astro";
+import "../styles/global.css";
+
+interface Props {
+	title?: string;
+	description?: string;
+	image?: string;
+	content?: { collection: string; id: string; slug?: string | null };
+}
+
+const { title, description, image, content } = Astro.props;
+const settings = await getSiteSettings();
+const menu = await getMenu("primary");
+const siteTitle = settings.title || "New EmDash site";
+const pageTitle = title || siteTitle;
+const documentTitle = title && title !== siteTitle ? `${title} — ${siteTitle}` : siteTitle;
+const pageCtx = createPublicPageContext({
+	Astro,
+	kind: content ? "content" : "custom",
+	pageType: "website",
+	title: documentTitle,
+	pageTitle,
+	description,
+	image,
+	content,
+});
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{documentTitle}</title>
+		{description && <meta name="description" content={description} />}
+		<EmDashHead page={pageCtx} />
+	</head>
+	<body>
+		<EmDashBodyStart page={pageCtx} />
+		<SkipLink href="#main-content">Skip to content</SkipLink>
+		<header class="border-b border-line bg-canvas">
+			<div class="mx-auto flex max-w-6xl items-center justify-between gap-6 px-5 py-4">
+				<a href="/" class="font-semibold tracking-tight text-ink">{siteTitle}</a>
+				{
+					menu?.items?.length ? (
+						<nav aria-label="Primary navigation">
+							<ul class="flex list-none flex-wrap items-center gap-5 p-0 text-sm">
+								{menu.items.map((item) => (
+									<li><a class="text-ink underline-offset-4 hover:underline" href={item.url}>{item.label}</a></li>
+								))}
+							</ul>
+						</nav>
+					) : null
+				}
+			</div>
+		</header>
+		<main id="main-content">
+			<slot />
+		</main>
+		<EmDashBodyEnd page={pageCtx} />
+	</body>
+</html>

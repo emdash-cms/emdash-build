@@ -1,0 +1,20 @@
+{
+	"$schema": "https://emdashcms.com/seed.schema.json",
+	"version": "1",
+	"meta": {
+		"name": "EmDash Builder Canvas",
+		"description": "An intentionally empty schema for agent-designed sites",
+		"author": "EmDash"
+	},
+	"settings": {
+		"title": "New EmDash site",
+		"tagline": "Designed from your brief"
+	},
+	"collections": [],
+	"taxonomies": [],
+	"menus": [],
+	"widgetAreas": [],
+	"sections": [],
+	"bylines": [],
+	"content": {}
+}

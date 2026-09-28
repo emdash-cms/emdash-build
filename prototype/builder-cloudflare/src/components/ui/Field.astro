@@ -1,0 +1,18 @@
+---
+interface Props {
+	for: string;
+	label: string;
+	hint?: string;
+	error?: string;
+	class?: string;
+}
+
+const { for: controlId, label, hint, error, class: className } = Astro.props;
+---
+
+<div class:list={["grid gap-2", className]}>
+	<label for={controlId} class="text-sm font-semibold text-ink">{label}</label>
+	{hint && <p id={`${controlId}-hint`} class="text-sm text-muted">{hint}</p>}
+	<slot />
+	{error && <p id={`${controlId}-error`} class="text-sm font-medium text-red-700" role="alert">{error}</p>}
+</div>

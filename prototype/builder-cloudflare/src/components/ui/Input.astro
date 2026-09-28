@@ -1,0 +1,40 @@
+---
+interface Props {
+	id: string;
+	name: string;
+	type?: "text" | "email" | "tel" | "url" | "number" | "search" | "password" | "date" | "time";
+	class?: string;
+	required?: boolean;
+	disabled?: boolean;
+	autocomplete?: string;
+	placeholder?: string;
+	describedBy?: string;
+}
+
+const {
+	id,
+	name,
+	type = "text",
+	class: className,
+	required = false,
+	disabled = false,
+	autocomplete,
+	placeholder,
+	describedBy,
+} = Astro.props;
+---
+
+<input
+	{id}
+	{name}
+	{type}
+	{required}
+	{disabled}
+	{autocomplete}
+	{placeholder}
+	aria-describedby={describedBy}
+	class:list={[
+		"min-h-11 w-full rounded-md border border-line bg-surface px-3 py-2 text-ink placeholder:text-muted disabled:cursor-not-allowed disabled:opacity-60",
+		className,
+	]}
+/>

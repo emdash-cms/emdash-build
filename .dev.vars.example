@@ -1,0 +1,7 @@
+# Required. Configure an AI Gateway with access to the builder model.
+AI_GATEWAY_ACCOUNT_ID=
+AI_GATEWAY_ID=
+AI_GATEWAY_TOKEN=
+
+# Optional. Obtain a key from Unsplash if media search is needed.
+UNSPLASH_ACCESS_KEY=
