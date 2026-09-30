@@ -122,7 +122,9 @@ import {
 } from "./build-convergence.js";
 import {
 	BUILDER_MODEL_ID,
-	BUILDER_PROVIDER_OPTIONS,
+	BUILDER_REASONING_EFFORT,
+	buildStepProviderOptions,
+	builderProviderOptions,
 	createBuilderModel,
 	requestedReasoningEffort,
 } from "./model.js";
@@ -5962,7 +5964,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									].join("\n"),
 									prompt: `Title: ${entry.title}\n\nWrite about: ${entry.brief}`,
 									maxOutputTokens: 2048,
-									providerOptions: BUILDER_PROVIDER_OPTIONS,
+									providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.entryBody, {
+										reasoningSummary: false,
+									}),
 								});
 								metrics?.addSubcall(usage);
 								const body = text.trim();
@@ -6503,7 +6507,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					: [hasToolCall("ask_questions"), stepCountIs(2)],
 				maxRetries: 5,
 				maxOutputTokens: 8192,
-				providerOptions: BUILDER_PROVIDER_OPTIONS,
+				providerOptions: builderProviderOptions(
+					alreadyInterviewed
+						? BUILDER_REASONING_EFFORT.holding
+						: BUILDER_REASONING_EFFORT.interview,
+				),
 				abortSignal,
 				experimental_onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
@@ -6718,9 +6726,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				// turn. Keep text and tool history intact; prepareStep only drops
 				// superseded screenshot bytes. Interview turns are capped at 2.
 				stopWhen: stepCountIs(BUILD_STEP_CAP),
-				prepareStep: ({ messages }) => {
-					return prepareBuildStep(convergence, messages, buildToolNames);
-				},
+				prepareStep: ({ messages, stepNumber }) => ({
+					...prepareBuildStep(convergence, messages, buildToolNames),
+					providerOptions: buildStepProviderOptions({
+						initialBuild: tracksInitialBuild,
+						stepNumber,
+					}),
+				}),
 				experimental_onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
 				onStepFinish: (step) => {
@@ -6749,7 +6761,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 				maxRetries: 5,
 				maxOutputTokens: 32768,
-				providerOptions: BUILDER_PROVIDER_OPTIONS,
+				// prepareStep sets each step's effort over these options.
+				providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.build),
 				abortSignal: buildAbortSignal,
 				onChunk: ({ chunk }) => {
 					this.touchBuildActivity();

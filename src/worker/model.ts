@@ -2,14 +2,60 @@ import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/opena
 
 export const BUILDER_MODEL_ID = "openai/gpt-5.6-luna";
 
-export const BUILDER_PROVIDER_OPTIONS = {
-	openai: {
-		forceReasoning: true,
-		reasoningEffort: "high",
-		reasoningSummary: "auto",
-		store: false,
-	} satisfies OpenAIResponsesProviderOptions,
-};
+export type BuilderReasoningEffort = "low" | "medium" | "high";
+
+/**
+ * Reasoning effort by phase. At high effort Luna thinks for several seconds
+ * before every step's first answer token, and a build runs dozens of steps in
+ * sequence, so high effort is spent only where one step's decisions shape the
+ * rest of the turn.
+ */
+export const BUILDER_REASONING_EFFORT = {
+	/** Choosing questions that change the content model; the user waits on them. */
+	interview: "medium",
+	/** A one-sentence acknowledgement while setup continues. */
+	holding: "low",
+	/** The first step of a first build plans the content model, design and schema. */
+	plan: "high",
+	/** Later first-build steps: authoring, content, and validation fixes. */
+	build: "medium",
+	followUp: "medium",
+	/** Drafting entry bodies inside create_entries_batch. */
+	entryBody: "low",
+} as const satisfies Record<string, BuilderReasoningEffort>;
+
+export function builderProviderOptions(
+	effort: BuilderReasoningEffort,
+	{ reasoningSummary = true }: { reasoningSummary?: boolean } = {},
+) {
+	return {
+		openai: {
+			forceReasoning: true,
+			reasoningEffort: effort,
+			...(reasoningSummary ? { reasoningSummary: "auto" } : {}),
+			store: false,
+		} satisfies OpenAIResponsesProviderOptions,
+	};
+}
+
+/**
+ * Effort for one build step. Changing effort changes the cached prompt prefix,
+ * so a first-build turn switches once, after its first step, rather than per
+ * step. A resumed first build plans again: its first step may still face an
+ * unplanned site.
+ */
+export function buildStepReasoningEffort(step: {
+	initialBuild: boolean;
+	stepNumber: number;
+}): BuilderReasoningEffort {
+	if (!step.initialBuild) return BUILDER_REASONING_EFFORT.followUp;
+	return step.stepNumber === 0 ? BUILDER_REASONING_EFFORT.plan : BUILDER_REASONING_EFFORT.build;
+}
+
+/** A build step's provider options, merged by the SDK over the turn's base options. */
+export function buildStepProviderOptions(step: { initialBuild: boolean; stepNumber: number }) {
+	return { openai: { reasoningEffort: buildStepReasoningEffort(step) } };
+}
 
 type GatewayEnv = Pick<Env, "AI_GATEWAY_TOKEN" | "AI_GATEWAY_ACCOUNT_ID" | "AI_GATEWAY_ID">;
 

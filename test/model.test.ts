@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { stepCountIs, streamText, tool } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
+import { z } from "zod";
 import {
 	BUILDER_MODEL_ID,
-	BUILDER_PROVIDER_OPTIONS,
+	BUILDER_REASONING_EFFORT,
+	buildStepProviderOptions,
+	buildStepReasoningEffort,
+	builderProviderOptions,
 	createBuilderModel,
 } from "../src/worker/model.js";
 
@@ -10,6 +16,16 @@ const env = {
 	AI_GATEWAY_ACCOUNT_ID: "account",
 	AI_GATEWAY_ID: "gateway",
 };
+
+function streamOf(parts: Array<Record<string, unknown>>) {
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue({ type: "stream-start", warnings: [] });
+			for (const part of parts) controller.enqueue(part);
+			controller.close();
+		},
+	});
+}
 
 function completedResponse() {
 	return new Response(
@@ -35,16 +51,86 @@ function completedResponse() {
 }
 
 describe("builder model configuration", () => {
-	it("uses Luna high without stored response references", () => {
+	it("uses Luna without stored response references", () => {
 		expect(BUILDER_MODEL_ID).toBe("openai/gpt-5.6-luna");
-		expect(BUILDER_PROVIDER_OPTIONS).toEqual({
+		expect(builderProviderOptions("medium")).toEqual({
 			openai: {
 				forceReasoning: true,
-				reasoningEffort: "high",
+				reasoningEffort: "medium",
 				reasoningSummary: "auto",
 				store: false,
 			},
 		});
+		// Nobody reads a sub-call's reasoning, so it asks for no summary.
+		expect(builderProviderOptions("low", { reasoningSummary: false })).toEqual({
+			openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+		});
+	});
+
+	it("spends high effort only where a step shapes the rest of the build", () => {
+		expect(BUILDER_REASONING_EFFORT).toEqual({
+			interview: "medium",
+			holding: "low",
+			plan: "high",
+			build: "medium",
+			followUp: "medium",
+			entryBody: "low",
+		});
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 0 })).toBe("high");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 1 })).toBe("medium");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 40 })).toBe("medium");
+		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 0 })).toBe("medium");
+		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 3 })).toBe("medium");
+	});
+
+	it("applies a per-step effort through prepareStep", async () => {
+		const sent: unknown[] = [];
+		let call = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async (options) => {
+				sent.push(options.providerOptions?.openai);
+				const first = call++ === 0;
+				return {
+					stream: streamOf([
+						...(first
+							? [{ type: "tool-call", toolCallId: "1", toolName: "noop", input: "{}" }]
+							: [
+									{ type: "text-start", id: "t" },
+									{ type: "text-delta", id: "t", delta: "Done." },
+									{ type: "text-end", id: "t" },
+								]),
+						{
+							type: "finish",
+							finishReason: first
+								? { unified: "tool-calls", raw: "tool_calls" }
+								: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 1, text: 1, reasoning: 0 },
+							},
+						},
+					]),
+				};
+			},
+		});
+		const result = streamText({
+			model,
+			prompt: "Build",
+			tools: { noop: tool({ inputSchema: z.object({}), execute: async () => ({}) }) },
+			stopWhen: stepCountIs(3),
+			providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.build),
+			prepareStep: ({ stepNumber }) => ({
+				providerOptions: buildStepProviderOptions({ initialBuild: true, stepNumber }),
+			}),
+		});
+		await result.consumeStream();
+
+		// The step's effort replaces the base effort and keeps every other option.
+		const base = { forceReasoning: true, reasoningSummary: "auto", store: false };
+		expect(sent).toEqual([
+			{ ...base, reasoningEffort: "high" },
+			{ ...base, reasoningEffort: "medium" },
+		]);
 	});
 
 	it("reports every model response status and tags gateway requests", async () => {
