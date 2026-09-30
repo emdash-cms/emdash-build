@@ -254,6 +254,7 @@ const BUILDER_TEMPLATE_DIR = "builder-cloudflare";
 const SNAPSHOT_PATH = "/tmp/emdash-build-session-snapshot";
 const PUBLISH_PATH = "/tmp/emdash-build-publish";
 const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
+const SNAPSHOT_PUSH_SESSION_ID = "builder-snapshot-push";
 const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
@@ -413,6 +414,13 @@ async function withBuildMutation<T>(
 	cacheResult: (result: T) => boolean = () => true,
 ): Promise<T> {
 	return convergence.runMutation(operation, { key, cacheResult });
+}
+
+interface BackupOptions {
+	quiet?: boolean;
+	skipIfUnchanged?: boolean;
+	/** Return once the snapshot is committed; upload it in the background. */
+	background?: boolean;
 }
 
 interface SiteRecoveryResult {
@@ -1469,6 +1477,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Serialize checkpoints so every caller waits for a snapshot containing its mutation. */
 	private backupChain: Promise<void> = Promise.resolve();
+	/** The latest committed snapshot and the preview generation it was staged at. */
+	private committedSnapshot?: { seq: number; generation: number | undefined };
+	private pushedSnapshotSeq = 0;
+	private pushTail: Promise<void> = Promise.resolve();
+	/** The committed snapshot a later checkpoint failed after; uploads up to it do not clear the error. */
+	private unsavedAfterSeq?: number;
 	private deletionPromise?: Promise<"deleted" | "retry">;
 	private backupRetryAfter = 0;
 	private lastSavedPreviewGeneration?: number;
@@ -1979,6 +1993,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		this.deletionPromise ??= (async () => {
 			await this.backupChain;
+			await this.pushTail;
 			try {
 				await this.eraseProjectData();
 				return "deleted" as const;
@@ -3396,15 +3411,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * short-lived, repo-scoped write token. Resolves to the redacted failure
 	 * message when the backup failed (it is also kept as `persistenceError`).
 	 */
-	private backupSite(
-		options: { quiet?: boolean; skipIfUnchanged?: boolean } = {},
-	): Promise<string | undefined> {
+	private backupSite(options: BackupOptions = {}): Promise<string | undefined> {
 		return this.enqueueBackupSite(options);
 	}
 
-	private enqueueBackupSite(
-		options: { quiet?: boolean; skipIfUnchanged?: boolean } = {},
-	): Promise<string | undefined> {
+	/**
+	 * The checkpoint after a mutating tool: the snapshot is staged and committed
+	 * before the tool returns, and uploaded in the background while the model
+	 * thinks. The turn's final save waits for the upload.
+	 */
+	private checkpointSite(): Promise<string | undefined> {
+		return this.backupSite({ quiet: true, background: true });
+	}
+
+	private enqueueBackupSite(options: BackupOptions = {}): Promise<string | undefined> {
 		const queued = this.backupChain.then(() => this.performBackupSite(options));
 		this.backupChain = queued.then(
 			() => {},
@@ -3416,12 +3436,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async performBackupSite({
 		quiet = false,
 		skipIfUnchanged = false,
-	}: {
-		quiet?: boolean;
-		skipIfUnchanged?: boolean;
-	}): Promise<string | undefined> {
+		background = false,
+	}: BackupOptions): Promise<string | undefined> {
 		if (this.isDeletionPending()) return;
 		if (!this.state.siteReady || (quiet && Date.now() < this.backupRetryAfter)) return;
+		// A waited save judges "unchanged" against what has actually been uploaded.
+		if (!background) await this.pushTail;
 		const sandbox = this.getOrCreateSandbox();
 		const previewGeneration = await this.env.Sandbox.getByName(this.name)
 			.getPreviewGeneration()
@@ -3438,86 +3458,138 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		if (!quiet) this.sendStatus("Saving session...");
 		try {
-			const { remote, token } = await this.writableArtifactsRepo();
-			// Git must never scan the live Vite/SQLite tree: files can change beneath
-			// its object reader and produce an unusable snapshot. Copy at a completed
-			// tool/turn boundary, then commit only the stable staging tree.
-			let staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
-				timeout: 120000,
-			});
-			if (!staged.success) {
-				this.sendConsole("Session snapshot staging was interrupted; retrying once...");
-				await new Promise((resolve) => setTimeout(resolve, 250));
-				staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
+			try {
+				// Git must never scan the live Vite/SQLite tree: files can change beneath
+				// its object reader and produce an unusable snapshot. Copy at a completed
+				// tool/turn boundary, then commit only the stable staging tree.
+				let staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
 					timeout: 120000,
 				});
-			}
-			if (!staged.success) {
-				throw new Error(staged.stderr || staged.stdout || "session staging copy failed");
-			}
-			const commit = snapshotCommitCommand({
-				snapshotPath: SNAPSHOT_PATH,
-				gitDir: SNAPSHOT_GIT_DIR,
-				message: `session snapshot ${new Date().toISOString()}`,
-				name: ARTIFACTS_GIT_USER,
-				email: ARTIFACTS_GIT_EMAIL,
-			});
-			let committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
-			if (!committed.success) {
-				// A damaged snapshot repository costs only one full upload to rebuild.
-				this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
-				await sandbox
-					.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000 })
-					.catch(() => undefined);
-				committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
-			}
-			if (!committed.success) {
-				throw new Error(committed.stderr || committed.stdout || "session snapshot commit failed");
-			}
-			const push = snapshotPushCommand({
-				gitDir: SNAPSHOT_GIT_DIR,
-				remote,
-				timeoutSeconds: SNAPSHOT_PUSH_TIMEOUT_SECONDS,
-			});
-			let result = await sandbox.exec(push, {
-				cwd: SNAPSHOT_PATH,
-				timeout: 65_000,
-				env: artifactsGitEnv(token),
-			});
-			if (!result.success && isTransientSnapshotPushFailure(result)) {
-				this.sendConsole("Session snapshot upload was interrupted; retrying once...");
-				await new Promise((resolve) => setTimeout(resolve, 1000));
-				result = await sandbox.exec(push, {
-					cwd: SNAPSHOT_PATH,
-					timeout: 65_000,
-					env: artifactsGitEnv(token),
+				if (!staged.success) {
+					this.sendConsole("Session snapshot staging was interrupted; retrying once...");
+					await new Promise((resolve) => setTimeout(resolve, 250));
+					staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
+						timeout: 120000,
+					});
+				}
+				if (!staged.success) {
+					throw new Error(staged.stderr || staged.stdout || "session staging copy failed");
+				}
+				const commit = snapshotCommitCommand({
+					snapshotPath: SNAPSHOT_PATH,
+					gitDir: SNAPSHOT_GIT_DIR,
+					message: `session snapshot ${new Date().toISOString()}`,
+					name: ARTIFACTS_GIT_USER,
+					email: ARTIFACTS_GIT_EMAIL,
 				});
+				let committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+				if (!committed.success) {
+					// A damaged snapshot repository costs only one full upload to rebuild.
+					this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
+					await sandbox
+						.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000 })
+						.catch(() => undefined);
+					committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+				}
+				if (!committed.success) {
+					throw new Error(committed.stderr || committed.stdout || "session snapshot commit failed");
+				}
+			} catch (err) {
+				// Uploads of earlier snapshots must not report this one as saved.
+				this.unsavedAfterSeq = this.committedSnapshot?.seq ?? 0;
+				return this.recordBackupFailure(err);
 			}
-			if (!result.success) {
-				// A rejected token must not be reused for the next checkpoint.
-				this.artifactsWriteAccess = undefined;
-				throw new Error(
-					result.exitCode === 124
-						? "Session snapshot upload timed out."
-						: redactArtifactsToken(result.stderr || result.stdout || "git push failed"),
-				);
+			this.committedSnapshot = {
+				seq: (this.committedSnapshot?.seq ?? 0) + 1,
+				generation: previewGeneration,
+			};
+			const pushed = this.pushLatestSnapshot(quiet);
+			if (background) return;
+			return await pushed;
+		} finally {
+			if (!quiet) this.sendStatus("");
+		}
+	}
+
+	/**
+	 * Upload the latest committed snapshot. Uploads run one at a time, so an
+	 * older snapshot never lands after a newer one, and a queued upload that
+	 * finds its snapshot already sent returns at once.
+	 */
+	private pushLatestSnapshot(quiet: boolean): Promise<string | undefined> {
+		const run = this.pushTail.then(async () => {
+			const target = this.committedSnapshot;
+			if (!target || target.seq <= this.pushedSnapshotSeq) return undefined;
+			try {
+				const { remote, token } = await this.writableArtifactsRepo();
+				const push = snapshotPushCommand({
+					gitDir: SNAPSHOT_GIT_DIR,
+					remote,
+					timeoutSeconds: SNAPSHOT_PUSH_TIMEOUT_SECONDS,
+				});
+				// Not the staging copy: the next checkpoint may be rebuilding it.
+				const options = { cwd: "/tmp", timeout: 65_000, env: artifactsGitEnv(token) };
+				let result = await this.execSnapshotPush(push, options);
+				if (!result.success && isTransientSnapshotPushFailure(result)) {
+					this.sendConsole("Session snapshot upload was interrupted; retrying once...");
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+					result = await this.execSnapshotPush(push, options);
+				}
+				if (!result.success) {
+					// A rejected token must not be reused for the next checkpoint.
+					this.artifactsWriteAccess = undefined;
+					throw new Error(
+						result.exitCode === 124
+							? "Session snapshot upload timed out."
+							: redactArtifactsToken(result.stderr || result.stdout || "git push failed"),
+					);
+				}
+			} catch (err) {
+				return this.recordBackupFailure(err);
 			}
+			this.pushedSnapshotSeq = target.seq;
+			this.lastSavedPreviewGeneration = target.generation;
+			// A later checkpoint failed before it could be committed; it is still unsaved.
+			if (this.unsavedAfterSeq !== undefined && target.seq <= this.unsavedAfterSeq) {
+				return undefined;
+			}
+			this.unsavedAfterSeq = undefined;
 			this.backupRetryAfter = 0;
-			this.lastSavedPreviewGeneration = previewGeneration;
 			if (!quiet) this.sendConsole("Session saved.");
 			if (this.state.persistenceError) {
 				this.setState({ ...this.state, persistenceError: undefined });
 			}
-		} catch (err) {
-			this.backupRetryAfter = Date.now() + BACKUP_FAILURE_COOLDOWN_MS;
-			const detail = redactArtifactsToken(err instanceof Error ? err.message : String(err));
-			const message = "The latest session checkpoint could not be saved.";
-			this.sendConsole(`Warning: session backup failed: ${detail}`);
-			this.setState({ ...this.state, persistenceError: message });
-			return message;
-		} finally {
-			if (!quiet) this.sendStatus("");
-		}
+			return undefined;
+		});
+		this.pushTail = run.then(
+			() => {},
+			() => {},
+		);
+		return run;
+	}
+
+	/**
+	 * Uploads run in their own sandbox session: a command in the default
+	 * session waits for the one before it, and an upload can take seconds.
+	 */
+	private async execSnapshotPush(
+		command: string,
+		options: { cwd: string; timeout: number; env: Record<string, string> },
+	) {
+		const sandbox = this.getOrCreateSandbox();
+		if (typeof sandbox.createSession !== "function") return sandbox.exec(command, options);
+		// Looked up each time: a restarted container does not keep its sessions.
+		const session = await this.getOrCreateProcessSession(sandbox, SNAPSHOT_PUSH_SESSION_ID);
+		return session.exec(command, options);
+	}
+
+	private recordBackupFailure(err: unknown): string {
+		this.backupRetryAfter = Date.now() + BACKUP_FAILURE_COOLDOWN_MS;
+		const detail = redactArtifactsToken(err instanceof Error ? err.message : String(err));
+		const message = "The latest session checkpoint could not be saved.";
+		this.sendConsole(`Warning: session backup failed: ${detail}`);
+		this.setState({ ...this.state, persistenceError: message });
+		return message;
 	}
 
 	private async prepareStaticSiteSnapshot(
@@ -4831,7 +4903,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								},
 								finish: async () => {
 									await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await timeSync(metrics, "backup", () => this.checkpointSite());
 								},
 								abortSignal,
 								ambiguousCode: /CONFLICT/,
@@ -4861,7 +4933,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							if (entityFailureKey) convergence.resolveUnresolvedFailure(entityFailureKey);
 							if (MUTATING_MCP_TOOLS.has(t.name)) {
 								await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-								await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+								await timeSync(metrics, "backup", () => this.checkpointSite());
 							}
 							return result;
 						}
@@ -5014,7 +5086,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
 								}
 								if (confirmedChanged() || mutationDispatched || ambiguousCommit) {
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await timeSync(metrics, "backup", () => this.checkpointSite());
 								}
 								checkpointed = true;
 							};
@@ -5382,7 +5454,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			(outcome.status === "toolError" && options.ambiguousCode.test(outcome.text));
 		const committed = outcome.status === "ok";
 		if (options.abortSignal?.aborted) {
-			if (committed || ambiguous) await this.backupSite({ quiet: true });
+			if (committed || ambiguous) await this.checkpointSite();
 			options.abortSignal.throwIfAborted();
 		}
 
@@ -5394,12 +5466,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				response = await options.reconcile();
 				reconciled = response !== undefined;
 			} catch (error) {
-				if (committed || ambiguous) await this.backupSite({ quiet: true });
+				if (committed || ambiguous) await this.checkpointSite();
 				throw error;
 			}
 		}
 		if (!response) {
-			if (committed || ambiguous) await this.backupSite({ quiet: true });
+			if (committed || ambiguous) await this.checkpointSite();
 			const detail =
 				outcome.status === "toolError" || outcome.status === "thrown"
 					? outcome.text
@@ -5422,7 +5494,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const result: Record<string, unknown> = {};
 		const finishMutation = async () => {
 			await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-			await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+			await timeSync(metrics, "backup", () => this.checkpointSite());
 		};
 		const reject = (error: string) => ({
 			changed: false as const,
@@ -6161,7 +6233,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								publishing.set("Saving...");
 								await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
 								if (results.some((result) => result.ok)) {
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await timeSync(metrics, "backup", () => this.checkpointSite());
 								}
 							};
 							for (const [index, d] of drafted.entries()) {
@@ -6746,7 +6818,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							this.refreshAndReloadPreview(tracksInitialBuild),
 						),
 					checkpointSite: async () => {
-						await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+						await timeSync(metrics, "backup", () => this.checkpointSite());
 					},
 					restartDevServer: () => this.restartDevServer(metrics),
 					getRecentRenderErrors: () =>
