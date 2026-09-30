@@ -203,11 +203,11 @@ describe("dependencies for a restored site", () => {
 			}));
 			const installDeps = vi.fn(async () => 0);
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => unknown;
+				sandboxOps: () => unknown;
 				installDeps: typeof installDeps;
 				restoreDependencies: () => Promise<number>;
 			};
-			harness.getOrCreateSandbox = () => ({ exec });
+			harness.sandboxOps = () => ({ exec });
 			harness.installDeps = installDeps;
 
 			await expect(harness.restoreDependencies()).resolves.toBe(0);

@@ -36,7 +36,7 @@ function validatingSandbox(
 ) {
 	return {
 		exec,
-		containerFetch: vi.fn(
+		fetchPort: vi.fn(
 			async () =>
 				new Response(body, {
 					status: 200,
@@ -74,7 +74,7 @@ describe("unchanged final checks", () => {
 		const types = `export interface PageLayoutHeroV1Block { _type: "hero"; _version: 1; _key: string; }
 declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLayoutHeroV1Block[] } } }`;
 		const sandbox = {
-			containerFetch: vi.fn(
+			fetchPort: vi.fn(
 				async () =>
 					new Response(types, {
 						status: 200,
@@ -94,10 +94,10 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			generatedFile: "emdash-env.d.ts",
 			declarations: types,
 		});
-		expect(sandbox.containerFetch).toHaveBeenCalledWith(
+		expect(sandbox.fetchPort).toHaveBeenCalledWith(
+			4321,
 			"http://localhost:4321/_emdash/api/typegen",
 			{ redirect: "manual" },
-			4321,
 		);
 		expect(sandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 		expect(sandbox.exec).not.toHaveBeenCalled();
@@ -107,7 +107,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	it("shortens very large declarations and points at the file for the rest", async () => {
 		const types = `declare module "emdash" {}\n${"// generated\n".repeat(10_000)}`;
 		const sandbox = {
-			containerFetch: vi.fn(async () => new Response(types, { status: 200 })),
+			fetchPort: vi.fn(async () => new Response(types, { status: 200 })),
 			writeFile: vi.fn(async () => ({ success: true })),
 			exec: vi.fn(),
 		};
@@ -125,7 +125,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	it("reports legacy typegen fallback and never checkpoints a failed refresh", async () => {
 		const checkpointSite = vi.fn(async () => {});
 		const sandbox = {
-			containerFetch: vi
+			fetchPort: vi
 				.fn()
 				.mockResolvedValueOnce(new Response("Not found", { status: 404 }))
 				.mockResolvedValueOnce(new Response("not generated types", { status: 200 })),
@@ -156,13 +156,13 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			context: { reason: "runtime_replaced" },
 		});
 		const types = 'declare module "emdash" { interface EmDashCollections {} }';
-		const oldSandbox = { containerFetch: vi.fn(async () => Promise.reject(interrupted)) };
+		const oldSandbox = { fetchPort: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
-			containerFetch: vi.fn(async () => new Response(types)),
+			fetchPort: vi.fn(async () => new Response(types)),
 			writeFile: vi.fn(async () => ({ success: true })),
 		};
 		let current: {
-			containerFetch: () => Promise<Response>;
+			fetchPort: () => Promise<Response>;
 			writeFile?: (path: string, content: string) => Promise<{ success: boolean }>;
 		} = oldSandbox;
 		const runSandboxRead = async <T>(operation: (sandbox: typeof current) => Promise<T>) => {
@@ -179,13 +179,13 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		} as never).refresh_types.execute as unknown as () => Promise<Record<string, unknown>>;
 
 		await expect(refresh()).resolves.toMatchObject({ success: true });
-		expect(oldSandbox.containerFetch).toHaveBeenCalledOnce();
+		expect(oldSandbox.fetchPort).toHaveBeenCalledOnce();
 		expect(newSandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 	});
 
 	it("rejects chunked live typegen above the response bound without writing", async () => {
 		const sandbox = {
-			containerFetch: vi.fn(async () => new Response("x".repeat(2 * 1024 * 1024 + 1))),
+			fetchPort: vi.fn(async () => new Response("x".repeat(2 * 1024 * 1024 + 1))),
 			writeFile: vi.fn(),
 		};
 		const checkpointSite = vi.fn(async () => {});
@@ -286,7 +286,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			expect(String(second.stdout)).toContain("unchanged");
 			expect(validateCalls(exec)).toBe(1);
 			// The rendered crawl still runs: content may have changed.
-			expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+			expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
 		});
 
 		it("typechecks again when the source changed", async () => {
@@ -437,7 +437,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 		await expect(validate()).resolves.toMatchObject({ success: false, cached: true });
 		expect(validateBlockContracts).toHaveBeenCalledOnce();
-		expect(sandbox.containerFetch).not.toHaveBeenCalled();
+		expect(sandbox.fetchPort).not.toHaveBeenCalled();
 	});
 
 	it("rejects a source-valid site that still renders the blank scaffold", async () => {
@@ -463,15 +463,11 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			},
 		});
 		await expect(validate()).resolves.toMatchObject({ success: false, cached: true });
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(1);
-		expect(sandbox.containerFetch).toHaveBeenCalledWith(
-			"http://localhost:4321/",
-			{
-				headers: { Accept: "text/html" },
-				redirect: "manual",
-			},
-			4321,
-		);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(1);
+		expect(sandbox.fetchPort).toHaveBeenCalledWith(4321, "http://localhost:4321/", {
+			headers: { Accept: "text/html" },
+			redirect: "manual",
+		});
 	});
 
 	it("retries one wholly truncated rendered crawl before failing validation", async () => {
@@ -482,7 +478,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch
+		sandbox.fetchPort
 			.mockResolvedValueOnce(
 				new Response("<!doctype html><html><body><main>Still streaming", {
 					headers: { "Content-Type": "text/html" },
@@ -498,7 +494,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			.execute as unknown as () => Promise<unknown>;
 
 		await expect(validate()).resolves.toMatchObject({ success: true });
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
 	});
 
 	it("fails after exactly one retry when rendered HTML stays truncated", async () => {
@@ -509,7 +505,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch.mockImplementation(
+		sandbox.fetchPort.mockImplementation(
 			async () =>
 				new Response("<!doctype html><html><body><main>Still streaming", {
 					headers: { "Content-Type": "text/html" },
@@ -522,7 +518,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			success: false,
 			publicSiteAudit: { issues: [{ reason: "truncated-html" }] },
 		});
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
 	});
 
 	it("returns rendered server errors to the model", async () => {
@@ -533,7 +529,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch.mockResolvedValue(
+		sandbox.fetchPort.mockResolvedValue(
 			new Response("<pre>TypeError: cannot read project.title</pre>", {
 				status: 500,
 				headers: { "Content-Type": "text/html" },

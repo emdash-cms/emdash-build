@@ -20,11 +20,9 @@ import { auditPublicSite } from "./public-site-audit.js";
 import { isSandboxRuntimeReplacement } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 
-import type { getSandbox } from "@cloudflare/sandbox";
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-
-type SandboxInstance = ReturnType<typeof getSandbox>;
+import type { SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -57,12 +55,9 @@ export interface BatchReadResult {
 	files: BatchReadFileResult[];
 }
 
-interface StreamingReadSandbox {
-	readFileStream(path: string): Promise<ReadableStream<Uint8Array>>;
-}
+type StreamingReadSandbox = Pick<SandboxOps, "readFileStream">;
 
 interface BatchReadOptions {
-	streamFile: typeof import("@cloudflare/sandbox").streamFile;
 	signal?: AbortSignal;
 	timeoutSignal?: (timeoutMs: number) => AbortSignal;
 }
@@ -190,29 +185,22 @@ async function openReadStream(
 async function readOneTextFile(
 	sandbox: StreamingReadSandbox,
 	path: CanonicalSiteReadPath,
-	streamFile: typeof import("@cloudflare/sandbox").streamFile,
 	signal?: AbortSignal,
 ): Promise<InternalReadResult> {
-	let chunks: ReturnType<typeof streamFile> | undefined;
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
 		const source = await openReadStream(sandbox, path.fullPath, signal);
 		const stream = signal
 			? source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal })
 			: source;
-		chunks = streamFile(stream);
-		const encoder = new TextEncoder();
+		reader = stream.getReader();
 		let bytes = 0;
 		const parts: Uint8Array[] = [];
 
 		while (true) {
-			const chunk = await chunks.next();
-			if (chunk.done) {
-				if (chunk.value.size > READ_FILE_MAX_BYTES) {
-					throw new Error("File exceeds the 48 KiB limit.");
-				}
-				break;
-			}
-			const part = chunk.value instanceof Uint8Array ? chunk.value : encoder.encode(chunk.value);
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			const part = chunk.value;
 			bytes += part.byteLength;
 			if (bytes > READ_FILE_MAX_BYTES) throw new Error("File exceeds the 48 KiB limit.");
 			if (part.includes(0)) throw new Error("File contains NUL bytes.");
@@ -232,7 +220,7 @@ async function readOneTextFile(
 		}
 		return { path: path.path, success: true, content, bytes };
 	} catch (error) {
-		await chunks?.return(undefined as never).catch(() => {});
+		await reader?.cancel().catch(() => {});
 		if (isSandboxRuntimeReplacement(error)) throw error;
 		return {
 			path: path.path,
@@ -285,7 +273,6 @@ export async function readFilesFromSandbox(
 			readOneTextFile(
 				sandbox,
 				path,
-				options.streamFile,
 				combineSignals([batchSignal, timeoutSignal(READ_FILE_TIMEOUT_MS)]),
 			),
 		),
@@ -620,8 +607,8 @@ interface ToolCallbacks {
 		{ ok: true; base64: string; mediaType: string } | { ok: false; error: string }
 	>;
 	savePreviewThumbnail?: (shotId: string, shot: { base64: string; mediaType: string }) => void;
-	runSandboxRead?: <T>(operation: (sandbox: SandboxInstance) => Promise<T>) => Promise<T>;
-	validateBlockContracts?: (sandbox: SandboxInstance) => Promise<BlockRendererValidationResult>;
+	runSandboxRead?: <T>(operation: (sandbox: SandboxOps) => Promise<T>) => Promise<T>;
+	validateBlockContracts?: (sandbox: SandboxOps) => Promise<BlockRendererValidationResult>;
 	/** Fingerprint of the source that last passed `pnpm validate`, kept across turns. */
 	typecheckCache?: {
 		lastPassed: () => string | undefined;
@@ -634,8 +621,6 @@ interface ToolOptions {
 	convergence?: BuildConvergence;
 	/** Cancellation for the build turn, including queued sandbox operations. */
 	abortSignal?: AbortSignal;
-	/** SDK decoder for transport-neutral file streams. */
-	streamFile?: typeof import("@cloudflare/sandbox").streamFile;
 	unsplashAccessKey?: string;
 	/** Full-scope API token for the site's EmDash instance (Worker-side only) */
 	apiToken?: string;
@@ -693,7 +678,7 @@ type BatchFileMutationResult =
  * yet" rather than aborting. Probe TCP instead of `/`: local Astro SSR can take
  * several seconds per render even when the listener is healthy.
  */
-async function waitForDevServer(sandbox: SandboxInstance, retries = 20): Promise<boolean> {
+async function waitForDevServer(sandbox: SandboxOps, retries = 20): Promise<boolean> {
 	for (let i = 0; i < retries; i++) {
 		try {
 			const check = await sandbox.exec("timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/4321'", {
@@ -760,7 +745,7 @@ export function typeDeclarationsForModel(declarations: string): {
 }
 
 export async function refreshLiveTypes(
-	sandbox: SandboxInstance,
+	sandbox: SandboxOps,
 	abortSignal?: AbortSignal,
 ): Promise<{
 	success: boolean;
@@ -773,11 +758,9 @@ export async function refreshLiveTypes(
 }> {
 	let response: Response;
 	try {
-		response = await sandbox.containerFetch(
-			"http://localhost:4321/_emdash/api/typegen",
-			{ redirect: "manual" },
-			4321,
-		);
+		response = await sandbox.fetchPort(4321, "http://localhost:4321/_emdash/api/typegen", {
+			redirect: "manual",
+		});
 	} catch (error) {
 		if (isSandboxRuntimeReplacement(error)) throw error;
 		return {
@@ -873,7 +856,7 @@ export function typecheckInputsFingerprintCommand(): string {
 }
 
 /** Undefined when the digest cannot be computed. */
-async function typecheckInputsFingerprint(sandbox: SandboxInstance): Promise<string | undefined> {
+async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string | undefined> {
 	try {
 		const result = await sandbox.exec(typecheckInputsFingerprintCommand(), {
 			cwd: SITE_PATH,
@@ -887,16 +870,14 @@ async function typecheckInputsFingerprint(sandbox: SandboxInstance): Promise<str
 	}
 }
 
-async function auditSandboxPublicSite(sandbox: SandboxInstance): Promise<PublicSiteAuditResult> {
+async function auditSandboxPublicSite(sandbox: SandboxOps): Promise<PublicSiteAuditResult> {
 	const fetchPage = (path: string) => {
 		const url = new URL(path, "http://localhost:4321");
-		// AbortSignal cannot cross the Sandbox RPC boundary. containerFetch owns
-		// its container-start and request timeouts, so pass only serializable init.
-		return sandbox.containerFetch(
-			url.toString(),
-			{ headers: { Accept: "text/html" }, redirect: "manual" },
-			4321,
-		);
+		// Only serializable init: the request owns its container-start and request timeouts.
+		return sandbox.fetchPort(4321, url.toString(), {
+			headers: { Accept: "text/html" },
+			redirect: "manual",
+		});
 	};
 	const first = await auditPublicSite(fetchPage);
 	if (
@@ -1182,7 +1163,7 @@ export function createMediaTools(options: {
  * Called once per onChatMessage invocation.
  */
 export function createTools(
-	sandboxSource: SandboxInstance | (() => SandboxInstance),
+	sandboxSource: SandboxOps | (() => SandboxOps),
 	callbacks: ToolCallbacks,
 	options: ToolOptions = {},
 ) {
@@ -1190,7 +1171,7 @@ export function createTools(
 		typeof sandboxSource === "function" ? sandboxSource() : sandboxSource;
 	const runSandboxRead =
 		callbacks.runSandboxRead ??
-		(<T>(operation: (sandbox: SandboxInstance) => Promise<T>) => operation(currentSandbox()));
+		(<T>(operation: (sandbox: SandboxOps) => Promise<T>) => operation(currentSandbox()));
 	const convergence = options.convergence ?? new BuildConvergence(options.abortSignal);
 	// AI SDK 6 converts an intermediate tool result twice: once for the
 	// completed step and once for the next model request. Retain each image for
@@ -1352,21 +1333,13 @@ export function createTools(
 			}),
 			execute: async ({ paths }, { abortSignal }) =>
 				readFilesQueue.run(() => {
-					if (!options.streamFile) {
-						return Promise.resolve(
-							invalidBatch(paths, new Error("Sandbox file streaming is unavailable.")),
-						);
-					}
 					if (abortSignal?.aborted) {
 						return Promise.resolve(
 							invalidBatch(paths, new Error("Read was stopped before it started.")),
 						);
 					}
 					return runSandboxRead((sandbox) =>
-						readFilesFromSandbox(sandbox, paths, {
-							streamFile: options.streamFile!,
-							signal: abortSignal,
-						}),
+						readFilesFromSandbox(sandbox, paths, { signal: abortSignal }),
 					);
 				}),
 		}),
@@ -1509,7 +1482,7 @@ export function createTools(
 						}> = [];
 						for (const file of files) {
 							options.abortSignal?.throwIfAborted();
-							let current: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+							let current: Awaited<ReturnType<SandboxOps["readFile"]>>;
 							try {
 								current = await currentSandbox().readFile(file.fullPath, {
 									encoding: "utf-8",
@@ -1656,7 +1629,7 @@ export function createTools(
 				}
 				return convergence.runConditionalMutation<FileMutationResult>(
 					async () => {
-						let file: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+						let file: Awaited<ReturnType<SandboxOps["readFile"]>>;
 						try {
 							file = await currentSandbox().readFile(fullPath, { encoding: "utf-8" });
 						} catch (err) {
@@ -1810,7 +1783,7 @@ export function createTools(
 							options.abortSignal?.throwIfAborted();
 							let file = prepared.get(edit.path);
 							if (!file) {
-								let current: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+								let current: Awaited<ReturnType<SandboxOps["readFile"]>>;
 								try {
 									current = await currentSandbox().readFile(edit.fullPath, { encoding: "utf-8" });
 								} catch (err) {

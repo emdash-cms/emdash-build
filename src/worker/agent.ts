@@ -199,9 +199,8 @@ import {
 	type ValidatedBlocksField,
 } from "./block-renderer-validation.js";
 
-import type { getSandbox as GetSandbox, Process as SandboxProcess } from "@cloudflare/sandbox";
-
-type SandboxInstance = ReturnType<typeof GetSandbox>;
+import { legacySandboxOps } from "./legacy-sandbox-ops.js";
+import { DEV_SERVER_PROCESS_PREFIX, type SandboxOps } from "./sandbox-ops.js";
 
 interface PublicationEnv {
 	WFP_RELEASES?: R2Bucket;
@@ -264,15 +263,11 @@ const BUILDER_TEMPLATE_DIR = "builder-cloudflare";
 const SNAPSHOT_PATH = "/tmp/emdash-build-session-snapshot";
 const PUBLISH_PATH = "/tmp/emdash-build-publish";
 const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
-const SNAPSHOT_PUSH_SESSION_ID = "builder-snapshot-push";
 const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
 const PRODUCTION_SNAPSHOT_PORT = 4322;
 const SNAPSHOT_PREPARATION_TIMEOUT_MS = 6 * 60_000;
-const QUICK_TUNNEL_SESSION_ID = "builder-tunnel";
-const DEV_SERVER_SESSION_ID = "builder-dev";
-const QUICK_TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 type PublishRunPhase =
 	| "checkpoint"
 	| "build"
@@ -1333,7 +1328,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		super.broadcast(message, [...new Set([...(without ?? []), ...invalid])]);
 	}
 
-	private sandbox: SandboxInstance | null = null;
+	private sandbox: SandboxOps | null = null;
 
 	/** Bounded in-memory console history, for reload/late-connect rehydration. */
 	private consoleBuffer: string[] = [];
@@ -1341,8 +1336,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Process id of the running `pnpm dev` server, for a clean restart. */
 	private devServerProcessId?: string;
-	private devServerProcess?: SandboxProcess;
-	private quickTunnelProcess?: SandboxProcess;
 
 	/**
 	 * Set when a build turn actually runs. Guards the auto-started build turn
@@ -2179,8 +2172,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** Local validation hook: revoke forwarding without touching the site disk. */
 	async deactivatePreviewForValidation() {
 		return this.withOwnerActivity("validation-deactivate", async () => {
-			const sandbox = this.getOrCreateSandbox();
-			if (this.usesQuickTunnelPreview()) await this.stopQuickTunnel(sandbox);
+			const sandbox = this.sandboxOps();
+			if (this.usesQuickTunnelPreview()) await sandbox.closeTunnel(4321);
 			else await sandbox.unexposePort(4321);
 			return { success: true, previewUrl: this.state.previewUrl };
 		});
@@ -2191,74 +2184,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!mode || mode === "expose-port") return false;
 		if (mode === "quick-tunnel") return true;
 		throw new Error("SANDBOX_PREVIEW_MODE must be expose-port or quick-tunnel.");
-	}
-
-	private async quickTunnelUrl(process: SandboxProcess): Promise<string | undefined> {
-		const status = await process.getStatus().catch(() => process.status);
-		if (status !== "starting" && status !== "running") return;
-		const logs = await process.getLogs().catch(() => undefined);
-		const match = `${logs?.stdout ?? ""}\n${logs?.stderr ?? ""}`.match(QUICK_TUNNEL_URL);
-		return match ? `${match[0].replace(/\/$/, "")}/` : undefined;
-	}
-
-	private async getOrCreateProcessSession(sandbox: SandboxInstance, id: string) {
-		try {
-			return await sandbox.createSession({ id });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
-				return sandbox.getSession(id);
-			}
-			if (!/already exists/i.test(message)) throw error;
-			return sandbox.getSession(id);
-		}
-	}
-
-	private async stopQuickTunnel(sandbox = this.getOrCreateSandbox()): Promise<void> {
-		this.quickTunnelProcess = undefined;
-		const session = await this.getOrCreateProcessSession(sandbox, QUICK_TUNNEL_SESSION_ID);
-		const processes = await session.listProcesses().catch(() => []);
-		await Promise.all(
-			processes
-				.filter((process) => process.command.includes("cloudflared tunnel"))
-				.map((process) => process.kill("SIGTERM").catch(() => undefined)),
-		);
-	}
-
-	private async exposeQuickTunnel(sandbox: SandboxInstance): Promise<{ url: string }> {
-		if (this.quickTunnelProcess) {
-			const url = await this.quickTunnelUrl(this.quickTunnelProcess);
-			if (url) return { url };
-			this.quickTunnelProcess = undefined;
-		}
-		const session = await this.getOrCreateProcessSession(sandbox, QUICK_TUNNEL_SESSION_ID);
-		const processes = await session.listProcesses().catch(() => []);
-		for (const process of processes) {
-			if (!process.command.includes("cloudflared tunnel")) continue;
-			const url = await this.quickTunnelUrl(process);
-			if (url) {
-				this.quickTunnelProcess = process;
-				return { url };
-			}
-			await process.kill("SIGTERM").catch(() => undefined);
-		}
-
-		this.sendConsole("$ cloudflared tunnel (Worker Preview)");
-		const process = await session.startProcess(
-			"cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:4321",
-			{ cwd: SITE_PATH },
-		);
-		this.quickTunnelProcess = process;
-		try {
-			const ready = await process.waitForLog(QUICK_TUNNEL_URL, 30_000);
-			const url = ready.match?.[0] ?? ready.line.match(QUICK_TUNNEL_URL)?.[0];
-			if (!url) throw new Error("cloudflared did not report a public URL.");
-			return { url: `${url.replace(/\/$/, "")}/` };
-		} catch (error) {
-			await process.kill("SIGTERM").catch(() => undefined);
-			if (this.quickTunnelProcess === process) this.quickTunnelProcess = undefined;
-			throw error;
-		}
 	}
 
 	/**
@@ -2300,43 +2225,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Reactivate the stable preview URL for the Sandbox's current runtime. */
 	private async exposePreview(hostname: string): Promise<{ url: string }> {
-		// Authorization survives a container restart, but current Sandbox SDKs
-		// require exposePort() again to activate forwarding for the new runtime.
-		// getExposedPorts() returns only currently-active ports.
-		const sandbox = this.getOrCreateSandbox();
-		if (this.usesQuickTunnelPreview()) return this.exposeQuickTunnel(sandbox);
-		const existing = await sandbox
-			.getExposedPorts(hostname)
-			.then((ports) => ports.find((entry) => entry.port === 4321))
-			.catch(() => undefined);
-		if (existing) return { url: existing.url };
-
-		try {
-			return await sandbox.exposePort(4321, {
-				hostname,
-				name: "preview",
-				token: this.ensurePreviewToken(),
-			});
-		} catch (error) {
-			// Container startup restores persisted ports asynchronously. Close the
-			// race where it becomes exposed between the list and expose calls.
-			if (!/already exposed/i.test(error instanceof Error ? error.message : String(error))) {
-				throw error;
-			}
-			const restored = (await sandbox.getExposedPorts(hostname)).find(
-				(entry) => entry.port === 4321,
-			);
-			if (restored) return { url: restored.url };
-
-			// A stale container-side exposure can outlive the SDK token record.
-			// Clear that orphan and recreate it with our persisted preview token.
-			await sandbox.unexposePort(4321);
-			return await sandbox.exposePort(4321, {
-				hostname,
-				name: "preview",
-				token: this.ensurePreviewToken(),
-			});
-		}
+		const sandbox = this.sandboxOps();
+		if (this.usesQuickTunnelPreview()) return sandbox.openTunnel(4321);
+		return sandbox.exposePort(4321, { hostname, token: this.ensurePreviewToken() });
 	}
 
 	private persistArtifactsRemote(remote: string) {
@@ -2472,28 +2363,30 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return { success: true };
 	}
 
-	private getOrCreateSandbox() {
+	private sandboxOps(): SandboxOps {
 		if (!this.sandbox) {
-			this.sandbox = getSandbox(this.env.Sandbox, this.name, {
-				sleepAfter: this.usesQuickTunnelPreview() ? "30m" : "5m",
-			});
+			const quickTunnel = this.usesQuickTunnelPreview();
+			this.sandbox = legacySandboxOps(
+				getSandbox(this.env.Sandbox, this.name, { sleepAfter: quickTunnel ? "30m" : "5m" }),
+				{ streamFile, quickTunnel, log: (line) => this.sendConsole(line) },
+			);
 		}
 		return this.sandbox;
 	}
 
 	private async runSandboxRead<T>(
-		operation: (sandbox: SandboxInstance) => Promise<T>,
+		operation: (sandbox: SandboxOps) => Promise<T>,
 		signal?: AbortSignal,
 	): Promise<T> {
 		try {
-			return await operation(this.getOrCreateSandbox());
+			return await operation(this.sandboxOps());
 		} catch (error) {
 			if (!isSandboxRuntimeReplacement(error)) throw error;
 			this.sendConsole("Sandbox runtime changed; retrying the read...");
 			this.sandbox = null;
 			await new Promise((resolve) => setTimeout(resolve, 750));
 			signal?.throwIfAborted();
-			return operation(this.getOrCreateSandbox());
+			return operation(this.sandboxOps());
 		}
 	}
 
@@ -2502,13 +2395,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			try {
-				return await this.getOrCreateSandbox().exec(command, { timeout });
+				return await this.sandboxOps().exec(command, { timeout });
 			} catch (error) {
 				lastError = error;
 				if (!isSandboxWakeReset(error) || attempt === 3) throw error;
 				this.sendConsole(`Sandbox wake was reset; retrying (${attempt}/3)...`);
 				this.sandbox = null;
-				this.devServerProcess = undefined;
 				this.devServerProcessId = undefined;
 				await new Promise((resolve) => setTimeout(resolve, attempt * 750));
 			}
@@ -2774,7 +2666,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			SELECT v FROM builder_secrets WHERE k = 'templateGuidance'
 		`[0]?.v;
 		if (pinned) return (this.templateGuidance = pinned);
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		try {
 			const result = await sandbox.exec(`cat ${SITE_PATH}/AGENTS.md`, { timeout: 5000 });
 			if (result.success && result.stdout.trim()) return this.pinTemplateGuidance(result.stdout);
@@ -2794,15 +2686,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private startInitialScaffoldPrefetch(
-		sandbox = this.getOrCreateSandbox(),
+		sandbox = this.sandboxOps(),
 	): Promise<InitialScaffoldContext> {
 		return this.initialScaffoldPrefetch.start(
 			async (signal) => {
 				try {
-					const result = await readFilesFromSandbox(sandbox, INITIAL_SCAFFOLD_PATHS, {
-						streamFile,
-						signal,
-					});
+					const result = await readFilesFromSandbox(sandbox, INITIAL_SCAFFOLD_PATHS, { signal });
 					return createInitialScaffoldContext(result);
 				} catch {
 					return emptyInitialScaffoldContext();
@@ -2825,7 +2714,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Wait for the dev listener after HMR/restart without forcing a slow SSR render. */
 	private async waitForDevServer(signal?: AbortSignal): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		for (let i = 0; i < 20; i++) {
 			signal?.throwIfAborted();
 			try {
@@ -2858,7 +2747,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private async runDevBypass(signal?: AbortSignal): Promise<string | undefined> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const base = "http://localhost:4321";
 		const bypassUrl = `${base}/_emdash/api/setup/dev-bypass?token=1&content=0`;
 
@@ -3021,7 +2910,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async restoreDependencies(signal?: AbortSignal): Promise<number> {
 		const archive = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}.tgz`;
 		const lockfile = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}/pnpm-lock.yaml`;
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		this.sendStatus("Restoring dependencies...");
 		const reused = await sandbox
 			.exec(preparedDependenciesCommand(archive, SITE_PATH, lockfile), {
@@ -3046,22 +2935,19 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** Run `pnpm install` in the site dir, streaming logs. Returns the exit code. */
 	private async installDeps(signal?: AbortSignal): Promise<number> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		this.sendStatus("Installing dependencies...");
 		this.sendConsole("$ pnpm install");
-		const install = await sandbox.startProcess(
-			"pnpm install --prefer-offline --reporter=append-only",
-			{
-				cwd: SITE_PATH,
-			},
-		);
-		const installLogs = await sandbox.streamProcessLogs(install.id);
-		const installLogsDone = this.pumpLogs(installLogs);
-		const stopInstall = () => void install.kill("SIGTERM").catch(() => {});
+		const install = `install-${crypto.randomUUID().slice(0, 8)}`;
+		await sandbox.startProcess(install, "pnpm install --prefer-offline --reporter=append-only", {
+			cwd: SITE_PATH,
+		});
+		const installLogsDone = this.pumpLogs(await sandbox.followProcessLogs(install));
+		const stopInstall = () => void sandbox.stopProcess(install);
 		signal?.addEventListener("abort", stopInstall, { once: true });
 		if (signal?.aborted) stopInstall();
 		try {
-			const installResult = await install.waitForExit(300000);
+			const installResult = await sandbox.waitForProcessExit(install, 300000);
 			signal?.throwIfAborted();
 			return installResult.exitCode;
 		} finally {
@@ -3072,7 +2958,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Reapply runtime-critical config that model-authored edits must preserve. */
 	private async protectAstroConfig(stripSandboxPlugin = false): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const astroPath = `${SITE_PATH}/astro.config.mjs`;
 		const cfg = await sandbox.readFile(astroPath, { encoding: "utf-8" });
 		if (!cfg.success) return;
@@ -3089,7 +2975,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?: AbortSignal,
 	): Promise<void> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const quickTunnel = this.usesQuickTunnelPreview();
 		if (!configurationReady) await this.protectAstroConfig();
 		await sandbox.writeFile(`${SITE_PATH}/src/worker.ts`, CANONICAL_WORKER_TS);
@@ -3127,17 +3013,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			? `mkdir -p /tmp/pnpm-store && ${previewEnv}PNPM_CONFIG_STORE_DIR=/tmp/pnpm-store pnpm dev --host 0.0.0.0`
 			: `${previewEnv}pnpm dev --host 0.0.0.0`;
 		this.sendConsole(archivedModules.success ? "$ pnpm dev (prepared archive)" : "$ pnpm dev");
-		const processHost = quickTunnel
-			? await this.getOrCreateProcessSession(sandbox, DEV_SERVER_SESSION_ID)
-			: sandbox;
-		const devServer = await processHost.startProcess(devCommand, { cwd: SITE_PATH });
-		this.devServerProcess = devServer;
-		this.devServerProcessId = devServer.id;
-		const stopOnAbort = () => void devServer.kill("SIGTERM").catch(() => {});
+		const devServer = `${DEV_SERVER_PROCESS_PREFIX}${crypto.randomUUID().slice(0, 8)}`;
+		await sandbox.startProcess(devServer, devCommand, { cwd: SITE_PATH });
+		this.devServerProcessId = devServer;
+		const stopOnAbort = () => void sandbox.stopProcess(devServer);
 		signal?.addEventListener("abort", stopOnAbort, { once: true });
 		if (signal?.aborted) stopOnAbort();
 		this.devServerErrors = [];
-		const logStream = await sandbox.streamProcessLogs(devServer.id);
+		const logStream = await sandbox.followProcessLogs(devServer);
 		const logsDone = this.pumpLogs(logStream, true);
 		try {
 			await this.waitForDevServerPort(45_000, signal);
@@ -3167,7 +3050,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		label: string,
 		signal?: AbortSignal,
 	): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const deadline = Date.now() + timeoutMs;
 		do {
 			signal?.throwIfAborted();
@@ -3233,13 +3116,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Kill the tracked `pnpm dev` process if running. Safe to call when stopped. */
 	private async stopDevServer(): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
-		if (this.devServerProcess) {
-			await this.devServerProcess.kill("SIGTERM").catch(() => {});
-		} else if (this.devServerProcessId) {
-			await sandbox.killProcess(this.devServerProcessId).catch(() => {});
-		}
-		this.devServerProcess = undefined;
+		const sandbox = this.sandboxOps();
+		if (this.devServerProcessId) await sandbox.stopProcess(this.devServerProcessId);
 		this.devServerProcessId = undefined;
 		const stopped = await sandbox.exec(
 			"pkill -f '[a]stro dev' || true; " +
@@ -3274,7 +3152,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const message = err instanceof Error ? err.message : String(err);
 			this.sendConsole(`Warning: dev server restart lost its transport: ${message}`);
 			this.sandbox = null;
-			this.devServerProcess = undefined;
 			this.devServerProcessId = undefined;
 			const appHost = this.state.appHost;
 			const hostname = appHost && isLocalHostname(appHost) ? appHost : this.env.PREVIEW_HOSTNAME;
@@ -3373,7 +3250,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async doRecoverSite(hostname: string): Promise<SiteRecoveryResult> {
-		let sandbox = this.getOrCreateSandbox();
+		let sandbox = this.sandboxOps();
 
 		// Probe the listening socket, not `/`. A warm Astro process can spend
 		// several seconds bundling a newly reached route; treating that HTTP
@@ -3423,7 +3300,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 
 		const hasSite = await this.execRecoveryCommand(`test -f ${SITE_PATH}/package.json`, 5000);
-		sandbox = this.getOrCreateSandbox();
+		sandbox = this.sandboxOps();
 		const apiToken = this.getApiToken();
 
 		if (!hasSite.success) {
@@ -3555,7 +3432,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!this.state.siteReady || (quiet && Date.now() < this.backupRetryAfter)) return;
 		// A waited save judges "unchanged" against what has actually been uploaded.
 		if (!background) await this.pushTail;
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const previewGeneration = await this.env.Sandbox.getByName(this.name)
 			.getPreviewGeneration()
 			.catch(() => undefined);
@@ -3681,19 +3558,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return run;
 	}
 
-	/**
-	 * Uploads run in their own sandbox session: a command in the default
-	 * session waits for the one before it, and an upload can take seconds.
-	 */
-	private async execSnapshotPush(
+	/** Uploads run beside other commands: one can take seconds, and must not hold up the model's. */
+	private execSnapshotPush(
 		command: string,
 		options: { cwd: string; timeout: number; env: Record<string, string> },
 	) {
-		const sandbox = this.getOrCreateSandbox();
-		if (typeof sandbox.createSession !== "function") return sandbox.exec(command, options);
-		// Looked up each time: a restarted container does not keep its sessions.
-		const session = await this.getOrCreateProcessSession(sandbox, SNAPSHOT_PUSH_SESSION_ID);
-		return session.exec(command, options);
+		return this.sandboxOps().exec(command, { ...options, concurrent: true });
 	}
 
 	private recordBackupFailure(err: unknown): string {
@@ -3749,7 +3619,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const checkpointGeneration = await this.env.Sandbox.getByName(this.name).getPreviewGeneration();
 		assertSnapshotGeneration(previewGeneration, checkpointGeneration);
 
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		let buildProcessId: string | undefined;
 		let buildLogs: Promise<void> | undefined;
 		let productionProcessId: string | undefined;
@@ -3778,13 +3648,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			this.sendStatus("Building the production site...");
 			this.sendConsole("$ pnpm build (publish snapshot)");
-			const build = await sandbox.startProcess(
+			const build = `publish-build-${crypto.randomUUID().slice(0, 8)}`;
+			await sandbox.startProcess(
+				build,
 				`EMDASH_SITE_URL=${shellQuote(liveUrl.origin)} pnpm build`,
 				{ cwd: PUBLISH_PATH },
 			);
-			buildProcessId = build.id;
-			buildLogs = this.pumpLogs(await sandbox.streamProcessLogs(build.id));
-			const buildResult = await build.waitForExit(300_000);
+			buildProcessId = build;
+			buildLogs = this.pumpLogs(await sandbox.followProcessLogs(build));
+			const buildResult = await sandbox.waitForProcessExit(build, 300_000);
 			buildProcessId = undefined;
 			await buildLogs.catch(() => undefined);
 			buildLogs = undefined;
@@ -3797,15 +3669,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				timeout: 5000,
 			});
 			this.sendConsole("$ wrangler dev (publish snapshot)");
-			const production = await sandbox.startProcess(
+			const production = `publish-serve-${crypto.randomUUID().slice(0, 8)}`;
+			await sandbox.startProcess(
+				production,
 				`CLOUDFLARE_API_TOKEN= CLOUDFLARE_API_KEY= CLOUDFLARE_EMAIL= ` +
 					`EMDASH_SITE_URL=${shellQuote(liveUrl.origin)} pnpm exec wrangler dev --local ` +
 					`--ip 0.0.0.0 --port ${PRODUCTION_SNAPSHOT_PORT} --persist-to .wrangler/state ` +
 					`-c dist/server/wrangler.json`,
 				{ cwd: PUBLISH_PATH },
 			);
-			productionProcessId = production.id;
-			productionLogs = this.pumpLogs(await sandbox.streamProcessLogs(production.id));
+			productionProcessId = production;
+			productionLogs = this.pumpLogs(await sandbox.followProcessLogs(production));
 			this.sendStatus("Starting production checks...");
 			await this.waitForSandboxPort(PRODUCTION_SNAPSHOT_PORT, 45_000, "Production runner");
 
@@ -3877,14 +3751,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				previewOrigin: this.state.previewUrl,
 				liveOrigin: liveUrl.origin,
 				fetch: (path) =>
-					sandbox.containerFetch(
-						new URL(path, liveUrl.origin).toString(),
-						{
-							headers: { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
-							redirect: "manual",
-						},
-						PRODUCTION_SNAPSHOT_PORT,
-					),
+					sandbox.fetchPort(PRODUCTION_SNAPSHOT_PORT, new URL(path, liveUrl.origin).toString(), {
+						headers: { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+						redirect: "manual",
+					}),
 				inspectBuiltAsset,
 				readBuiltAsset,
 			});
@@ -3906,11 +3776,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return snapshot;
 		} finally {
 			if (buildProcessId) {
-				await sandbox.killProcess(buildProcessId).catch(() => undefined);
+				await sandbox.stopProcess(buildProcessId);
 				await buildLogs?.catch(() => undefined);
 			}
 			if (productionProcessId) {
-				await sandbox.killProcess(productionProcessId).catch(() => undefined);
+				await sandbox.stopProcess(productionProcessId);
 				await productionLogs?.catch(() => undefined);
 			}
 			try {
@@ -4360,7 +4230,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return { ready: false, error };
 		}
 
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const templateDir = BUILDER_TEMPLATE_DIR;
 
 		try {
@@ -5984,7 +5854,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async validateLiveBlockContracts(
-		sandbox: SandboxInstance,
+		sandbox: SandboxOps,
 		abortSignal?: AbortSignal,
 	): Promise<BlockRendererValidationResult> {
 		const { evidence, issues } = await this.loadLiveBlockEvidence(abortSignal);
@@ -6846,7 +6716,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const convergence = new BuildConvergence(buildAbortSignal);
 			if (options?.requestId) this.activeBuildConvergences.set(options.requestId, convergence);
 			const sandboxTools = createTools(
-				() => this.getOrCreateSandbox(),
+				() => this.sandboxOps(),
 				{
 					reloadPreview: () =>
 						timeSync(metrics, "previewRefresh", () =>
@@ -6878,7 +6748,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				{
 					convergence,
 					abortSignal: buildAbortSignal,
-					streamFile,
 					unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
 					apiToken: this.getApiToken(),
 					cmsBaseUrl: this.state.previewUrl,

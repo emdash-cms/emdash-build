@@ -482,8 +482,8 @@ describe("apply_schema_plan", () => {
 		await runInDurableObject(agent, async (instance) => {
 			const calls: McpCall[] = [];
 			const harness = installBlockCms(instance, calls);
-			(harness as unknown as { getOrCreateSandbox: () => unknown }).getOrCreateSandbox = () => ({
-				containerFetch: async () => new Response("typegen crashed", { status: 500 }),
+			(harness as unknown as { sandboxOps: () => unknown }).sandboxOps = () => ({
+				fetchPort: async () => new Response("typegen crashed", { status: 500 }),
 			});
 
 			const result = await harness
@@ -531,11 +531,11 @@ describe("apply_schema_plan", () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000035");
 		await runInDurableObject(agent, async (instance) => {
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => unknown;
+				sandboxOps: () => unknown;
 				regenerateSiteTypes: () => Promise<unknown>;
 			};
-			harness.getOrCreateSandbox = () => ({
-				containerFetch: async () => new Response("not found", { status: 404 }),
+			harness.sandboxOps = () => ({
+				fetchPort: async () => new Response("not found", { status: 404 }),
 				exec: async () => ({ success: true, exitCode: 0, stdout: "Wrote types", stderr: "" }),
 			});
 
@@ -1876,11 +1876,11 @@ describe("template guidance", () => {
 			runInDurableObject(agent, async (instance) => {
 				const harness = instance as unknown as {
 					templateGuidance: string | undefined;
-					getOrCreateSandbox: () => unknown;
+					sandboxOps: () => unknown;
 					loadTemplateGuidance: () => Promise<string | undefined>;
 				};
 				harness.templateGuidance = undefined;
-				harness.getOrCreateSandbox = () => ({
+				harness.sandboxOps = () => ({
 					exec: async () => ({ success: true, exitCode: 0, stdout, stderr: "" }),
 				});
 				return harness.loadTemplateGuidance();
@@ -1894,12 +1894,12 @@ describe("template guidance", () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000006");
 		await runInDurableObject(agent, async (instance) => {
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => unknown;
+				sandboxOps: () => unknown;
 				initialScaffoldPrefetch: { current: () => Promise<unknown> };
 				loadTemplateGuidance: () => Promise<string | undefined>;
 				loadInitialScaffoldContext: () => Promise<{ templateGuidance?: string }>;
 			};
-			harness.getOrCreateSandbox = () => ({
+			harness.sandboxOps = () => ({
 				exec: async () => ({ success: true, exitCode: 0, stdout: "# Scaffold", stderr: "" }),
 			});
 			await harness.loadTemplateGuidance();

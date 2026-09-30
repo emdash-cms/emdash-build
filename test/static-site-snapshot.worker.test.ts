@@ -17,19 +17,15 @@ function emptyLogStream(): ReadableStream<Uint8Array> {
 }
 
 function harnessSandbox(buildExitCode = 0) {
-	const killed: string[] = [];
+	const stopped: string[] = [];
 	const builtCss = "h1{color:red}";
-	const startProcess = vi.fn(async (command: string, _options?: { cwd?: string }) => {
-		const build = command.includes("pnpm build");
-		return {
-			id: build ? "build-process" : "production-runner",
-			waitForExit: async () => ({ exitCode: build ? buildExitCode : 0 }),
-		};
-	});
-	const containerFetch = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
-		const path = new URL(
-			typeof input === "string" ? input : input instanceof URL ? input : input.url,
-		).pathname;
+	const startProcess = vi.fn(
+		async (_id: string, _command: string, _options?: { cwd?: string }) => undefined,
+	);
+	const commandOf = (id: string) =>
+		startProcess.mock.calls.find(([started]) => started === id)?.[1] ?? "";
+	const fetchPort = vi.fn(async (_port: number, url: string, _init?: RequestInit) => {
+		const path = new URL(url).pathname;
 		if (path === "/") {
 			return new Response(
 				'<!doctype html><html><head><link rel="stylesheet" href="/assets/app.css"></head><body><h1>Published</h1></body></html>',
@@ -49,17 +45,22 @@ function harnessSandbox(buildExitCode = 0) {
 	});
 	const writeFile = vi.fn(async () => ({ success: true }));
 	return {
-		killed,
+		stopped,
 		startProcess,
-		containerFetch,
+		fetchPort,
 		exec,
 		writeFile,
 		sandbox: {
 			startProcess,
-			streamProcessLogs: async () => emptyLogStream(),
+			followProcessLogs: async () => emptyLogStream(),
+			waitForProcessExit: async (id: string) => ({
+				exitCode: commandOf(id).includes("pnpm build") ? buildExitCode : 0,
+			}),
 			exec,
-			killProcess: async (id: string) => killed.push(id),
-			containerFetch,
+			stopProcess: async (id: string) => {
+				stopped.push(id);
+			},
+			fetchPort,
 			readFile: async (path: string, options?: { encoding?: string }) => {
 				if (path.endsWith("/.dev.vars"))
 					return { success: true, content: "EMDASH_SITE_URL=http://localhost:4321\n" };
@@ -85,18 +86,18 @@ describe("Builder production snapshot preparation", () => {
 		const agent = testEnv.BuilderAgent.getByName(PROJECT_ID);
 		await runInDurableObject(agent, async (instance) => {
 			const exec = vi.fn(async () => ({ success: true, stdout: "", stderr: "" }));
-			const killProcess = vi.fn(async () => undefined);
+			const stopProcess = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
 				devServerProcessId?: string;
-				getOrCreateSandbox: () => { exec: typeof exec; killProcess: typeof killProcess };
+				sandboxOps: () => { exec: typeof exec; stopProcess: typeof stopProcess };
 				stopDevServer(): Promise<void>;
 			};
 			harness.devServerProcessId = undefined;
-			harness.getOrCreateSandbox = () => ({ exec, killProcess });
+			harness.sandboxOps = () => ({ exec, stopProcess });
 
 			await harness.stopDevServer();
 
-			expect(killProcess).not.toHaveBeenCalled();
+			expect(stopProcess).not.toHaveBeenCalled();
 			expect(exec).toHaveBeenCalledWith(expect.stringContaining("pkill"), {
 				cwd: "/home/user/site",
 				timeout: 5000,
@@ -118,7 +119,7 @@ describe("Builder production snapshot preparation", () => {
 			const startDevServer = vi.fn(async () => undefined);
 			const refreshPreviewSnapshots = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => typeof runtime.sandbox;
+				sandboxOps: () => typeof runtime.sandbox;
 				execRecoveryCommand: typeof execRecoveryCommand;
 				backupSite: () => Promise<string | undefined>;
 				stopDevServer: typeof stopDevServer;
@@ -129,7 +130,7 @@ describe("Builder production snapshot preparation", () => {
 					routes: Array<{ path: string }>;
 				}>;
 			};
-			harness.getOrCreateSandbox = () => runtime.sandbox;
+			harness.sandboxOps = () => runtime.sandbox;
 			harness.execRecoveryCommand = execRecoveryCommand;
 			harness.backupSite = async () => undefined;
 			harness.stopDevServer = stopDevServer;
@@ -153,14 +154,15 @@ describe("Builder production snapshot preparation", () => {
 			expect(startDevServer).not.toHaveBeenCalled();
 			expect(refreshPreviewSnapshots).not.toHaveBeenCalled();
 			expect(generationReads).toBe(3);
-			expect(runtime.killed).toEqual(["production-runner"]);
-			expect(runtime.startProcess.mock.calls[0]?.[0]).toContain("pnpm build");
-			expect(runtime.startProcess.mock.calls[0]?.[1]).toEqual({
+			// The build exited by itself; only the production runner is stopped.
+			expect(runtime.stopped).toEqual([runtime.startProcess.mock.calls[1]?.[0]]);
+			expect(runtime.startProcess.mock.calls[0]?.[1]).toContain("pnpm build");
+			expect(runtime.startProcess.mock.calls[0]?.[2]).toEqual({
 				cwd: "/tmp/emdash-build-publish",
 			});
-			expect(runtime.startProcess.mock.calls[1]?.[0]).toContain("wrangler dev");
-			expect(runtime.startProcess.mock.calls[1]?.[0]).toContain("--persist-to .wrangler/state");
-			expect(runtime.startProcess.mock.calls[1]?.[1]).toEqual({
+			expect(runtime.startProcess.mock.calls[1]?.[1]).toContain("wrangler dev");
+			expect(runtime.startProcess.mock.calls[1]?.[1]).toContain("--persist-to .wrangler/state");
+			expect(runtime.startProcess.mock.calls[1]?.[2]).toEqual({
 				cwd: "/tmp/emdash-build-publish",
 			});
 			const stagingCommand = runtime.exec.mock.calls.find(([command]) =>
@@ -174,8 +176,9 @@ describe("Builder production snapshot preparation", () => {
 				"/tmp/emdash-build-publish/.dev.vars",
 				expect.stringContaining(`EMDASH_SITE_URL=${LIVE_ORIGIN}`),
 			);
-			expect(typeof runtime.containerFetch.mock.calls[0]?.[0]).toBe("string");
-			expect(runtime.containerFetch.mock.calls[0]?.[1]).not.toHaveProperty("signal");
+			expect(runtime.fetchPort.mock.calls[0]?.[0]).toBe(4322);
+			expect(runtime.fetchPort.mock.calls[0]?.[1]).toBe(`${LIVE_ORIGIN}/`);
+			expect(runtime.fetchPort.mock.calls[0]?.[2]).not.toHaveProperty("signal");
 		});
 	});
 
@@ -196,13 +199,13 @@ describe("Builder production snapshot preparation", () => {
 				.mockResolvedValueOnce({ success: false })
 				.mockResolvedValueOnce({ success: true });
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => typeof runtime.sandbox;
+				sandboxOps: () => typeof runtime.sandbox;
 				execRecoveryCommand: typeof execRecoveryCommand;
 				recoverSite: typeof recoverSite;
 				backupSite: typeof backupSite;
 				prepareStaticSiteSnapshot(liveOrigin: string): Promise<unknown>;
 			};
-			harness.getOrCreateSandbox = () => runtime.sandbox;
+			harness.sandboxOps = () => runtime.sandbox;
 			harness.execRecoveryCommand = execRecoveryCommand;
 			harness.recoverSite = recoverSite;
 			harness.backupSite = backupSite;
@@ -230,13 +233,13 @@ describe("Builder production snapshot preparation", () => {
 			const runtime = harnessSandbox();
 			const backupSite = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => typeof runtime.sandbox;
+				sandboxOps: () => typeof runtime.sandbox;
 				execRecoveryCommand: () => Promise<{ success: boolean }>;
 				recoverSite: () => Promise<never>;
 				backupSite: typeof backupSite;
 				prepareStaticSiteSnapshot(liveOrigin: string): Promise<unknown>;
 			};
-			harness.getOrCreateSandbox = () => runtime.sandbox;
+			harness.sandboxOps = () => runtime.sandbox;
 			harness.execRecoveryCommand = async () => ({ success: false });
 			harness.recoverSite = async () => {
 				throw new Error("sandbox wake failed");
@@ -264,14 +267,14 @@ describe("Builder production snapshot preparation", () => {
 			const runtime = harnessSandbox();
 			const startDevServer = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => typeof runtime.sandbox;
+				sandboxOps: () => typeof runtime.sandbox;
 				backupSite: () => Promise<string | undefined>;
 				stopDevServer: () => Promise<void>;
 				startDevServer: typeof startDevServer;
 				refreshPreviewSnapshots: () => Promise<void>;
 				prepareStaticSiteSnapshot(liveOrigin: string): Promise<unknown>;
 			};
-			harness.getOrCreateSandbox = () => runtime.sandbox;
+			harness.sandboxOps = () => runtime.sandbox;
 			harness.backupSite = async () => undefined;
 			harness.stopDevServer = async () => undefined;
 			harness.startDevServer = startDevServer;
@@ -285,7 +288,7 @@ describe("Builder production snapshot preparation", () => {
 				code: "SITE_CHANGED_DURING_PUBLISH",
 			});
 			expect(startDevServer).not.toHaveBeenCalled();
-			expect(runtime.killed).toEqual(["production-runner"]);
+			expect(runtime.stopped).toEqual([runtime.startProcess.mock.calls[1]?.[0]]);
 		});
 	});
 
@@ -301,14 +304,14 @@ describe("Builder production snapshot preparation", () => {
 			const runtime = harnessSandbox(1);
 			const startDevServer = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => typeof runtime.sandbox;
+				sandboxOps: () => typeof runtime.sandbox;
 				backupSite: () => Promise<string | undefined>;
 				stopDevServer: () => Promise<void>;
 				startDevServer: typeof startDevServer;
 				refreshPreviewSnapshots: () => Promise<void>;
 				prepareStaticSiteSnapshot(liveOrigin: string): Promise<unknown>;
 			};
-			harness.getOrCreateSandbox = () => runtime.sandbox;
+			harness.sandboxOps = () => runtime.sandbox;
 			harness.backupSite = async () => undefined;
 			harness.stopDevServer = async () => undefined;
 			harness.startDevServer = startDevServer;
@@ -319,7 +322,7 @@ describe("Builder production snapshot preparation", () => {
 
 			await expect(harness.prepareStaticSiteSnapshot(LIVE_ORIGIN)).rejects.toThrow(/build failed/i);
 			expect(startDevServer).not.toHaveBeenCalled();
-			expect(runtime.killed).toEqual([]);
+			expect(runtime.stopped).toEqual([]);
 		});
 	});
 });

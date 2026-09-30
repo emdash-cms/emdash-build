@@ -26,12 +26,12 @@ describe("session backup after a stalled upload", () => {
 				.mockResolvedValueOnce({ success: true })
 				.mockResolvedValueOnce({ success: true });
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => { exec: typeof exec };
+				sandboxOps: () => { exec: typeof exec };
 				ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 				backupSite: (options?: { quiet?: boolean; skipIfUnchanged?: boolean }) => Promise<void>;
 				retrySessionSave: () => Promise<boolean>;
 			};
-			harness.getOrCreateSandbox = () => ({ exec });
+			harness.sandboxOps = () => ({ exec });
 			harness.ensureArtifactsRepo = async () => ({
 				remote: "https://artifacts.example/git/site.git",
 				token: "test-token",
@@ -77,11 +77,11 @@ describe("session backup after a stalled upload", () => {
 				})
 				.mockResolvedValueOnce({ success: true });
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => { exec: typeof exec };
+				sandboxOps: () => { exec: typeof exec };
 				ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 				backupSite: (options?: { quiet?: boolean }) => Promise<void>;
 			};
-			harness.getOrCreateSandbox = () => ({ exec });
+			harness.sandboxOps = () => ({ exec });
 			harness.ensureArtifactsRepo = async () => ({
 				remote: "https://artifacts.example/git/site.git",
 				token: "test-token",
@@ -108,11 +108,11 @@ describe("session backup after a stalled upload", () => {
 				ttlSeconds: 900,
 			}));
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => { exec: typeof exec };
+				sandboxOps: () => { exec: typeof exec };
 				ensureArtifactsRepo: typeof ensureArtifactsRepo;
 				backupSite: (options?: { quiet?: boolean }) => Promise<string | undefined>;
 			};
-			harness.getOrCreateSandbox = () => ({ exec });
+			harness.sandboxOps = () => ({ exec });
 			harness.ensureArtifactsRepo = ensureArtifactsRepo;
 
 			await harness.backupSite();
@@ -158,11 +158,11 @@ describe("session backup after a stalled upload", () => {
 				.mockResolvedValueOnce({ success: true })
 				.mockResolvedValueOnce({ success: true });
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => { exec: typeof exec };
+				sandboxOps: () => { exec: typeof exec };
 				ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 				backupSite: () => Promise<void>;
 			};
-			harness.getOrCreateSandbox = () => ({ exec });
+			harness.sandboxOps = () => ({ exec });
 			harness.ensureArtifactsRepo = async () => ({
 				remote: "https://artifacts.example/git/site.git",
 				token: "test-token",
@@ -182,7 +182,7 @@ describe("background session uploads", () => {
 	});
 
 	type Harness = {
-		getOrCreateSandbox: () => unknown;
+		sandboxOps: () => unknown;
 		ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 		checkpointSite: () => Promise<string | undefined>;
 		backupSite: (options?: {
@@ -197,7 +197,7 @@ describe("background session uploads", () => {
 			getByName: () => ({ getPreviewGeneration: async () => generation() }),
 		});
 		const harness = instance as unknown as Harness;
-		harness.getOrCreateSandbox = () => sandbox;
+		harness.sandboxOps = () => sandbox;
 		harness.ensureArtifactsRepo = async () => ({
 			remote: "https://artifacts.example/git/site.git",
 			token: "test-token",
@@ -270,27 +270,22 @@ describe("background session uploads", () => {
 		});
 	});
 
-	it("uploads in its own sandbox session", async () => {
+	it("runs uploads beside the model's commands", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000023");
 		await runInDurableObject(agent, async (instance) => {
-			const exec = vi.fn(async (_command: string) => ({ success: true, stdout: "", stderr: "" }));
-			const sessionExec = vi.fn(async (_command: string) => ({
+			const exec = vi.fn(async (_command: string, _options?: { concurrent?: boolean }) => ({
 				success: true,
 				stdout: "abc\n",
 				stderr: "",
 			}));
-			const createSession = vi.fn(async () => ({ exec: sessionExec }));
-			const harness = install(instance, { exec, createSession });
+			const harness = install(instance, { exec });
 
 			await harness.backupSite();
-			await harness.backupSite();
 
-			expect(exec.mock.calls.map(([command]) => String(command))).not.toContainEqual(
-				expect.stringContaining("git push"),
-			);
-			expect(sessionExec).toHaveBeenCalledTimes(2);
-			// Looked up per upload: a restarted container does not keep its sessions.
-			expect(createSession).toHaveBeenCalledTimes(2);
+			const concurrent = exec.mock.calls.filter(([, options]) => options?.concurrent);
+			expect(concurrent).toHaveLength(1);
+			expect(concurrent[0]![0]).toContain("git push");
+			expect(concurrent[0]![1]).toMatchObject({ cwd: "/tmp" });
 		});
 	});
 
@@ -325,12 +320,12 @@ describe("session upload recovery", () => {
 			getByName: () => ({ getPreviewGeneration: async () => 3 }),
 		});
 		const harness = instance as unknown as {
-			getOrCreateSandbox: () => unknown;
+			sandboxOps: () => unknown;
 			ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 			checkpointSite: () => Promise<string | undefined>;
 			backupSite: (options?: { quiet?: boolean }) => Promise<string | undefined>;
 		};
-		harness.getOrCreateSandbox = () => ({ exec });
+		harness.sandboxOps = () => ({ exec });
 		harness.ensureArtifactsRepo = async () => ({
 			remote: "https://artifacts.example/git/site.git",
 			token: "test-token",
