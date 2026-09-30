@@ -18,8 +18,10 @@ export default defineConfig({
 					ProviderControlPlane: { className: "ProviderControlPlane", useSQLite: true },
 					SiteService: { className: "SiteService", useSQLite: true },
 				},
+				workerLoaders: { LOADER: {} },
 				bindings: {
 					TEST_MIGRATIONS: migrations,
+					ENABLE_CMS_SCRIPTS: "true",
 					SITES_HOSTNAME: "sites.test",
 					BRANDED_SITES_HOSTNAME: "em-da.sh",
 				},

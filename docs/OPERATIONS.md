@@ -40,6 +40,9 @@ also kept in agent state as `lastTurnMetrics`. Fields:
   step's end including its tools; the step's `tokens`; and `incomplete` when
   the step never finished (stopped, failed or out of retries)
 - `modelWaitMs`, the sum of the timed steps' `firstOutputMs`
+- `scriptCalls`: the calls `run_cms_script` programs made, by inner tool, with
+  the same `calls`, `ms` and `failures` as `tools` (the program itself is in
+  `tools.run_cms_script`)
 - `modelHttp`: model HTTP attempts, including SDK retries and entry-body
   sub-calls, with failed statuses counted by code (`0` is a network error; a
   Stop is not counted)

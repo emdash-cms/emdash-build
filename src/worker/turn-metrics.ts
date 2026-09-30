@@ -58,6 +58,8 @@ export interface TurnMetricsRecord {
 	subcalls: { calls: number; tokens: TokenTotals };
 	/** Model HTTP attempts, including ones the SDK retried; status 0 is a network error. */
 	modelHttp: { requests: number; failures: Record<string, number> };
+	/** Calls made by run_cms_script programs, by inner tool; the program itself is in `tools`. */
+	scriptCalls: Record<string, { calls: number; ms: number; failures: number }>;
 	tools: Record<string, { calls: number; ms: number; failures: number }>;
 	/**
 	 * Preview re-renders and backups awaited inside tool calls, so a subset of
@@ -131,6 +133,7 @@ export class TurnMetrics {
 	};
 	// Invalid calls carry model-chosen names, so no prototype keys like `__proto__`.
 	private readonly tools: TurnMetricsRecord["tools"] = Object.create(null);
+	private readonly scriptCalls: TurnMetricsRecord["scriptCalls"] = Object.create(null);
 	private readonly executedToolCalls = new Set<string>();
 	private readonly sync: TurnMetricsRecord["sync"] = {
 		previewRefresh: { count: 0, ms: 0 },
@@ -254,6 +257,14 @@ export class TurnMetrics {
 		});
 	}
 
+	/** A call a run_cms_script program made. */
+	onScriptCall(tool: string, ms: number, success: boolean): void {
+		const entry = (this.scriptCalls[tool] ??= { calls: 0, ms: 0, failures: 0 });
+		entry.calls += 1;
+		entry.ms += Math.round(ms);
+		if (!success) entry.failures += 1;
+	}
+
 	private toolEntry(name: string): TurnMetricsRecord["tools"][string] {
 		return (this.tools[name] ??= { calls: 0, ms: 0, failures: 0 });
 	}
@@ -360,6 +371,7 @@ export class TurnMetrics {
 				requests: this.modelHttp.requests,
 				failures: { ...this.modelHttp.failures },
 			},
+			scriptCalls: structuredClone(this.scriptCalls),
 			tools: structuredClone(this.tools),
 			sync: structuredClone(this.sync),
 		};

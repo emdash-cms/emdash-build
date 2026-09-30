@@ -137,6 +137,7 @@ export function renderStudioWrangler(config) {
 			...(siteServiceConfigured ? [{ tag: "v4", new_sqlite_classes: ["SiteService"] }] : []),
 		],
 		ai: { binding: "AI", remote: true },
+		worker_loaders: [{ binding: "LOADER" }],
 		artifacts: [{ binding: "ARTIFACTS", namespace: config.artifactsNamespace, remote: true }],
 		...(identityConfigured
 			? {
@@ -173,6 +174,7 @@ export function renderStudioWrangler(config) {
 					}
 				: {}),
 			SITES_HOSTNAME: config.sitesHostname,
+			ENABLE_CMS_SCRIPTS: "true",
 			WFP_DISPATCH_NAMESPACE: config.dispatchNamespace,
 			WFP_ACCOUNT_ID: config.accountId,
 		},

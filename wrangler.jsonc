@@ -74,6 +74,12 @@
 		"binding": "AI",
 		"remote": true,
 	},
+	// run_cms_script programs run in Dynamic Workers (ENABLE_CMS_SCRIPTS gates the tool).
+	"worker_loaders": [
+		{
+			"binding": "LOADER",
+		},
+	],
 	// Session persistence: each session's site dir is snapshotted to its own
 	// Artifacts git repo (see BuilderAgent.backupSite/recoverSite).
 	"artifacts": [
@@ -130,6 +136,7 @@
 		"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
 		"PREVIEW_HOSTNAME": "build.emdashcms.com",
 		"ENABLE_PUBLIC_PUBLISHING": "false",
+		"ENABLE_CMS_SCRIPTS": "true",
 		"SITES_HOSTNAME": "build.emdashcms.com",
 		"BRANDED_SITES_HOSTNAME": "em-da.sh",
 		"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
@@ -188,6 +195,11 @@
 			"binding": "AI",
 			"remote": true,
 		},
+		"worker_loaders": [
+			{
+				"binding": "LOADER",
+			},
+		],
 		"artifacts": [
 			{
 				"binding": "ARTIFACTS",
@@ -226,6 +238,7 @@
 			"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
 			"PREVIEW_HOSTNAME": "build.emdashcms.com",
 			"ENABLE_PUBLIC_PUBLISHING": "false",
+			"ENABLE_CMS_SCRIPTS": "true",
 			"SANDBOX_PREVIEW_MODE": "quick-tunnel",
 			"SITES_HOSTNAME": "build.emdashcms.com",
 			"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",

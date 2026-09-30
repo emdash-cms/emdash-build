@@ -69,6 +69,15 @@ describe("builder template prototype", () => {
 		expect(prompt).not.toContain("Custom Portable Text blocks");
 	});
 
+	it("describes CMS programs only when the tool is available", () => {
+		expect(buildBuildPrompt({})).not.toContain("run_cms_script");
+		for (const editMode of [false, true]) {
+			const prompt = buildBuildPrompt({ editMode, cmsScripts: true });
+			expect(prompt).toContain("`run_cms_script`");
+			expect(prompt).toContain("do not re-run it whole");
+		}
+	});
+
 	it("puts initial block guidance after stale pinned and snapshot guidance", () => {
 		const prompt = buildBuildPrompt({
 			templateGuidance: "Obsolete pinned Custom Portable Text marker.",

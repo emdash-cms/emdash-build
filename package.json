@@ -38,6 +38,7 @@
 		"@ai-sdk/react": "3.0.273",
 		"@base-ui/react": "1.8.0",
 		"@cloudflare/ai-chat": "^0.7.0",
+		"@cloudflare/codemode": "0.5.2",
 		"@cloudflare/kumo": "^2.13.2",
 		"@cloudflare/sandbox": "0.12.10",
 		"@phosphor-icons/react": "^2.1.10",

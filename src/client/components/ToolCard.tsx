@@ -39,6 +39,11 @@ const TOOL_LABELS: Record<string, ToolLabels> = {
 		complete: "Prepared source download",
 		error: "Source download failed",
 	},
+	run_cms_script: {
+		active: "Updating content",
+		complete: "Updated content",
+		error: "Content update failed",
+	},
 	create_entries_batch: {
 		active: "Adding entries",
 		complete: "Added entries",

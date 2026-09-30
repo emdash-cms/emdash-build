@@ -40,9 +40,11 @@ import {
 	stepCountIs,
 	jsonSchema,
 	tool,
+	type ToolSet,
 } from "ai";
 import { z } from "zod";
 import {
+	createMediaTools,
 	createTools,
 	mapLimit,
 	SITE_PATH,
@@ -115,6 +117,17 @@ import {
 	type InitialScaffoldContext,
 } from "./initial-scaffold.js";
 import { drainProvisionTasks, preparedDependenciesCommand } from "./provisioning.js";
+import {
+	CMS_SCRIPT_TOOL,
+	CMS_SCRIPT_TOOLS,
+	CmsScriptRun,
+	DeferredSiteSync,
+	cmsScriptOutput,
+	createCmsScriptExecutor,
+	createCmsScriptTool,
+	type CmsScriptTarget,
+} from "./cms-script.js";
+import type { Executor } from "@cloudflare/codemode";
 import {
 	BuildConvergence,
 	canCompleteBuild,
@@ -4888,6 +4901,85 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return failed(reason);
 	}
 
+	/**
+	 * The Dynamic Worker executor for CMS programs, or undefined when the
+	 * Worker Loader binding or the ENABLE_CMS_SCRIPTS switch is off.
+	 */
+	private async createCmsScriptExecutor(): Promise<Executor | undefined> {
+		const env = this.env as Env & { LOADER?: WorkerLoader; ENABLE_CMS_SCRIPTS?: string };
+		if (!env.LOADER || env.ENABLE_CMS_SCRIPTS !== "true") return undefined;
+		return createCmsScriptExecutor(env.LOADER);
+	}
+
+	/**
+	 * `run_cms_script`: a program's calls run the same tool objects as direct
+	 * calls, rebuilt against the program's mutation scope and a deferred sync,
+	 * so the whole program is one mutation window with one preview refresh and
+	 * one checkpoint, both inside the window.
+	 */
+	private async buildCmsScriptTool(turn: {
+		convergence: BuildConvergence;
+		failureGuard: McpToolFailureGuard;
+		metrics: TurnMetrics;
+		abortSignal: AbortSignal;
+		toolNames: readonly string[];
+	}): Promise<ToolSet> {
+		const executor = await this.createCmsScriptExecutor();
+		if (!executor) return {};
+		const names = CMS_SCRIPT_TOOLS.filter((name) => turn.toolNames.includes(name));
+		const immediate = this.immediateSiteSync(turn.metrics);
+		return {
+			[CMS_SCRIPT_TOOL]: createCmsScriptTool(names, (code, { toolCallId, abortSignal }) => {
+				const signal = abortSignal ?? turn.abortSignal;
+				return turn.convergence.runScript(
+					async (scope) => {
+						const progress = this.statusLine();
+						const deferred = new DeferredSiteSync();
+						const run = new CmsScriptRun({
+							toolCallId,
+							abortSignal: signal,
+							onCall: (name, ms, ok) => turn.metrics.onScriptCall(name, ms, ok),
+							onActivity: () => progress.set("Updating content..."),
+						});
+						const inner = {
+							...this.buildMcpTools(turn.failureGuard, scope, turn.metrics, deferred, {
+								quiet: true,
+							}),
+							...createMediaTools({
+								mutations: scope,
+								checkpoint: () => deferred.checkpoint(),
+								abortSignal: run.signal,
+								unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
+								apiToken: this.getApiToken(),
+								cmsBaseUrl: this.state.previewUrl,
+							}),
+						} as Record<string, CmsScriptTarget>;
+						const fns = Object.fromEntries(
+							names
+								.filter((name) => inner[name])
+								.map((name) => [name, run.bind(name, inner[name]!)]),
+						);
+						let outcome: Awaited<ReturnType<CmsScriptRun["execute"]>> | undefined;
+						try {
+							outcome = await run.execute(executor, code, fns);
+						} finally {
+							await run.close(outcome ? outcome.stop : "aborted");
+							// Inside the mutation window, so no observation can certify pre-program HTML.
+							await deferred.flush(immediate, scope.mutated);
+							progress.clear();
+						}
+						if (outcome.stop === "aborted") signal.throwIfAborted();
+						return cmsScriptOutput(outcome, run, scope.mutated);
+					},
+					{
+						key: mutationKey(CMS_SCRIPT_TOOL, { code }),
+						cacheResult: (output) => output.success,
+					},
+				);
+			}),
+		};
+	}
+
 	/** Preview refresh and checkpoint after a mutation, as tools run them one call at a time. */
 	private immediateSiteSync(metrics?: TurnMetrics): SiteSync {
 		return {
@@ -6973,12 +7065,22 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			);
 
 			const mcpFailureGuard = new McpToolFailureGuard();
-			const tools = {
+			const directTools = {
 				...sandboxTools,
 				...this.buildMcpTools(mcpFailureGuard, convergence, metrics),
 				...this.buildSchemaPlanTool(convergence, metrics),
 				...this.buildBlockEvolutionTools(convergence, metrics),
 				...this.buildContentBatchTool(convergence, metrics),
+			};
+			const tools = {
+				...directTools,
+				...(await this.buildCmsScriptTool({
+					convergence,
+					failureGuard: mcpFailureGuard,
+					metrics,
+					abortSignal: buildAbortSignal,
+					toolNames: Object.keys(directTools),
+				})),
 			};
 			const buildToolNames = Object.keys(tools) as Array<keyof typeof tools>;
 			const initialScaffoldContext = isInitialBuild
@@ -6990,6 +7092,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				templateGuidance,
 				initialScaffoldContext,
 				editMode: !tracksInitialBuild,
+				cmsScripts: CMS_SCRIPT_TOOL in tools,
 			});
 
 			const onBuildFinish = async (...args: unknown[]) => {

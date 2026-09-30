@@ -95,6 +95,7 @@ const MUTATING_BUILD_TOOLS = new Set([
 	"upload_media",
 	"apply_schema_plan",
 	"create_entries_batch",
+	"run_cms_script",
 	"schema_create_collection",
 	"schema_create_field",
 	"update_blocks_field",

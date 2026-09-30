@@ -28,6 +28,9 @@ describe("provider configuration", () => {
 			name: "example-host-emdash-build",
 			containers: [{ max_instances: 5 }],
 			artifacts: [{ namespace: "example-build" }],
+			// CMS programs run in Dynamic Workers.
+			worker_loaders: [{ binding: "LOADER" }],
+			vars: expect.objectContaining({ ENABLE_CMS_SCRIPTS: "true" }),
 			r2_buckets: [
 				{ binding: "WFP_RELEASES", bucket_name: "example-wfp-releases" },
 				{ binding: "SITE_MEDIA", bucket_name: "example-site-media" },
