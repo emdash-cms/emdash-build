@@ -457,7 +457,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	it("treats every shell command as a potential site mutation", async () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
-		convergence.recordValidation(observation, { success: true });
+		// A failed validation leaves shell access open for diagnosis.
+		convergence.recordValidationResult(observation, { success: false }, false);
 		const exec = vi.fn(async () => ({ success: true, exitCode: 0, stdout: "ok", stderr: "" }));
 		const tools = createTools({ exec } as never, toolCallbacks() as never, {
 			convergence,
@@ -469,7 +470,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 
 		expect(convergence.currentRevision()).toBe(1);
-		expect(convergence.hasCurrentValidation()).toBe(false);
+		expect(convergence.currentValidationResult()).toBeUndefined();
 	});
 
 	it("does not advance the revision for an edit precondition miss", async () => {
@@ -1008,7 +1009,7 @@ describe("stopped media batch", () => {
 		expect(convergence.hasUnresolvedFailures()).toBe(true);
 		expect(
 			prepareBuildStep(convergence, [] as never, ["upload_media", "view_preview"]),
-		).toMatchObject({ toolChoice: { type: "tool", toolName: "upload_media" } });
+		).toMatchObject({ allowedTools: { toolNames: ["upload_media"], mode: "required" } });
 
 		await expect(
 			upload({
@@ -1724,6 +1725,21 @@ describe("protected site files", () => {
 		const [command] = exec.mock.calls[0] as unknown as [string];
 		expect(command.startsWith("( guard=$(mktemp -d")).toBe(true);
 		expect(command).toContain("timeout --signal=TERM --kill-after=2s 12s bash -lc");
+	});
+
+	it("refuses shell commands while validation is current, so a diagnostic cannot void it", async () => {
+		const exec = vi.fn();
+		const convergence = new BuildConvergence();
+		convergence.recordValidation(convergence.beginObservation()!, { success: true });
+		const tools = createTools({ exec } as never, toolCallbacks() as never, { convergence });
+		const run = tools.exec.execute as unknown as (input: { command: string }) => Promise<unknown>;
+
+		await expect(run({ command: "curl -s localhost:4321" })).resolves.toMatchObject({
+			success: false,
+			error: expect.stringContaining("passed validation"),
+		});
+		expect(exec).not.toHaveBeenCalled();
+		expect(convergence.hasCurrentValidation()).toBe(true);
 	});
 
 	it("passes Stop to an active sandbox command", async () => {

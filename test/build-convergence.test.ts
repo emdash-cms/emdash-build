@@ -288,18 +288,18 @@ describe("build loop convergence", () => {
 		convergence.finishStep(failedPreview);
 		expect(convergence.shouldForceText()).toBe(false);
 		expect(
-			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]).toolChoice,
-		).toEqual({ type: "tool", toolName: "view_preview" });
+			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]).allowedTools,
+		).toEqual({ toolNames: ["view_preview"], mode: "required" });
 
 		convergence.finishStep(failedPreview);
 		expect(convergence.shouldForceText()).toBe(true);
-		expect(
-			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]),
-		).toMatchObject({ activeTools: [], toolChoice: "none" });
+		const textOnly = prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]);
+		expect(textOnly.toolChoice).toBe("none");
+		expect(textOnly.allowedTools).toBeUndefined();
 		expect(canCompleteBuild(convergence, "stop")).toBe(false);
 	});
 
-	it("removes shell access while validation is current", () => {
+	it("requires the final preview once validation is current", () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
 		convergence.recordValidation(observation, { success: true });
@@ -310,8 +310,62 @@ describe("build loop convergence", () => {
 			"view_preview",
 		]);
 
-		expect(prepared.activeTools).toEqual(["write_file", "view_preview"]);
-		expect(prepared.toolChoice).toEqual({ type: "tool", toolName: "view_preview" });
+		expect(prepared.allowedTools).toEqual({ toolNames: ["view_preview"], mode: "required" });
+		expect(prepared.toolChoice).toBeUndefined();
+	});
+
+	it("removes shell access while validation is current", () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+
+		const prepared = prepareBuildStep(convergence, [] as never, [
+			"exec",
+			"write_file",
+			"view_preview",
+		]);
+
+		expect(prepared.allowedTools).toEqual({
+			toolNames: ["write_file", "view_preview"],
+			mode: "auto",
+		});
+	});
+
+	it("never narrows the tools sent, so the cached prompt prefix survives", () => {
+		const toolNames = ["exec", "write_file", "view_preview", "content_create"] as const;
+		const validated = new BuildConvergence();
+		validated.recordValidation(validated.beginObservation()!, { success: true });
+		const converged = new BuildConvergence();
+		recordCompleteEvidence(converged);
+		converged.finishStep({});
+		converged.finishStep({});
+		const recovering = new BuildConvergence();
+		recovering.recordUnresolvedFailure({
+			key: "content:pages:home",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR]",
+		});
+
+		for (const convergence of [new BuildConvergence(), validated, converged, recovering]) {
+			expect(prepareBuildStep(convergence, [] as never, toolNames)).not.toHaveProperty(
+				"activeTools",
+			);
+		}
+	});
+
+	it("allows one more step after a refused shell command, then forces text", () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+		// The evidence reached the model; its next step called exec anyway.
+		convergence.finishStep({});
+		const refusedExec = { toolResults: [{ toolName: "exec", output: { success: false } }] };
+
+		convergence.finishStep(refusedExec);
+		expect(convergence.shouldForceText()).toBe(false);
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+
+		convergence.finishStep(refusedExec);
+		expect(convergence.shouldForceText()).toBe(true);
+		expect(canCompleteBuild(convergence, "stop")).toBe(true);
 	});
 
 	it("makes the step text-only after unchanged evidence converges", () => {
@@ -322,8 +376,8 @@ describe("build loop convergence", () => {
 
 		const prepared = prepareBuildStep(convergence, [] as never, ["exec", "write_file"]);
 
-		expect(prepared.activeTools).toEqual([]);
 		expect(prepared.toolChoice).toBe("none");
+		expect(prepared.allowedTools).toBeUndefined();
 	});
 
 	it("does not mark a non-error finish complete without final evidence", () => {
@@ -357,7 +411,7 @@ describe("build loop convergence", () => {
 		expect(
 			prepareBuildStep(convergence, [] as never, ["content_create", "view_preview"]),
 		).toMatchObject({
-			toolChoice: { type: "tool", toolName: "content_create" },
+			allowedTools: { toolNames: ["content_create"], mode: "required" },
 		});
 
 		convergence.resolveUnresolvedFailure("content:pages:submit");

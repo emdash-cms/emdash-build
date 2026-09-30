@@ -1723,8 +1723,17 @@ export function createTools(
 			inputSchema: z.object({
 				command: z.string().describe("The shell command to execute"),
 			}),
-			execute: async ({ command }) =>
-				trackedMutation(async () => {
+			execute: async ({ command }) => {
+				// The step's allowed tools already exclude exec here; refuse too in case
+				// the provider ignored them, since the command would void validation.
+				if (convergence.hasCurrentValidation()) {
+					return {
+						success: false as const,
+						error:
+							"The current revision already passed validation, and a shell command would void it. Make a real source or CMS change, or finish.",
+					};
+				}
+				return trackedMutation(async () => {
 					// The SDK request timeout does not reliably kill a child process. A
 					// hung curl then owns the default command session and every later exec
 					// queues behind it. Enforce the deadline inside the container and leave
@@ -1747,7 +1756,8 @@ export function createTools(
 							note: "Builder-managed files must not be modified; see protectedFiles.",
 						}),
 					};
-				}),
+				});
+			},
 		}),
 
 		refresh_types: tool({

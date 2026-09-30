@@ -480,15 +480,25 @@ export function canCompleteBuild(convergence: BuildConvergence, finishReason: un
 	);
 }
 
+/**
+ * One step's gating. The full tool list is always sent: narrowing it changes
+ * the cached prompt prefix, so `allowedTools` restricts calls through the
+ * provider (OpenAI `allowed_tools`) instead. A text-only step and a tool
+ * restriction are exclusive, since the provider lets the restriction win.
+ */
+export type PreparedBuildStep<TOOL_NAME extends string> = { messages: ModelMessage[] } & (
+	| {
+			toolChoice?: undefined;
+			allowedTools?: { toolNames: TOOL_NAME[]; mode: "auto" | "required" };
+	  }
+	| { toolChoice: "none"; allowedTools?: undefined }
+);
+
 export function prepareBuildStep<TOOL_NAME extends string>(
 	convergence: BuildConvergence,
 	messages: ModelMessage[],
 	toolNames: readonly TOOL_NAME[],
-): {
-	messages: ModelMessage[];
-	activeTools?: TOOL_NAME[];
-	toolChoice?: "none" | { type: "tool"; toolName: TOOL_NAME };
-} {
+): PreparedBuildStep<TOOL_NAME> {
 	const preparedPreview = promoteLatestPreviewImage(
 		messages,
 		convergence.hasCurrentPreviewCapture(),
@@ -498,38 +508,30 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 		convergence.markEvidenceExposed();
 	}
 	const prunedMessages = preparedPreview.messages;
-	const activeTools = convergence.hasCurrentValidation()
+	// A shell command counts as a mutation, so it would void current validation.
+	const callable = convergence.hasCurrentValidation()
 		? toolNames.filter((toolName) => toolName !== "exec")
 		: [...toolNames];
+	const required = (toolName: TOOL_NAME): PreparedBuildStep<TOOL_NAME> => ({
+		messages: prunedMessages,
+		allowedTools: { toolNames: [toolName], mode: "required" },
+	});
 	const unresolved = convergence.nextUnresolvedFailure();
 	const recoveryTool = unresolved
-		? activeTools.find((toolName) => toolName === unresolved.toolName)
+		? callable.find((toolName) => toolName === unresolved.toolName)
 		: undefined;
-	if (recoveryTool) {
-		return {
-			messages: prunedMessages,
-			activeTools,
-			toolChoice: { type: "tool", toolName: recoveryTool },
-		};
-	}
+	if (recoveryTool) return required(recoveryTool);
 	if (convergence.shouldForceText()) {
-		return { messages: prunedMessages, activeTools: [], toolChoice: "none" };
+		return { messages: prunedMessages, toolChoice: "none" };
 	}
 	if (convergence.hasCurrentValidation()) {
 		if (!convergence.hasCompleteEvidence()) {
-			const previewTool = activeTools.find((toolName) => toolName === "view_preview");
-			if (previewTool) {
-				return {
-					messages: prunedMessages,
-					activeTools,
-					toolChoice: { type: "tool", toolName: previewTool },
-				};
-			}
+			const previewTool = callable.find((toolName) => toolName === "view_preview");
+			if (previewTool) return required(previewTool);
 		}
-		return {
-			messages: prunedMessages,
-			activeTools,
-		};
+		if (callable.length < toolNames.length) {
+			return { messages: prunedMessages, allowedTools: { toolNames: callable, mode: "auto" } };
+		}
 	}
 	return { messages: prunedMessages };
 }
