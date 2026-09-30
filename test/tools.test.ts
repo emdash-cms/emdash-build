@@ -13,7 +13,12 @@ import {
 	releaseStepPreviewImages,
 } from "../src/worker/build-convergence.js";
 import { capturedPreviewShotId } from "../src/worker/readiness.js";
-import { createTools, ensurePreviewHmr, guardProtectedFiles } from "../src/worker/tools.js";
+import {
+	createTools,
+	ensurePreviewHmr,
+	guardProtectedFiles,
+	typecheckInputsFingerprintCommand,
+} from "../src/worker/tools.js";
 
 function toolCallbacks(capturePreview = vi.fn()) {
 	return {
@@ -240,6 +245,123 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 		expect(oldSandbox.readFile).toHaveBeenCalledOnce();
 		expect(newSandbox.readFile).toHaveBeenCalledOnce();
+	});
+
+	describe("typecheck reuse", () => {
+		const digest = (char: string) => char.repeat(64);
+		function fingerprintingSandbox(fingerprint: () => string, validate: () => unknown) {
+			const exec = vi.fn(async (command: string) =>
+				command.includes("sha256sum")
+					? { success: true, exitCode: 0, stdout: `${fingerprint()}\n`, stderr: "" }
+					: validate(),
+			);
+			return { exec, sandbox: validatingSandbox(exec) };
+		}
+		function cache(initial?: string) {
+			let passed = initial;
+			return {
+				lastPassed: vi.fn(() => passed),
+				recordPassed: vi.fn((fingerprint: string) => {
+					passed = fingerprint;
+				}),
+			};
+		}
+		const passing = () => ({ success: true, exitCode: 0, stdout: "typed", stderr: "" });
+		const validateCalls = (exec: ReturnType<typeof vi.fn>) =>
+			exec.mock.calls.filter(([command]) => command === "pnpm validate").length;
+
+		it("skips the typecheck in a later turn when the source is unchanged", async () => {
+			const typecheckCache = cache();
+			const { exec, sandbox } = fingerprintingSandbox(() => digest("a"), passing);
+			const turn = () =>
+				createTools(sandbox as never, { ...toolCallbacks(), typecheckCache } as never).validate_site
+					.execute as unknown as () => Promise<Record<string, unknown>>;
+
+			await expect(turn()()).resolves.toMatchObject({ success: true });
+			expect(typecheckCache.recordPassed).toHaveBeenCalledWith(digest("a"));
+			// A content-only follow-up: same source, new turn.
+			const second = await turn()();
+
+			expect(second).toMatchObject({ success: true, typecheckSkipped: true });
+			expect(String(second.stdout)).toContain("unchanged");
+			expect(validateCalls(exec)).toBe(1);
+			// The rendered crawl still runs: content may have changed.
+			expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+		});
+
+		it("typechecks again when the source changed", async () => {
+			const typecheckCache = cache(digest("a"));
+			const { exec, sandbox } = fingerprintingSandbox(() => digest("b"), passing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as unknown as () => Promise<Record<string, unknown>>;
+
+			await expect(validate()).resolves.toMatchObject({ success: true });
+			expect(validateCalls(exec)).toBe(1);
+			expect(typecheckCache.recordPassed).toHaveBeenCalledWith(digest("b"));
+		});
+
+		it("does not record a pass when the source changed while it was being checked", async () => {
+			const typecheckCache = cache();
+			const digests = [digest("a"), digest("b")];
+			const { sandbox } = fingerprintingSandbox(() => digests.shift() ?? digest("b"), passing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as unknown as () => Promise<unknown>;
+
+			await expect(validate()).resolves.toMatchObject({ success: true });
+			expect(typecheckCache.recordPassed).not.toHaveBeenCalled();
+		});
+
+		it("fingerprints every source file outside dependencies, output and local state", () => {
+			const root = mkdtempSync(join(tmpdir(), "emdash-fingerprint-"));
+			try {
+				const write = (path: string, content: string) => {
+					mkdirSync(posix.dirname(join(root, path)), { recursive: true });
+					writeFileSync(join(root, path), content);
+				};
+				write("src/pages/index.astro", "home");
+				write("worker-configuration.d.ts", "declare const env: {}");
+				write("node_modules/pkg/index.js", "dependency");
+				write(".wrangler/state/db.sqlite", "content");
+				const fingerprint = () =>
+					spawnSync("bash", ["-c", typecheckInputsFingerprintCommand()], {
+						cwd: root,
+						encoding: "utf8",
+					}).stdout.trim();
+				const first = fingerprint();
+				write("node_modules/pkg/index.js", "changed dependency");
+				write(".wrangler/state/db.sqlite", "changed content");
+				expect(fingerprint()).toBe(first);
+				write("worker-configuration.d.ts", "declare const env: { DB: D1Database }");
+				expect(fingerprint()).not.toBe(first);
+				expect(first).toMatch(/^[0-9a-f]{64}$/);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("never records a failed typecheck and typechecks when fingerprinting fails", async () => {
+			const typecheckCache = cache();
+			const failing = () => ({ success: false, exitCode: 1, stdout: "", stderr: "Type error" });
+			const { sandbox } = fingerprintingSandbox(() => digest("c"), failing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as () => Promise<unknown>;
+			await expect(validate()).resolves.toMatchObject({ success: false });
+			expect(typecheckCache.recordPassed).not.toHaveBeenCalled();
+
+			const unreadable = fingerprintingSandbox(() => "not a digest", passing);
+			const again = createTools(
+				unreadable.sandbox as never,
+				{ ...toolCallbacks(), typecheckCache: cache(digest("c")) } as never,
+			).validate_site.execute as () => Promise<unknown>;
+			await expect(again()).resolves.toMatchObject({ success: true });
+			expect(validateCalls(unreadable.exec)).toBe(1);
+		});
 	});
 
 	it("coalesces overlapping successful validation calls", async () => {

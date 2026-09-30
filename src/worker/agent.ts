@@ -1526,6 +1526,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return row ? { base64: row.base64, mediaType: "image/png" } : null;
 	}
 
+	/** A server-only value that is not broadcast with state. */
+	private readSecret(key: string): string | undefined {
+		this.ensureSecretsTable();
+		return this.sql<{ v: string }>`SELECT v FROM builder_secrets WHERE k = ${key}`[0]?.v;
+	}
+
+	private writeSecret(key: string, value: string): void {
+		this.ensureSecretsTable();
+		this.sql`INSERT OR REPLACE INTO builder_secrets (k, v) VALUES (${key}, ${value})`;
+	}
+
 	private persistApiToken(token: string) {
 		this.ensureSecretsTable();
 		this.sql`INSERT OR REPLACE INTO builder_secrets (k, v) VALUES ('apiToken', ${token})`;
@@ -6706,6 +6717,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					runSandboxRead: (operation) => this.runSandboxRead(operation, buildAbortSignal),
 					validateBlockContracts: (sandbox) =>
 						this.validateLiveBlockContracts(sandbox, buildAbortSignal),
+					typecheckCache: {
+						lastPassed: () => this.readSecret("typecheckedSource"),
+						recordPassed: (fingerprint) => this.writeSecret("typecheckedSource", fingerprint),
+					},
 				},
 				{
 					convergence,

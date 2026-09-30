@@ -692,6 +692,11 @@ interface ToolCallbacks {
 	savePreviewThumbnail?: (shotId: string, shot: { base64: string; mediaType: string }) => void;
 	runSandboxRead?: <T>(operation: (sandbox: SandboxInstance) => Promise<T>) => Promise<T>;
 	validateBlockContracts?: (sandbox: SandboxInstance) => Promise<BlockRendererValidationResult>;
+	/** Fingerprint of the source that last passed `pnpm validate`, kept across turns. */
+	typecheckCache?: {
+		lastPassed: () => string | undefined;
+		recordPassed: (fingerprint: string) => void;
+	};
 }
 
 interface ToolOptions {
@@ -919,6 +924,37 @@ export async function refreshLiveTypes(
 		generatedFile: "emdash-env.d.ts",
 		declarations: types,
 	};
+}
+
+/**
+ * A digest of what `pnpm validate` can read: every file in the site except
+ * installed dependencies (pinned by the hashed lockfile), build output, git
+ * metadata, local CMS state and static assets. Anything else a check might
+ * include, such as generated declarations or a root-level module, changes it.
+ */
+export function typecheckInputsFingerprintCommand(): string {
+	const skipped = ["node_modules", ".git", "dist", ".astro", ".wrangler", "public"]
+		.map((dir) => `-path ./${dir}`)
+		.join(" -o ");
+	return (
+		`find . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
+		"| sha256sum | cut -d ' ' -f 1"
+	);
+}
+
+/** Undefined when the digest cannot be computed. */
+async function typecheckInputsFingerprint(sandbox: SandboxInstance): Promise<string | undefined> {
+	try {
+		const result = await sandbox.exec(typecheckInputsFingerprintCommand(), {
+			cwd: SITE_PATH,
+			timeout: 15_000,
+		});
+		const digest = result.stdout.trim();
+		return result.success && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
+	} catch (error) {
+		if (isSandboxRuntimeReplacement(error)) throw error;
+		return undefined;
+	}
 }
 
 async function auditSandboxPublicSite(sandbox: SandboxInstance): Promise<PublicSiteAuditResult> {
@@ -1927,13 +1963,28 @@ export function createTools(
 						};
 					}
 
-					const result = await runSandboxRead((sandbox) =>
-						sandbox.exec("pnpm validate", {
-							cwd: SITE_PATH,
-							timeout: 120_000,
-							signal: options.abortSignal,
-						}),
-					);
+					// A content-only change leaves the typecheck's inputs as they were
+					// when it last passed; skip it and keep the content-dependent checks.
+					const fingerprint = callbacks.typecheckCache
+						? await runSandboxRead((sandbox) => typecheckInputsFingerprint(sandbox))
+						: undefined;
+					const typecheckSkipped =
+						fingerprint !== undefined && fingerprint === callbacks.typecheckCache?.lastPassed();
+					const result = typecheckSkipped
+						? {
+								success: true,
+								exitCode: 0,
+								stdout:
+									"Source, generated types and config are unchanged since they last passed the frontend check and Astro typecheck, so those were skipped.",
+								stderr: "",
+							}
+						: await runSandboxRead((sandbox) =>
+								sandbox.exec("pnpm validate", {
+									cwd: SITE_PATH,
+									timeout: 120_000,
+									signal: options.abortSignal,
+								}),
+							);
 					const blockRendererValidation =
 						result.success && callbacks.validateBlockContracts
 							? await runSandboxRead((sandbox) => callbacks.validateBlockContracts!(sandbox))
@@ -1977,6 +2028,7 @@ export function createTools(
 							.join("\n"),
 						...(publicSiteAudit ? { publicSiteAudit } : {}),
 						...(blockRendererValidation ? { blockRendererValidation } : {}),
+						...(typecheckSkipped ? { typecheckSkipped: true as const } : {}),
 					};
 					if (!convergence.recordValidationResult(observation, output, success)) {
 						return {
@@ -1984,6 +2036,13 @@ export function createTools(
 							retryable: true as const,
 							error: "The site changed during validation. Retry against the current revision.",
 						};
+					}
+					// The revision held still through the typecheck; a change the builder does
+					// not track (such as types regenerated after an Admin schema edit) would
+					// still change the digest, so the pass is recorded only if it matches.
+					if (fingerprint !== undefined && result.success && !typecheckSkipped) {
+						const after = await runSandboxRead((sandbox) => typecheckInputsFingerprint(sandbox));
+						if (after === fingerprint) callbacks.typecheckCache?.recordPassed(fingerprint);
 					}
 					if (!success || !options.previewImagesEnabled) return output;
 					// The completion gate needs a final look at the validated revision.
