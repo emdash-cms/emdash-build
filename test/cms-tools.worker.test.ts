@@ -1,4 +1,5 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
+import { MockLanguageModelV3 } from "ai/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BuildConvergence } from "../src/worker/build-convergence.js";
 import { McpToolFailureGuard } from "../src/worker/mcp-tool-guard.js";
@@ -1203,6 +1204,156 @@ describe("create_entries_batch schema filter", () => {
 			const slugs = await harness.fetchCollectionFieldSlugs("posts");
 
 			expect(slugs && [...slugs]).toEqual(["title"]);
+		});
+	});
+});
+
+describe("create_entries_batch drafting", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("drafts six bodies at a time at low effort with room for reasoning and prose", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000031");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			installBlockCms(instance, calls);
+			const harness = instance as unknown as CmsToolHarness & {
+				createTurnModel: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildContentBatchTool: (convergence: BuildConvergence) => {
+					create_entries_batch: ExecutableTool;
+				};
+			};
+			const requests: Array<{ maxOutputTokens?: number; providerOptions?: unknown }> = [];
+			let active = 0;
+			let peak = 0;
+			harness.createTurnModel = () =>
+				new MockLanguageModelV3({
+					doGenerate: async (options) => {
+						requests.push({
+							maxOutputTokens: options.maxOutputTokens,
+							providerOptions: options.providerOptions,
+						});
+						active += 1;
+						peak = Math.max(peak, active);
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						active -= 1;
+						return {
+							content: [{ type: "text", text: "A real paragraph about bread." }],
+							finishReason: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 20, text: 20, reasoning: 0 },
+							},
+							warnings: [],
+						};
+					},
+				});
+			harness.fetchCollectionFieldSlugs = async () => null;
+			harness.refreshAndReloadPreview = async () => {};
+			harness.callMcpTool = async (name, _serverId, _inputSchema, args) => {
+				calls.push({ name, args });
+				return mcpJson({ item: { id: String(args.slug) } });
+			};
+
+			const tools = harness.buildContentBatchTool(new BuildConvergence());
+			const result = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm and specific.",
+					entries: Array.from({ length: 12 }, (_, index) => ({
+						title: `Loaf ${index + 1}`,
+						brief: "How this loaf is made.",
+					})),
+				},
+				toolOptions,
+			);
+
+			expect(result).toMatchObject({ success: true, created: 12, total: 12 });
+			expect(peak).toBe(6);
+			expect(requests).toHaveLength(12);
+			for (const request of requests) {
+				expect(request.maxOutputTokens).toBe(4096);
+				expect(request.providerOptions).toEqual({
+					openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+				});
+			}
+		});
+	});
+});
+
+describe("create_entries_batch truncated bodies", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("redrafts a body cut off at the length limit instead of publishing half of it", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000032");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			installBlockCms(instance, calls);
+			const harness = instance as unknown as CmsToolHarness & {
+				createTurnModel: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildContentBatchTool: (convergence: BuildConvergence) => {
+					create_entries_batch: ExecutableTool;
+				};
+			};
+			const finishes = ["length", "stop", "length", "length", "length", "length"];
+			harness.createTurnModel = () =>
+				new MockLanguageModelV3({
+					doGenerate: async () => {
+						const finish = finishes.shift() ?? "stop";
+						return {
+							content: [{ type: "text", text: finish === "length" ? "Half a par" : "Whole body." }],
+							finishReason: { unified: finish === "length" ? "length" : "stop", raw: finish },
+							usage: {
+								inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 20, text: 20, reasoning: 0 },
+							},
+							warnings: [],
+						};
+					},
+				});
+			harness.fetchCollectionFieldSlugs = async () => null;
+			harness.refreshAndReloadPreview = async () => {};
+			harness.callMcpTool = async (name, _serverId, _inputSchema, args) => {
+				calls.push({ name, args });
+				return mcpJson({ item: { id: String(args.slug) } });
+			};
+
+			const tools = harness.buildContentBatchTool(new BuildConvergence());
+			// One entry at a time keeps the scripted finish reasons in order.
+			const first = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm.",
+					entries: [{ title: "Rye", brief: "Rye loaves." }],
+				},
+				toolOptions,
+			);
+			const second = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm.",
+					entries: [{ title: "Spelt", brief: "Spelt loaves." }],
+				},
+				toolOptions,
+			);
+
+			expect(first).toMatchObject({ success: true, created: 1 });
+			expect(second).toMatchObject({
+				success: false,
+				created: 0,
+				results: [{ title: "Spelt", ok: false, error: expect.stringContaining("cut off") }],
+			});
+			const created = calls.filter((call) => call.name === "content_create");
+			expect(created).toHaveLength(1);
+			expect(JSON.stringify(created[0]?.args)).toContain("Whole body.");
 		});
 	});
 });

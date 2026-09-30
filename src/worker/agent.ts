@@ -307,6 +307,13 @@ const SSR_OPTIMIZE_EXCLUDES = ["astro/app/manifest"];
 const CLONE_TOKEN_TTL_SECONDS = 3600;
 /** Step cap for one build turn; see the streamText call in onChatMessage. */
 const BUILD_STEP_CAP = 256;
+/**
+ * Entry bodies are independent model calls with no tools, so they draft in
+ * parallel; publishing them through the dev server stays serial.
+ */
+const ENTRY_BODY_CONCURRENCY = 6;
+/** Reasoning counts against the limit, so leave room for it on top of 3-6 paragraphs. */
+const ENTRY_BODY_MAX_OUTPUT_TOKENS = 4096;
 
 /** Max console lines retained in memory for reload rehydration. */
 const CONSOLE_BUFFER_MAX = 500;
@@ -5947,12 +5954,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					let draftedCount = 0;
 					drafting.set(`Drafting (0/${entries.length})...`);
 					this.sendConsole(`Generating ${entries.length} entry bodies in parallel...`);
-					const generateBody = async (entry: { title: string; brief: string }) => {
+					const generateBody = async (entry: {
+						title: string;
+						brief: string;
+					}): Promise<{ body: string } | { body: null; error: string }> => {
 						const MAX = 4;
+						let problem = "empty body generated";
 						for (let attempt = 0; attempt < MAX; attempt++) {
 							abortSignal?.throwIfAborted();
 							try {
-								const { text, usage } = await generateText({
+								const { text, usage, finishReason } = await generateText({
 									model: genModel,
 									abortSignal,
 									system: [
@@ -5963,14 +5974,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 										"frontmatter, no title line, no preamble such as 'Here is'. Output only the body markdown.",
 									].join("\n"),
 									prompt: `Title: ${entry.title}\n\nWrite about: ${entry.brief}`,
-									maxOutputTokens: 2048,
+									maxOutputTokens: ENTRY_BODY_MAX_OUTPUT_TOKENS,
 									providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.entryBody, {
 										reasoningSummary: false,
 									}),
 								});
 								metrics?.addSubcall(usage);
+								// A body cut off at the token limit would publish half an article.
+								if (finishReason === "length") {
+									problem = "body generation was cut off at the length limit";
+									continue;
+								}
 								const body = text.trim();
-								if (body.length > 0) return body;
+								if (body.length > 0) return { body };
+								problem = "empty body generated";
 							} catch (err) {
 								abortSignal?.throwIfAborted();
 								// Retry capacity/rate errors with backoff; rethrow the rest.
@@ -5982,13 +5999,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								throw err;
 							}
 						}
-						return null;
+						return { body: null, error: problem };
 					};
-					const drafted = await mapLimit(entries, 3, async (entry) => {
+					const drafted = await mapLimit(entries, ENTRY_BODY_CONCURRENCY, async (entry) => {
 						abortSignal?.throwIfAborted();
 						try {
-							const body = await generateBody(entry);
-							return { entry, body, error: body ? undefined : "empty body generated" };
+							const generated = await generateBody(entry);
+							return {
+								entry,
+								body: generated.body,
+								error: generated.body === null ? generated.error : undefined,
+							};
 						} catch (err) {
 							return {
 								entry,
