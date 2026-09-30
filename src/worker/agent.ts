@@ -145,6 +145,9 @@ import {
 	canReuseFinalSnapshotForTurn,
 	canSkipFinalSnapshot,
 	publishStagingCommand,
+	SNAPSHOT_GIT_DIR,
+	snapshotCommitCommand,
+	snapshotPushCommand,
 	snapshotStagingCommand,
 } from "./session-snapshot.js";
 import { renderErrorSummary } from "./render-diagnostics.js";
@@ -251,6 +254,7 @@ const BUILDER_TEMPLATE_DIR = "builder-cloudflare";
 const SNAPSHOT_PATH = "/tmp/emdash-build-session-snapshot";
 const PUBLISH_PATH = "/tmp/emdash-build-publish";
 const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
+const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
 const PRODUCTION_SNAPSHOT_PORT = 4322;
@@ -2327,11 +2331,37 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * The repo name is the DO id; the namespace is the binding's. Returns the
 	 * git remote and a fresh write token.
 	 */
-	private async ensureArtifactsRepo(): Promise<{ remote: string; token: string }> {
+	/** A write token cached across checkpoints; minting one per checkpoint costs a round trip. */
+	private artifactsWriteAccess?: { remote: string; token: string; expiresAt: number };
+
+	private async writableArtifactsRepo(): Promise<{ remote: string; token: string }> {
+		const cached = this.artifactsWriteAccess;
+		if (cached && Date.now() < cached.expiresAt) return cached;
+		const access = await this.ensureArtifactsRepo();
+		// Only a token of known lifetime is reused, and renewed well before a long push outlives it.
+		if (access.ttlSeconds) {
+			this.artifactsWriteAccess = {
+				remote: access.remote,
+				token: access.token,
+				expiresAt: Date.now() + Math.min(10 * 60_000, (access.ttlSeconds * 1000) / 2),
+			};
+		}
+		return access;
+	}
+
+	private async ensureArtifactsRepo(): Promise<{
+		remote: string;
+		token: string;
+		ttlSeconds?: number;
+	}> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("write", 900);
-			return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
+			return {
+				remote: await this.resolveArtifactsRemote(repo),
+				token: tok.plaintext,
+				ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
+			};
 		} catch (err) {
 			if (!isArtifactsNotFound(err)) throw err;
 			// First save for this session: create the repo. `create` returns a
@@ -3408,7 +3438,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		if (!quiet) this.sendStatus("Saving session...");
 		try {
-			const { remote, token } = await this.ensureArtifactsRepo();
+			const { remote, token } = await this.writableArtifactsRepo();
 			// Git must never scan the live Vite/SQLite tree: files can change beneath
 			// its object reader and produce an unusable snapshot. Copy at a completed
 			// tool/turn boundary, then commit only the stable staging tree.
@@ -3425,17 +3455,31 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (!staged.success) {
 				throw new Error(staged.stderr || staged.stdout || "session staging copy failed");
 			}
-			const script = [
-				`cd ${SNAPSHOT_PATH}`,
-				"git init -q",
-				`git config user.email ${shellQuote(ARTIFACTS_GIT_EMAIL)}`,
-				`git config user.name ${shellQuote(ARTIFACTS_GIT_USER)}`,
-				"git add -A",
-				`git commit -q --allow-empty -m ${shellQuote(`session snapshot ${new Date().toISOString()}`)}`,
-				// The Sandbox RPC timeout does not kill a stalled git child. Bound it inside the container.
-				`timeout --signal=TERM --kill-after=2s ${SNAPSHOT_PUSH_TIMEOUT_SECONDS}s git push -q ${shellQuote(remote)} HEAD:main --force`,
-			].join(" && ");
-			let result = await sandbox.exec(script, {
+			const commit = snapshotCommitCommand({
+				snapshotPath: SNAPSHOT_PATH,
+				gitDir: SNAPSHOT_GIT_DIR,
+				message: `session snapshot ${new Date().toISOString()}`,
+				name: ARTIFACTS_GIT_USER,
+				email: ARTIFACTS_GIT_EMAIL,
+			});
+			let committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+			if (!committed.success) {
+				// A damaged snapshot repository costs only one full upload to rebuild.
+				this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
+				await sandbox
+					.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000 })
+					.catch(() => undefined);
+				committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+			}
+			if (!committed.success) {
+				throw new Error(committed.stderr || committed.stdout || "session snapshot commit failed");
+			}
+			const push = snapshotPushCommand({
+				gitDir: SNAPSHOT_GIT_DIR,
+				remote,
+				timeoutSeconds: SNAPSHOT_PUSH_TIMEOUT_SECONDS,
+			});
+			let result = await sandbox.exec(push, {
 				cwd: SNAPSHOT_PATH,
 				timeout: 65_000,
 				env: artifactsGitEnv(token),
@@ -3443,13 +3487,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (!result.success && isTransientSnapshotPushFailure(result)) {
 				this.sendConsole("Session snapshot upload was interrupted; retrying once...");
 				await new Promise((resolve) => setTimeout(resolve, 1000));
-				result = await sandbox.exec(script, {
+				result = await sandbox.exec(push, {
 					cwd: SNAPSHOT_PATH,
 					timeout: 65_000,
 					env: artifactsGitEnv(token),
 				});
 			}
 			if (!result.success) {
+				// A rejected token must not be reused for the next checkpoint.
+				this.artifactsWriteAccess = undefined;
 				throw new Error(
 					result.exitCode === 124
 						? "Session snapshot upload timed out."

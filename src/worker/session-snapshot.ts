@@ -103,3 +103,70 @@ export function publishStagingCommand(
 		`${shellQuote(`${publishPath}/node_modules`)} {} +`
 	);
 }
+
+/** Snapshot git metadata, beside the staging copy so it survives each rebuild of it. */
+export const SNAPSHOT_GIT_DIR = "/tmp/emdash-build-session-git";
+
+/**
+ * Commit the staged tree as a new root commit, in a git directory kept beside
+ * the staging copy so it survives each rebuild of that copy. The remote still
+ * holds one snapshot commit, but the previous snapshot's objects stay local,
+ * so the next push sends only what changed. Prints the new commit id.
+ *
+ * It runs in a subshell: the sandbox's default session keeps exported
+ * variables and the working directory for later commands. The index is
+ * rebuilt each time, so a lock left by a killed commit cannot wedge later
+ * ones and the site's .gitignore applies afresh (every file is rehashed after
+ * the staging rebuild anyway).
+ */
+export function snapshotCommitCommand(options: {
+	snapshotPath: string;
+	gitDir: string;
+	message: string;
+	name: string;
+	email: string;
+}): string {
+	const steps = [
+		`export GIT_DIR=${shellQuote(options.gitDir)} GIT_WORK_TREE=${shellQuote(options.snapshotPath)}`,
+		`cd ${shellQuote(options.snapshotPath)}`,
+		'{ test -f "$GIT_DIR/HEAD" || git init -q; }',
+		'rm -f "$GIT_DIR/index" "$GIT_DIR/index.lock" "$GIT_DIR"/refs/heads/*.lock',
+		`git config user.email ${shellQuote(options.email)}`,
+		`git config user.name ${shellQuote(options.name)}`,
+		// A background gc would stall a checkpoint; old snapshots are pruned after uploads.
+		"git config gc.auto 0",
+		"git config core.logAllRefUpdates false",
+		"git add -A",
+		"tree=$(git write-tree)",
+		`commit=$(git commit-tree "$tree" -m ${shellQuote(options.message)})`,
+		'git update-ref refs/heads/snapshot "$commit"',
+		'echo "$commit"',
+	];
+	return `( ${steps.join(" && ")} )`;
+}
+
+/**
+ * Push the latest committed snapshot over the remote's main branch and print
+ * the pushed commit. It needs no work tree, so it runs from the git directory
+ * while the next checkpoint rebuilds the staging copy. The pushed commit stays
+ * local, which keeps the next push incremental; older snapshots are pruned.
+ * `--no-thin` keeps each pack self-contained. The Sandbox RPC timeout does not
+ * kill a stalled git child, so the push is bounded inside the container.
+ */
+export function snapshotPushCommand(options: {
+	gitDir: string;
+	remote: string;
+	timeoutSeconds: number;
+}): string {
+	const steps = [
+		`export GIT_DIR=${shellQuote(options.gitDir)}`,
+		'cd "$GIT_DIR"',
+		"commit=$(git rev-parse refs/heads/snapshot)",
+		`timeout --signal=TERM --kill-after=2s ${options.timeoutSeconds}s git push -q --no-thin ${shellQuote(options.remote)} "$commit:refs/heads/main" --force`,
+		'git update-ref refs/heads/pushed "$commit"',
+		// Objects younger than an hour may belong to a commit still being written.
+		"{ git prune --expire=1.hour.ago >/dev/null 2>&1 || true; }",
+		'echo "$commit"',
+	];
+	return `( ${steps.join(" && ")} )`;
+}
