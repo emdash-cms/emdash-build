@@ -352,6 +352,139 @@ describe("build loop convergence", () => {
 		}
 	});
 
+	it("stops forcing a failure the model could not repair after three forced steps", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] body: required",
+		});
+		const tools = ["content_create", "view_preview"] as const;
+
+		for (let step = 0; step < 3; step++) {
+			expect(prepareBuildStep(convergence, [] as never, tools).allowedTools).toEqual({
+				toolNames: ["content_create"],
+				mode: "required",
+			});
+			// The retry used a new title, so the original key never resolves.
+			convergence.recordUnresolvedFailure({
+				key: "content:posts:rye",
+				toolName: "content_create",
+				error: "[VALIDATION_ERROR] body: required",
+			});
+		}
+
+		expect(prepareBuildStep(convergence, [] as never, tools).allowedTools).toBeUndefined();
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+		expect(convergence.abandonedFailures()).toEqual([
+			expect.objectContaining({ key: "content:posts:rye", toolName: "content_create" }),
+		]);
+		recordCompleteEvidence(convergence);
+		convergence.finishStep({});
+		convergence.finishStep({});
+		expect(canCompleteBuild(convergence, "stop")).toBe(true);
+	});
+
+	it("spends one forced-repair budget per tool, not per failed item", () => {
+		const convergence = new BuildConvergence();
+		for (const name of ["a", "b", "c", "d", "e"]) {
+			convergence.recordUnresolvedFailure({
+				key: `media\0${name}.jpg`,
+				toolName: "upload_media",
+				error: "HTTP 503",
+			});
+		}
+		let forced = 0;
+		for (let step = 0; step < 10; step++) {
+			const prepared = prepareBuildStep(convergence, [] as never, ["upload_media"]);
+			if (!prepared.allowedTools) break;
+			forced += 1;
+			// Each forced batch retries every image, and they all fail again.
+			for (const name of ["a", "b", "c", "d", "e"]) {
+				convergence.recordUnresolvedFailure({
+					key: `media\0${name}.jpg`,
+					toolName: "upload_media",
+					error: "HTTP 503",
+				});
+			}
+			convergence.finishStep({
+				toolResults: [{ toolName: "upload_media", output: { success: false } }],
+			});
+		}
+
+		expect(forced).toBe(3);
+		expect(convergence.abandonedFailures()).toHaveLength(5);
+	});
+
+	it("resolves the forced failure when the forced call succeeds under a new identity", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR]",
+		});
+		prepareBuildStep(convergence, [] as never, ["content_create"]);
+		// The retry used a new title, so the tool resolved no key itself.
+		convergence.finishStep({
+			toolResults: [{ toolName: "content_create", output: { content: [{ type: "text" }] } }],
+		});
+
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+		expect(convergence.abandonedFailures()).toEqual([]);
+	});
+
+	it("keeps a forced failure the same step recorded again, even when the call partly succeeded", () => {
+		const convergence = new BuildConvergence();
+		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
+		convergence.recordUnresolvedFailure(failure);
+		prepareBuildStep(convergence, [] as never, ["upload_media"]);
+		convergence.recordUnresolvedFailure(failure);
+		convergence.finishStep({
+			toolResults: [{ toolName: "upload_media", output: { success: true, uploaded: 2 } }],
+		});
+
+		expect(convergence.hasUnresolvedFailures()).toBe(true);
+	});
+
+	it("tells the model which repairs it stopped being made to attempt", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] body: required",
+		});
+		for (let step = 0; step < 3; step++) {
+			prepareBuildStep(convergence, [] as never, ["content_create"]);
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { success: false } }],
+			});
+		}
+
+		const { messages } = prepareBuildStep(convergence, [] as never, ["content_create"]);
+		const note = JSON.stringify(messages.at(-1));
+		expect(messages.at(-1)?.role).toBe("user");
+		expect(note).toContain("body: required");
+		expect(note).toContain("summary");
+	});
+
+	it("forces a new failure again after an earlier one is resolved", () => {
+		const convergence = new BuildConvergence();
+		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
+		convergence.recordUnresolvedFailure(failure);
+		prepareBuildStep(convergence, [] as never, ["upload_media"]);
+		convergence.resolveUnresolvedFailure(failure.key);
+		convergence.recordUnresolvedFailure(failure);
+
+		// Resolution resets the budget: a later failure of the same slot is forced again.
+		for (let step = 0; step < 3; step++) {
+			expect(prepareBuildStep(convergence, [] as never, ["upload_media"]).allowedTools).toEqual({
+				toolNames: ["upload_media"],
+				mode: "required",
+			});
+		}
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
 	it("allows one more step after a refused shell command, then forces text", () => {
 		const convergence = new BuildConvergence();
 		recordCompleteEvidence(convergence);

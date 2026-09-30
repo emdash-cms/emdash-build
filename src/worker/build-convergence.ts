@@ -31,6 +31,13 @@ function canonicalJson(value: unknown): unknown {
 	);
 }
 
+/**
+ * Forced repair steps per unresolved failure. A retry that changes the
+ * failure's identity (a new title or filename) never resolves the original
+ * key, and forcing it on every step would run the turn to its step cap.
+ */
+const MAX_FORCED_RECOVERY_STEPS = 3;
+
 export function mutationKey(toolName: string, input: unknown): string {
 	return `${toolName}\0${JSON.stringify(canonicalJson(input))}`;
 }
@@ -57,6 +64,10 @@ export class BuildConvergence {
 	private mutationResults = new Map<string, unknown>();
 	private mutationTail: Promise<void> = Promise.resolve();
 	private unresolvedFailures = new Map<string, UnresolvedBuildFailure>();
+	private forcedRecoveries = new Map<string, number>();
+	/** The failure the current step was forced to repair, and failures it recorded again. */
+	private forcedStep?: { key: string; toolName: string };
+	private rerecordedFailures = new Set<string>();
 
 	constructor(private readonly abortSignal?: AbortSignal) {}
 
@@ -280,20 +291,51 @@ export class BuildConvergence {
 	}
 
 	recordUnresolvedFailure(failure: UnresolvedBuildFailure): void {
+		this.rerecordedFailures.add(failure.key);
 		this.unresolvedFailures.set(failure.key, failure);
 		this.forceText = false;
 	}
 
 	resolveUnresolvedFailure(key: string): void {
 		this.unresolvedFailures.delete(key);
+		this.forcedRecoveries.delete(key);
 	}
 
+	private isAbandoned(failure: UnresolvedBuildFailure): boolean {
+		return (this.forcedRecoveries.get(failure.key) ?? 0) >= MAX_FORCED_RECOVERY_STEPS;
+	}
+
+	/** Failures still worth forcing a repair for; abandoned ones no longer block completion. */
 	hasUnresolvedFailures(): boolean {
-		return this.unresolvedFailures.size > 0;
+		return this.nextUnresolvedFailure() !== undefined;
 	}
 
 	nextUnresolvedFailure(): UnresolvedBuildFailure | undefined {
-		return this.unresolvedFailures.values().next().value;
+		for (const failure of this.unresolvedFailures.values()) {
+			if (!this.isAbandoned(failure)) return failure;
+		}
+		return undefined;
+	}
+
+	/**
+	 * A step is about to force a repair of this failure. A forced call usually
+	 * retries every failure of its tool at once (an image batch, say), so the
+	 * step counts against all of them rather than against each in turn.
+	 */
+	noteForcedRecovery(key: string): void {
+		const forced = this.unresolvedFailures.get(key);
+		if (!forced) return;
+		for (const failure of this.unresolvedFailures.values()) {
+			if (failure.toolName !== forced.toolName) continue;
+			this.forcedRecoveries.set(failure.key, (this.forcedRecoveries.get(failure.key) ?? 0) + 1);
+		}
+		this.forcedStep = { key, toolName: forced.toolName };
+		this.rerecordedFailures.clear();
+	}
+
+	/** Failures that stayed unresolved through every forced repair step. */
+	abandonedFailures(): UnresolvedBuildFailure[] {
+		return [...this.unresolvedFailures.values()].filter((failure) => this.isAbandoned(failure));
 	}
 
 	markEvidenceExposed(): void {
@@ -303,6 +345,7 @@ export class BuildConvergence {
 	}
 
 	finishStep(step: BuildConvergenceStep): void {
+		this.settleForcedStep(step);
 		if (!this.hasCompleteEvidence()) {
 			if (this.hasCurrentValidation() && this.stepFailed(step, "view_preview")) {
 				this.finalPreviewFailures += 1;
@@ -324,6 +367,23 @@ export class BuildConvergence {
 			if (this.postEvidenceFailures < 2) return;
 		}
 		this.forceText = true;
+	}
+
+	/**
+	 * A forced call that succeeded repaired its failure even when the retry
+	 * changed the failure's identity (a new title, say), which leaves the
+	 * original key unresolved; forcing it again could create a duplicate.
+	 */
+	private settleForcedStep(step: BuildConvergenceStep): void {
+		const forced = this.forcedStep;
+		const rerecorded = this.rerecordedFailures;
+		this.forcedStep = undefined;
+		this.rerecordedFailures = new Set();
+		if (!forced || rerecorded.has(forced.key)) return;
+		const called = (step.toolResults ?? []).some((result) => result.toolName === forced.toolName);
+		if (called && !this.stepFailed(step, forced.toolName)) {
+			this.resolveUnresolvedFailure(forced.key);
+		}
 	}
 
 	private stepFailed(step: BuildConvergenceStep, toolName?: string): boolean {
@@ -493,6 +553,26 @@ export function canCompleteBuild(convergence: BuildConvergence, finishReason: un
 	);
 }
 
+const ABANDONED_REPAIR_NOTE =
+	"The builder stopped requiring repairs for these failures after three attempts. Fix them if you can; otherwise say in your final summary what is still missing:";
+
+/** Keep abandoned repairs in front of the model so its summary reports them. */
+function withAbandonedRepairNote(
+	messages: ModelMessage[],
+	convergence: BuildConvergence,
+): ModelMessage[] {
+	const abandoned = convergence.abandonedFailures().slice(0, 5);
+	if (abandoned.length === 0) return messages;
+	const lines = abandoned.map((failure) => `- ${failure.toolName}: ${failure.error.slice(0, 200)}`);
+	return [
+		...messages,
+		{
+			role: "user",
+			content: [{ type: "text", text: [ABANDONED_REPAIR_NOTE, ...lines].join("\n") }],
+		},
+	];
+}
+
 /**
  * One step's gating. The full tool list is always sent: narrowing it changes
  * the cached prompt prefix, so `allowedTools` restricts calls through the
@@ -520,7 +600,7 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 		convergence.recordPreviewDelivery(convergence.currentRevision());
 		convergence.markEvidenceExposed();
 	}
-	const prunedMessages = preparedPreview.messages;
+	const prunedMessages = withAbandonedRepairNote(preparedPreview.messages, convergence);
 	// A shell command counts as a mutation, so it would void current validation.
 	const callable = convergence.hasCurrentValidation()
 		? toolNames.filter((toolName) => toolName !== "exec")
@@ -533,7 +613,10 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 	const recoveryTool = unresolved
 		? callable.find((toolName) => toolName === unresolved.toolName)
 		: undefined;
-	if (recoveryTool) return required(recoveryTool);
+	if (unresolved && recoveryTool) {
+		convergence.noteForcedRecovery(unresolved.key);
+		return required(recoveryTool);
+	}
 	if (convergence.shouldForceText()) {
 		return { messages: prunedMessages, toolChoice: "none" };
 	}
