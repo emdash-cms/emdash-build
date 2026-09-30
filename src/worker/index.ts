@@ -1,4 +1,3 @@
-import { proxyToSandbox } from "@cloudflare/sandbox";
 import { routeAgentRequest } from "agents";
 import { Hono } from "hono";
 import {
@@ -20,6 +19,7 @@ import {
 import { resolveOwner } from "./owner-auth.js";
 import { withVerifiedAgentAuth } from "./agent-authorization.js";
 import { enableLocalPreviewEditorSessionCookie, injectPreviewBridge } from "./preview-bridge.js";
+import { routePreviewRequest } from "./preview-router.js";
 import { routeProviderSite } from "./site-routing.js";
 import { activePublishedSlugForSite, publishedSlugForSite } from "./published-slugs.js";
 import { transcribeDictation } from "./transcribe.js";
@@ -556,7 +556,7 @@ app.post("/api/projects/:projectId/validation/resume-preview", async (c) => {
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		// Sandbox preview proxy must be checked first
-		const proxyResponse = await proxyToSandbox(request, env);
+		const proxyResponse = await routePreviewRequest(request, env);
 		if (proxyResponse) {
 			// Reconstructing a 101 Response drops its WebSocket. Return upgrades
 			// unchanged so Vite HMR can traverse the Sandbox preview proxy.

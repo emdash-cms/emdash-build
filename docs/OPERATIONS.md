@@ -160,7 +160,7 @@ replayed with the same key so the control plane reconciles remote identity.
   the stable sandbox id and reloads only after recovery succeeds.
 - Opening an existing sidebar project proactively wakes the Sandbox and
   reactivates port forwarding. Vite HMR uses the public preview host, and the
-  Worker must preserve WebSocket upgrade responses from `proxyToSandbox`.
+  Worker must preserve WebSocket upgrade responses from `routePreviewRequest`.
 - Serialize per-site MCP calls through the Astro dev runner and reload the
   preview only for mutating CMS tools. Parallel MCP bursts otherwise queue
   user page loads behind several multi-second dynamic requests.
