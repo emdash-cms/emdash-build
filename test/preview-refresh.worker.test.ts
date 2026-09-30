@@ -185,3 +185,38 @@ describe("preview refresh loop robustness", () => {
 		});
 	});
 });
+
+describe("dependencies for a restored site", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("reuses the image's dependencies and installs only when the lockfile changed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000044");
+		await runInDurableObject(agent, async (instance) => {
+			let preparedExit = 0;
+			const exec = vi.fn(async (command: string) => ({
+				success: !command.includes("cmp -s") || preparedExit === 0,
+				exitCode: command.includes("cmp -s") ? preparedExit : 0,
+				stdout: "",
+				stderr: "",
+			}));
+			const installDeps = vi.fn(async () => 0);
+			const harness = instance as unknown as {
+				getOrCreateSandbox: () => unknown;
+				installDeps: typeof installDeps;
+				restoreDependencies: () => Promise<number>;
+			};
+			harness.getOrCreateSandbox = () => ({ exec });
+			harness.installDeps = installDeps;
+
+			await expect(harness.restoreDependencies()).resolves.toBe(0);
+			expect(installDeps).not.toHaveBeenCalled();
+			expect(String(exec.mock.calls[0]?.[0])).toContain("builder-cloudflare.tgz");
+
+			preparedExit = 1;
+			await expect(harness.restoreDependencies()).resolves.toBe(0);
+			expect(installDeps).toHaveBeenCalledOnce();
+		});
+	});
+});

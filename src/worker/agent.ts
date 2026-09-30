@@ -114,7 +114,7 @@ import {
 	emptyInitialScaffoldContext,
 	type InitialScaffoldContext,
 } from "./initial-scaffold.js";
-import { drainProvisionTasks } from "./provisioning.js";
+import { drainProvisionTasks, preparedDependenciesCommand } from "./provisioning.js";
 import {
 	BuildConvergence,
 	canCompleteBuild,
@@ -2996,6 +2996,37 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
+	/**
+	 * Dependencies for a site cloned from its snapshot, which excludes
+	 * `node_modules`. The image's prepared scaffold already has them installed,
+	 * and the image has no package store, so `pnpm install` would download all
+	 * of them again; reuse them while the lockfile is still the scaffold's.
+	 */
+	private async restoreDependencies(signal?: AbortSignal): Promise<number> {
+		const archive = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}.tgz`;
+		const lockfile = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}/pnpm-lock.yaml`;
+		const sandbox = this.getOrCreateSandbox();
+		this.sendStatus("Restoring dependencies...");
+		const reused = await sandbox
+			.exec(preparedDependenciesCommand(archive, SITE_PATH, lockfile), {
+				timeout: 180_000,
+				signal,
+			})
+			.catch(() => undefined);
+		signal?.throwIfAborted();
+		if (reused?.success) {
+			this.sendConsole("Restored dependencies from the prepared image.");
+			return 0;
+		}
+		if (reused?.exitCode !== 1) {
+			// An interrupted extraction must not leave pnpm half a dependency tree.
+			await sandbox
+				.exec(`rm -rf ${shellQuote(`${SITE_PATH}/node_modules`)}`, { timeout: 60_000 })
+				.catch(() => undefined);
+		}
+		return this.installDeps(signal);
+	}
+
 	/** Run `pnpm install` in the site dir, streaming logs. Returns the exit code. */
 	private async installDeps(signal?: AbortSignal): Promise<number> {
 		signal?.throwIfAborted();
@@ -3400,7 +3431,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				);
 				return { ready: false, error: "The saved site snapshot could not be restored." };
 			}
-			const installCode = await this.installDeps();
+			const installCode = await this.restoreDependencies();
 			if (installCode !== 0) {
 				this.sendConsole(`pnpm install failed during restore (exit ${installCode})`);
 				return { ready: false, error: "Dependencies could not be restored for the saved site." };
