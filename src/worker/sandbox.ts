@@ -149,6 +149,12 @@ export class Sandbox extends CloudflareSandbox<Env> {
 		return this.currentGeneration();
 	}
 
+	/** Mark every snapshot stale at a builder mutation; renders follow separately. */
+	async invalidatePreviewSnapshots(): Promise<number> {
+		this.invalidatePreviews();
+		return this.currentGeneration();
+	}
+
 	/** Mark every stored snapshot as older than the latest content change. */
 	private invalidatePreviews(): void {
 		this.ctx.storage.sql.exec(

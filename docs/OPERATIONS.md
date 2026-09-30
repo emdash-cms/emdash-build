@@ -28,7 +28,9 @@ also kept in agent state as `lastTurnMetrics`. Fields:
   `subcalls` for batch entry-text model calls
 - per-tool `calls`, `ms` and `failures`, including calls the SDK rejected
   without running them (invalid input, unknown or disabled tool) at 0 ms;
-  `sync` is the preview re-render and backup time spent inside tools
+  `sync` is the time tools wait on sync work: `previewRefresh` for marking
+  preview snapshots stale (the re-render runs in the background) and `backup`
+  for staging and committing a checkpoint (the upload runs in the background)
 - `stepTimings` for the first 64 steps (`stepTimingsOmitted` counts the rest),
   each measured from the step's start: the requested `effort`; `attempts`, the
   model HTTP attempts (above 1, the times include the SDK's retry backoff);

@@ -1493,6 +1493,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Astro's Cloudflare dev runner becomes unresponsive under parallel MCP requests. */
 	private mcpCallQueue = new SerialTaskQueue();
+	/** The background preview render after mutations, and whether another is due. */
+	private previewRefreshRunning?: Promise<void>;
+	private previewRenderInFlight?: Promise<void>;
+	private previewRefreshQueued?: { initialBuild: boolean };
+	/** How long a CMS call waits for a background render before going ahead. */
+	private previewRenderWaitMs = 5_000;
 
 	/**
 	 * Cached template AGENTS.md (per-template body included). Populated
@@ -2544,8 +2550,62 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return false;
 	}
 
-	private refreshAndReloadPreview(initialBuild = false): Promise<void> {
-		return this.refreshAndReloadPreviewInternal(initialBuild);
+	/**
+	 * After a mutation: mark every preview snapshot stale before the tool
+	 * returns, then re-render and reload the preview in the background. Renders
+	 * are coalesced: mutations during one lead to one more render of the newest
+	 * revision. The model's own checks read the dev server directly, so they
+	 * never wait for this.
+	 */
+	private async refreshAndReloadPreview(initialBuild = false): Promise<void> {
+		try {
+			await this.env.Sandbox.getByName(this.name).invalidatePreviewSnapshots();
+		} catch (error) {
+			this.sendConsole(
+				`Warning: preview snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		this.previewRefreshQueued = {
+			initialBuild: initialBuild || (this.previewRefreshQueued?.initialBuild ?? false),
+		};
+		if (this.previewRefreshRunning) return;
+		const running = (async () => {
+			try {
+				while (this.previewRefreshQueued) {
+					const queued = this.previewRefreshQueued;
+					this.previewRefreshQueued = undefined;
+					const render = this.refreshAndReloadPreviewInternal(queued.initialBuild, {
+						invalidate: false,
+					});
+					this.previewRenderInFlight = render;
+					try {
+						await render;
+					} catch (error) {
+						console.warn("[BuilderAgent] background preview refresh failed:", error);
+					}
+				}
+			} finally {
+				// Cleared as the queue drains, so a refresh queued from here on starts a new loop.
+				this.previewRefreshRunning = undefined;
+				this.previewRenderInFlight = undefined;
+			}
+		})();
+		this.previewRefreshRunning = running;
+		this.ctx.waitUntil(running);
+	}
+
+	/**
+	 * The dev server stalls under concurrent renders and CMS requests, so a CMS
+	 * call lets the render in flight finish first: only that one, for a bounded
+	 * time, and not past a Stop, so a wedged render cannot hold every call.
+	 */
+	private async previewRendersIdle(signal?: AbortSignal): Promise<void> {
+		const render = this.previewRenderInFlight;
+		if (!render || signal?.aborted) return;
+		const stopped = new Promise<void>((resolve) =>
+			signal?.addEventListener("abort", () => resolve(), { once: true }),
+		);
+		await Promise.race([settleWithin(render, this.previewRenderWaitMs), stopped]);
 	}
 
 	/**
@@ -2553,12 +2613,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * re-render `/` and the routes open in the builder so the reload that
 	 * follows shows current HTML on whatever page the user is viewing.
 	 */
-	private async refreshPreviewSnapshots(): Promise<boolean> {
+	private async refreshPreviewSnapshots({
+		invalidate = true,
+	}: { invalidate?: boolean } = {}): Promise<boolean> {
 		try {
 			const sandbox = this.env.Sandbox.getByName(this.name);
-			const [home] = await sandbox.refreshPreviews(["/", ...this.viewedPreviewPaths()], {
-				invalidate: true,
-			});
+			const [home] = await sandbox.refreshPreviews(
+				["/", ...this.viewedPreviewPaths()],
+				invalidate ? { invalidate: true } : {},
+			);
 			if (home?.success || home?.rendered) return true;
 			this.sendConsole(
 				home?.error
@@ -2648,8 +2711,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
-	private async refreshAndReloadPreviewInternal(initialBuild = false): Promise<void> {
-		const refreshed = await this.refreshPreviewSnapshots();
+	private async refreshAndReloadPreviewInternal(
+		initialBuild = false,
+		options: { invalidate?: boolean } = {},
+	): Promise<void> {
+		const refreshed = await this.refreshPreviewSnapshots(options);
 		const update = recordPersonalizationMilestone(this.state, initialBuild, refreshed);
 		if (update) this.publishMilestone("personalized", update);
 		this.broadcast(JSON.stringify({ type: "reload" }));
@@ -4612,7 +4678,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			abortSignal?.throwIfAborted();
 			let result: unknown;
 			try {
-				result = await this.mcpCallQueue.run(() => {
+				result = await this.mcpCallQueue.run(async () => {
+					await this.previewRendersIdle(abortSignal);
 					abortSignal?.throwIfAborted();
 					return this.mcp.callTool({ name, arguments: repairedArgs, serverId });
 				});
