@@ -60,7 +60,7 @@ The first build should contain only what the brief needs:
 3. A `primary` menu and a footer/social menu only when genuinely useful.
 4. Site settings updated immediately.
 
-After changing schema, call `refresh_types` and read `emdash-env.d.ts` before writing typechecked queries or block renderers. Never guess generated names.
+A successful `apply_schema_plan` regenerates `emdash-env.d.ts` and returns its declarations in `types`. Write typechecked queries and block renderers from those exact generated names; never guess them. After any other schema change, call `refresh_types`, which returns the declarations too.
 
 ## EmDash rendering contract
 
@@ -142,7 +142,7 @@ Then build without asking permission:
 1. Use the supplied blank-scaffold snapshot. Do not re-read an included file before its first mutation. If you need missing or additional independent source context, request it in one `read_files` call.
 2. State a compact internal content architecture; create all block definitions, collections, and fields in one `apply_schema_plan` call.
 3. Update site settings and create menus.
-4. Call `refresh_types`, read the generated declarations, and create exhaustive typed block renderers/maps before block content.
+4. From the declarations the plan returned, create exhaustive typed block renderers/maps before block content.
 5. Create the shared layout and the first coherent homepage structure. Use real CMS queries from the start.
 6. Call `view_preview` and critique category fit, hierarchy, typography, imagery, spacing, and mobile implications.
 7. Create and publish enough representative content for the requested views, using images and taxonomies where appropriate.

@@ -55,6 +55,8 @@ import {
 	ensureSsrOptimizeDep,
 	ensurePreviewHmr,
 	readFilesFromSandbox,
+	refreshLiveTypes,
+	typeDeclarationsForModel,
 	type DeployResult,
 } from "./tools.js";
 import { buildInterviewPrompt, buildHoldingPrompt, buildBuildPrompt } from "./prompts.js";
@@ -4873,7 +4875,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					"repeater because the current schema MCP does not expose it; model ordered structured values " +
 					"such as a project gallery as a subject-specific block type plus a blocks field. Repeater is " +
 					"valid only inside blockTypes[].fields. The plan is " +
-					"checkpointed once at the end. Call refresh_types after it succeeds.",
+					"checkpointed once at the end. A successful plan regenerates emdash-env.d.ts and returns its " +
+					"declarations in `types`; use those names directly rather than calling refresh_types or reading the file.",
 				inputSchema: schemaPlanInput,
 				execute: async ({ blockTypes = [], collections = [] }, { abortSignal }) => {
 					const hasBlocksFields = collections.some((collection) =>
@@ -5224,11 +5227,19 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									);
 								}
 							}
-							await checkpointChanges();
+							progress.set("Generating types...");
+							let types: Awaited<ReturnType<BuilderAgent["regenerateSiteTypes"]>>;
+							try {
+								types = await this.regenerateSiteTypes(abortSignal);
+							} finally {
+								// A Stop here must not strand the schema changes outside the snapshot.
+								await checkpointChanges();
+							}
 							return {
 								success: true as const,
 								changed: confirmedChanged(),
 								...counters(),
+								types,
 							};
 						},
 						mutationKey("apply_schema_plan", { blockTypes, collections }),
@@ -5236,6 +5247,48 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 			}),
 		};
+	}
+
+	/**
+	 * Regenerate emdash-env.d.ts after a schema change and return what the model
+	 * needs from it. Never throws: a failed refresh leaves the schema change in
+	 * place and tells the model to run refresh_types.
+	 */
+	private async regenerateSiteTypes(
+		abortSignal?: AbortSignal,
+	): Promise<
+		| ({ success: true; file: string } & ReturnType<typeof typeDeclarationsForModel>)
+		| { success: true; file: string; note: string }
+		| { success: false; error: string }
+	> {
+		try {
+			const result = await this.runSandboxRead(
+				(sandbox) => refreshLiveTypes(sandbox, abortSignal),
+				abortSignal,
+			);
+			if (result.success && result.declarations) {
+				return {
+					success: true,
+					file: result.generatedFile ?? "emdash-env.d.ts",
+					...typeDeclarationsForModel(result.declarations),
+				};
+			}
+			if (result.success) {
+				// The legacy CLI writes the types without returning them.
+				const file = result.generatedFile ?? "emdash-env.d.ts";
+				return { success: true, file, note: `Read ${file} for the generated names.` };
+			}
+			return {
+				success: false,
+				error: `Types were not regenerated (${(result.stderr || result.stdout || "no declarations returned").slice(0, 300)}). Call refresh_types before writing typed code.`,
+			};
+		} catch (error) {
+			abortSignal?.throwIfAborted();
+			return {
+				success: false,
+				error: `Types were not regenerated (${error instanceof Error ? error.message : String(error)}). Call refresh_types before writing typed code.`,
+			};
+		}
 	}
 
 	private async runReconciledSchemaWrite(options: {

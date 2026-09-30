@@ -34,6 +34,8 @@ const EDIT_FILES_MAX_EDITS = 12;
 const EDIT_FILES_MAX_BYTES = 192 * 1024;
 const BATCH_READ_EXCLUDED_ROOTS = new Set([".git", ".wrangler", ".astro", "node_modules", "dist"]);
 const TYPEGEN_MAX_BYTES = 2 * 1024 * 1024;
+/** Generated declarations returned to the model; larger files point at the file itself. */
+const TYPE_DECLARATIONS_MAX_CHARS = 60_000;
 
 export interface CanonicalSiteReadPath {
 	path: string;
@@ -802,7 +804,21 @@ async function readResponseTextBounded(response: Response, maximumBytes: number)
 	}
 }
 
-async function refreshLiveTypes(
+/** Generated type declarations as returned to the model, bounded for its context. */
+export function typeDeclarationsForModel(declarations: string): {
+	declarations: string;
+	declarationsTruncated?: true;
+	note?: string;
+} {
+	if (declarations.length <= TYPE_DECLARATIONS_MAX_CHARS) return { declarations };
+	return {
+		declarations: declarations.slice(0, TYPE_DECLARATIONS_MAX_CHARS),
+		declarationsTruncated: true,
+		note: "The declarations were shortened. Read emdash-env.d.ts for the rest before using names beyond this excerpt.",
+	};
+}
+
+export async function refreshLiveTypes(
 	sandbox: SandboxInstance,
 	abortSignal?: AbortSignal,
 ): Promise<{
@@ -811,6 +827,8 @@ async function refreshLiveTypes(
 	stdout: string;
 	stderr: string;
 	generatedFile?: string;
+	/** The generated declarations, when they came from the live expanded schema. */
+	declarations?: string;
 }> {
 	let response: Response;
 	try {
@@ -893,6 +911,7 @@ async function refreshLiveTypes(
 		stdout: "Generated emdash-env.d.ts from the live expanded schema.",
 		stderr: "",
 		generatedFile: "emdash-env.d.ts",
+		declarations: types,
 	};
 }
 
@@ -1762,8 +1781,9 @@ export function createTools(
 
 		refresh_types: tool({
 			description:
-				"Regenerate emdash-env.d.ts from the live expanded schema after creating or changing collections, fields, or block types. " +
-				"Call this once after a coherent schema pass, then read emdash-env.d.ts. Never hand-author replacement block unions.",
+				"Regenerate emdash-env.d.ts from the live expanded schema after creating or changing collections, fields, or block types, " +
+				"and return its declarations. Call this once after a coherent schema pass; apply_schema_plan already does it. " +
+				"Use the returned names exactly and never hand-author replacement block unions.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				trackedMutation(async () => {
@@ -1777,6 +1797,9 @@ export function createTools(
 						stdout: result.stdout.slice(0, 4000),
 						stderr: result.stderr.slice(0, 2000),
 						...(result.generatedFile ? { generatedFile: result.generatedFile } : {}),
+						...(result.success && result.declarations
+							? typeDeclarationsForModel(result.declarations)
+							: {}),
 					};
 				}),
 		}),

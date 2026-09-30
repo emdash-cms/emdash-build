@@ -81,9 +81,11 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const refresh = createTools(sandbox as never, { ...toolCallbacks(), checkpointSite } as never)
 			.refresh_types.execute as unknown as () => Promise<Record<string, unknown>>;
 
+		// The declarations come back with the result, so no separate read is needed.
 		await expect(refresh()).resolves.toMatchObject({
 			success: true,
 			generatedFile: "emdash-env.d.ts",
+			declarations: types,
 		});
 		expect(sandbox.containerFetch).toHaveBeenCalledWith(
 			"http://localhost:4321/_emdash/api/typegen",
@@ -93,6 +95,24 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(sandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 		expect(sandbox.exec).not.toHaveBeenCalled();
 		expect(checkpointSite).toHaveBeenCalledOnce();
+	});
+
+	it("shortens very large declarations and points at the file for the rest", async () => {
+		const types = `declare module "emdash" {}\n${"// generated\n".repeat(10_000)}`;
+		const sandbox = {
+			containerFetch: vi.fn(async () => new Response(types, { status: 200 })),
+			writeFile: vi.fn(async () => ({ success: true })),
+			exec: vi.fn(),
+		};
+		const refresh = createTools(sandbox as never, toolCallbacks() as never).refresh_types
+			.execute as unknown as () => Promise<Record<string, unknown>>;
+
+		const result = await refresh();
+
+		expect(result).toMatchObject({ success: true, declarationsTruncated: true });
+		expect(String(result.declarations).length).toBeLessThan(types.length);
+		expect(String(result.note)).toContain("emdash-env.d.ts");
+		expect(sandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 	});
 
 	it("reports legacy typegen fallback and never checkpoints a failed refresh", async () => {

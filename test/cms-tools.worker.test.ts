@@ -386,6 +386,13 @@ describe("apply_schema_plan", () => {
 			const harness = installBlockCms(instance, calls);
 			const checkpoint = vi.fn(async () => {});
 			harness.backupSite = checkpoint;
+			const regenerate = vi.fn(async () => ({
+				success: true as const,
+				file: "emdash-env.d.ts",
+				declarations: "export type PagesLayoutBlock = BakeryIntroV1Block;",
+			}));
+			(harness as unknown as { regenerateSiteTypes: typeof regenerate }).regenerateSiteTypes =
+				regenerate;
 			const run = () => harness.buildSchemaPlanTool(new BuildConvergence()).apply_schema_plan;
 			harness.blockTypes.set("visit_bakery", {
 				slug: "visit_bakery",
@@ -406,7 +413,14 @@ describe("apply_schema_plan", () => {
 				createdCollections: 2,
 				createdFields: 4,
 				createdBlockFields: 1,
+				// Generated names come back with the plan: no refresh_types or read step.
+				types: {
+					success: true,
+					file: "emdash-env.d.ts",
+					declarations: "export type PagesLayoutBlock = BakeryIntroV1Block;",
+				},
 			});
+			expect(regenerate).toHaveBeenCalledOnce();
 			const mutations = calls.filter((call) => call.name.startsWith("schema_create"));
 			expect(mutations.map((call) => `${call.name}:${call.args.slug}`)).toEqual([
 				"schema_create_block_type:bakery_intro",
@@ -460,6 +474,76 @@ describe("apply_schema_plan", () => {
 					(call) => call.name === "schema_create_collection" && call.args.slug === "missing_pages",
 				),
 			).toBe(false);
+		});
+	});
+
+	it("keeps a successful plan successful when type generation fails", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000033");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			const harness = installBlockCms(instance, calls);
+			(harness as unknown as { getOrCreateSandbox: () => unknown }).getOrCreateSandbox = () => ({
+				containerFetch: async () => new Response("typegen crashed", { status: 500 }),
+			});
+
+			const result = await harness
+				.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan.execute(structuredClone(bakeryPlan), toolOptions);
+
+			expect(result).toMatchObject({
+				success: true,
+				types: {
+					success: false,
+					error: expect.stringMatching(/HTTP 500.*Call refresh_types/),
+				},
+			});
+		});
+	});
+
+	it("still checkpoints a changed plan when Stop lands during type generation", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000034");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			const harness = installBlockCms(instance, calls);
+			const checkpoint = vi.fn(async () => {});
+			harness.backupSite = checkpoint;
+			const controller = new AbortController();
+			(harness as unknown as { regenerateSiteTypes: () => Promise<never> }).regenerateSiteTypes =
+				async () => {
+					controller.abort();
+					throw new DOMException("The operation was aborted.", "AbortError");
+				};
+
+			await expect(
+				harness
+					.buildSchemaPlanTool(new BuildConvergence())
+					.apply_schema_plan.execute(structuredClone(bakeryPlan), {
+						...toolOptions,
+						abortSignal: controller.signal,
+					}),
+			).rejects.toThrow();
+			// The schema changes are already in D1; they must reach the snapshot.
+			expect(checkpoint).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("reports generated types from the legacy CLI as success with the file to read", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000035");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				getOrCreateSandbox: () => unknown;
+				regenerateSiteTypes: () => Promise<unknown>;
+			};
+			harness.getOrCreateSandbox = () => ({
+				containerFetch: async () => new Response("not found", { status: 404 }),
+				exec: async () => ({ success: true, exitCode: 0, stdout: "Wrote types", stderr: "" }),
+			});
+
+			await expect(harness.regenerateSiteTypes()).resolves.toEqual({
+				success: true,
+				file: ".emdash/types.ts",
+				note: expect.stringContaining("Read .emdash/types.ts"),
+			});
 		});
 	});
 
