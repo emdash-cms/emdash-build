@@ -355,6 +355,16 @@ export class BuildConvergence {
 	}
 }
 
+/** Tools whose results can carry a preview screenshot: validation attaches the final one. */
+const PREVIEW_IMAGE_TOOLS = new Set(["view_preview", "validate_site"]);
+
+/** The screenshot caption; pruning drops it with the image and keeps any other text. */
+export const PREVIEW_IMAGE_CAPTION =
+	"Current preview screenshot. Review layout, spacing, alignment, colour/contrast, whether images loaded, any empty or broken sections, and how well it matches the brief. If anything looks off, fix it and look again.";
+
+const OMITTED_PREVIEW_TEXT =
+	"A superseded preview image was omitted from the current build context.";
+
 export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean): ModelMessage[] {
 	const imageLocations: Array<{ messageIndex: number; partIndex: number }> = [];
 	for (const [messageIndex, message] of messages.entries()) {
@@ -362,7 +372,7 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 		for (const [partIndex, part] of message.content.entries()) {
 			if (
 				part.type !== "tool-result" ||
-				part.toolName !== "view_preview" ||
+				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content" ||
 				!part.output.value.some((item) => item.type === "file-data")
 			) {
@@ -390,17 +400,20 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 		if (!message || message.role !== "tool" || !Array.isArray(message.content)) {
 			continue;
 		}
-		message.content = message.content.map((part, partIndex) =>
-			indexes.has(partIndex) && part.type === "tool-result"
-				? {
-						...part,
-						output: {
-							type: "text" as const,
-							value: "A superseded preview image was omitted from the current build context.",
-						},
-					}
-				: part,
-		);
+		message.content = message.content.map((part, partIndex) => {
+			if (!indexes.has(partIndex) || part.type !== "tool-result") return part;
+			// Keep what else the result said, such as validation output beside the image.
+			const kept =
+				part.output.type === "content"
+					? part.output.value.flatMap((item) =>
+							item.type === "text" && item.text !== PREVIEW_IMAGE_CAPTION ? [item.text] : [],
+						)
+					: [];
+			return {
+				...part,
+				output: { type: "text" as const, value: [...kept, OMITTED_PREVIEW_TEXT].join("\n") },
+			};
+		});
 	}
 	return messages;
 }
@@ -433,7 +446,7 @@ export function promoteLatestPreviewImage(
 		for (const part of message.content) {
 			if (
 				part.type !== "tool-result" ||
-				part.toolName !== "view_preview" ||
+				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content"
 			) {
 				continue;

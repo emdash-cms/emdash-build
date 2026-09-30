@@ -168,6 +168,6 @@ When changing a primitive, preserve native semantics, labels, keyboard behaviour
 6. Create and publish representative content for the requested views. Add media when the subject needs it, and taxonomy terms only when classification is part of the site.
 7. Add the list/detail and narrative routes the brief requires. Keep navigation free of dead links.
 8. Run `validate_site`.
-9. Inspect the live preview, correct the design, validate again, and inspect the final result.
+9. Review the preview a passing `validate_site` returns, correct the design, and validate again after any change.
 
 Never expose credentials to the sandbox or place secrets in source files.

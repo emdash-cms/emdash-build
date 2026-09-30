@@ -41,6 +41,35 @@ describe("active chat activity", () => {
 		expect(image.getAttribute("src")).toBe("data:image/png;base64,cGljdHVyZQ==");
 	});
 
+	it("shows the final screenshot a passing validation captured", async () => {
+		const user = userEvent.setup();
+		const loadPreviewThumbnail = vi.fn(async () => ({
+			base64: "dmFsaWRhdGVk",
+			mediaType: "image/png" as const,
+		}));
+		render(
+			<ToolCard
+				part={{
+					type: "tool-validate_site",
+					state: "output-available",
+					output: {
+						success: true,
+						stdout: "Rendered public-site audit passed for 1 route(s).",
+						preview: { shotId: "shot-validated", revision: 3 },
+					},
+				}}
+				variant="timeline"
+				loadPreviewThumbnail={loadPreviewThumbnail}
+			/>,
+		);
+		await user.click(screen.getByRole("button", { name: /Validated site/ }));
+		await waitFor(() => expect(loadPreviewThumbnail).toHaveBeenCalledWith("shot-validated"));
+		const image = await screen.findByRole("img", {
+			name: "Preview screenshot captured during this step",
+		});
+		expect(image.getAttribute("src")).toBe("data:image/png;base64,dmFsaWRhdGVk");
+	});
+
 	it("explains unavailable older preview screenshots without claiming a current image is historical", async () => {
 		const user = userEvent.setup();
 		render(

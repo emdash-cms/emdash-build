@@ -62,11 +62,9 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain("never put scaffolding language");
 		expect(prompt).not.toContain("strong, editable first version");
 		expect(prompt).not.toContain(".agents/skills/frontend-design/SKILL.md");
-		// A mid-build look is optional; the reviewed final preview follows validation.
+		// A mid-build look is optional; validation delivers the final preview.
 		expect(prompt).toContain("only when a visual decision is genuinely uncertain");
-		expect(prompt.indexOf("Call `validate_site`")).toBeLessThan(
-			prompt.indexOf("Call `view_preview` on the finished page"),
-		);
+		expect(prompt).toContain("When it passes it also returns the final preview screenshot");
 		expect(prompt).toContain('`status: "published"`');
 		expect(prompt).not.toContain("Custom Portable Text blocks");
 	});

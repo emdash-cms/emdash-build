@@ -37,8 +37,21 @@ export function capturedPreviewShotId(
 		const results = steps[stepIndex]?.toolResults ?? [];
 		for (let resultIndex = results.length - 1; resultIndex >= 0; resultIndex--) {
 			const result = results[resultIndex];
-			if (result?.toolName !== "view_preview") continue;
-			const output = result.output as {
+			if (result?.toolName !== "view_preview" && result?.toolName !== "validate_site") continue;
+			const raw = result.output as {
+				success?: unknown;
+				preview?: { shotId?: unknown; revision?: unknown };
+			} | null;
+			// Validation carries its final capture under `preview`.
+			const output = (
+				result.toolName === "validate_site"
+					? raw?.success === true
+						? raw.preview
+							? { success: true, ...raw.preview }
+							: null
+						: null
+					: raw
+			) as {
 				success?: unknown;
 				cached?: unknown;
 				skipped?: unknown;
@@ -117,6 +130,23 @@ function successfulToolResult(step: BuildStepLike, toolName: string): boolean {
 	});
 }
 
+/** A passing validation that captured the final preview itself. */
+function validationDeliveredPreview(step: BuildStepLike): boolean {
+	return (step.toolResults ?? []).some((result) => {
+		if (result.toolName !== "validate_site") return false;
+		const output = result.output as { success?: unknown; preview?: { shotId?: unknown } } | null;
+		return output?.success === true && typeof output.preview?.shotId === "string";
+	});
+}
+
+/** Final preview evidence for the validation at `validationStep`. */
+function hasFinalPreview(steps: readonly BuildStepLike[], validationStep: number): boolean {
+	return (
+		validationDeliveredPreview(steps[validationStep]!) ||
+		steps.slice(validationStep + 1).some((step) => successfulToolResult(step, "view_preview"))
+	);
+}
+
 function toolMayHaveChanged(step: BuildStepLike, toolName: string): boolean {
 	const results = (step.toolResults ?? []).filter((result) => result.toolName === toolName);
 	if (results.length === 0) return true;
@@ -172,10 +202,7 @@ export function summarizeInitialBuildBenchmark(
 						toolMayHaveChanged(step, call.toolName),
 				),
 			);
-		const laterPreview = steps
-			.slice(validationStep + 1)
-			.some((step) => successfulToolResult(step, "view_preview"));
-		return !mutationAfterValidation && laterPreview;
+		return !mutationAfterValidation && hasFinalPreview(steps, validationStep);
 	});
 
 	const rejectionReasons: string[] = [];
@@ -199,9 +226,7 @@ export function summarizeInitialBuildBenchmark(
 	}
 	if (
 		successfulValidationSteps.length > 0 &&
-		!successfulValidationSteps.some((validationStep) =>
-			steps.slice(validationStep + 1).some((step) => successfulToolResult(step, "view_preview")),
-		)
+		!successfulValidationSteps.some((validationStep) => hasFinalPreview(steps, validationStep))
 	) {
 		rejectionReasons.push("missing-final-preview");
 	}

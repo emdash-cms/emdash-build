@@ -7,9 +7,14 @@
  * up in agent.ts.
  */
 
-import { tool } from "ai";
+import { tool, type JSONValue } from "ai";
 import { z } from "zod";
-import { BuildConvergence, mutationKey } from "./build-convergence.js";
+import {
+	BuildConvergence,
+	mutationKey,
+	PREVIEW_IMAGE_CAPTION,
+	type BuildObservation,
+} from "./build-convergence.js";
 import { auditPublicSite } from "./public-site-audit.js";
 import { isSandboxRuntimeReplacement } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
@@ -723,6 +728,7 @@ interface UnsplashSearchResponse {
 type PreviewModelOutput =
 	| { type: "text"; value: string }
 	| { type: "error-text"; value: string }
+	| { type: "json"; value: JSONValue }
 	| {
 			type: "content";
 			value: Array<
@@ -1092,6 +1098,85 @@ export function createTools(
 	const readFilesQueue = new SerialTaskQueue();
 	const validationQueue = new SerialTaskQueue();
 	const previewQueue = new SerialTaskQueue();
+	/** Screenshot the observed revision and keep it for delivery to the model. */
+	const capturePreviewShot = async (
+		observation: BuildObservation,
+	): Promise<{ shotId: string; revision: number } | { error: string; retryable?: true }> => {
+		const shot = await callbacks.capturePreview();
+		if (!shot.ok) return { error: shot.error };
+		if (!convergence.recordPreviewCapture(observation)) {
+			return {
+				error: "The site changed during preview capture. Retry the current revision.",
+				retryable: true,
+			};
+		}
+		const shotId = crypto.randomUUID();
+		try {
+			callbacks.savePreviewThumbnail?.(shotId, {
+				base64: shot.base64,
+				mediaType: shot.mediaType,
+			});
+		} catch {
+			console.warn("Could not retain preview thumbnail");
+		}
+		previewShots.set(shotId, {
+			base64: shot.base64,
+			mediaType: shot.mediaType,
+			revision: observation.revision,
+			conversions: 0,
+		});
+		return { shotId, revision: observation.revision };
+	};
+	/**
+	 * The model's view of a captured shot. The SDK converts a result twice, so
+	 * the bytes are kept for two conversions and then released.
+	 */
+	const deliverPreviewShot = (shotId: string): PreviewModelOutput => {
+		const shot = previewShots.get(shotId);
+		if (!shot) {
+			return {
+				type: "error-text" as const,
+				value: "The preview screenshot could not be attached. Capture the current revision again.",
+			};
+		}
+		if (!convergence.isObservationCurrent({ revision: shot.revision })) {
+			previewShots.delete(shotId);
+			return {
+				type: "error-text" as const,
+				value: "The site changed before the screenshot could be attached. Capture it again.",
+			};
+		}
+		if (shot.modelOutput) {
+			shot.conversions += 1;
+			const converted = shot.modelOutput;
+			if (shot.conversions >= 2) previewShots.delete(shotId);
+			return converted;
+		}
+		shot.conversions += 1;
+		const maxPreviewImages = options.maxPreviewImages ?? 1;
+		const isFinalPreview = convergence.hasCurrentValidation();
+		const canDeliverExploratory = exploratoryPreviewImagesDelivered < maxPreviewImages;
+		if (!options.previewImagesEnabled || (!isFinalPreview && !canDeliverExploratory)) {
+			shot.modelOutput = {
+				type: "text" as const,
+				value:
+					"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
+			};
+			if (shot.conversions >= 2) previewShots.delete(shotId);
+			return shot.modelOutput;
+		}
+		if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
+		const converted: PreviewModelOutput = {
+			type: "content" as const,
+			value: [
+				{ type: "text" as const, text: PREVIEW_IMAGE_CAPTION },
+				{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
+			],
+		};
+		shot.modelOutput = converted;
+		if (shot.conversions >= 2) previewShots.delete(shotId);
+		return converted;
+	};
 	const trackedMutation = async <T>(
 		operation: () => Promise<T>,
 		key?: string,
@@ -1809,7 +1894,8 @@ export function createTools(
 				"Validate the generated public site before completion. Runs the template's frontend boundary " +
 				"check (no React/JSX/client hydration on public routes), Astro typecheck, and a rendered crawl " +
 				"that rejects the blank scaffold and broken internal links. Fix every reported source or route " +
-				"error, then call this again until it succeeds.",
+				"error, then call this again until it succeeds. A passing result includes the final preview " +
+				"screenshot of the validated revision; review it instead of calling view_preview.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				validationQueue.run(async () => {
@@ -1899,8 +1985,28 @@ export function createTools(
 							error: "The site changed during validation. Retry against the current revision.",
 						};
 					}
-					return output;
+					if (!success || !options.previewImagesEnabled) return output;
+					// The completion gate needs a final look at the validated revision.
+					// Capturing it here spares the model a separate view_preview step.
+					const preview = await previewQueue.run(() => capturePreviewShot(observation));
+					return "shotId" in preview
+						? { ...output, preview }
+						: { ...output, previewError: preview.error };
 				}),
+			toModelOutput: ({ output }) => {
+				const o = output as { preview?: { shotId?: unknown; revision?: unknown } };
+				const { preview, ...rest } = o;
+				const text = { type: "text" as const, text: JSON.stringify(rest) };
+				if (typeof preview?.shotId !== "string") {
+					return { type: "json" as const, value: output as JSONValue };
+				}
+				const image = deliverPreviewShot(preview.shotId);
+				if (image.type === "content") {
+					return { type: "content" as const, value: [text, ...image.value] };
+				}
+				const note = image.type === "json" ? JSON.stringify(image.value) : image.value;
+				return { type: "content" as const, value: [text, { type: "text" as const, text: note }] };
+			},
 		}),
 
 		search_unsplash: tool({
@@ -2055,8 +2161,9 @@ export function createTools(
 				"Look at the live preview: capture a screenshot of the site as it renders right now and " +
 				"see it yourself. Use this after making design or content changes to check your work -- " +
 				"verify layout, spacing and alignment, colour and contrast, that images actually loaded, " +
-				"that no section is empty or broken, and that the result matches the brief. Call it before " +
-				"telling the user the site is ready. Fix anything that looks off, then look again.",
+				"that no section is empty or broken, and that the result matches the brief. A passing validate_site " +
+				"already returns the final screenshot, so call this for a look before validation or when " +
+				"validation could not capture one. Fix anything that looks off, then look again.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				previewQueue.run(async () => {
@@ -2090,31 +2197,15 @@ export function createTools(
 								"The exploratory screenshot budget is full. Validate first, then request the final preview.",
 						};
 					}
-					const shot = await callbacks.capturePreview();
-					if (!shot.ok) return { success: false as const, error: shot.error };
-					if (!convergence.recordPreviewCapture(observation)) {
+					const captured = await capturePreviewShot(observation);
+					if ("error" in captured) {
 						return {
 							success: false as const,
-							retryable: true as const,
-							error: "The site changed during preview capture. Retry the current revision.",
+							...(captured.retryable ? { retryable: true as const } : {}),
+							error: captured.error,
 						};
 					}
-					const shotId = crypto.randomUUID();
-					try {
-						callbacks.savePreviewThumbnail?.(shotId, {
-							base64: shot.base64,
-							mediaType: shot.mediaType,
-						});
-					} catch {
-						console.warn("Could not retain preview thumbnail");
-					}
-					previewShots.set(shotId, {
-						base64: shot.base64,
-						mediaType: shot.mediaType,
-						revision: observation.revision,
-						conversions: 0,
-					});
-					return { success: true as const, shotId, revision: observation.revision };
+					return { success: true as const, ...captured };
 				}),
 			// Hand the first-build screenshot to the multimodal coordinator,
 			// not as JSON. `file-data` carries base64 image bytes inline.
@@ -2155,54 +2246,7 @@ export function createTools(
 							"No new screenshot was captured because the site has not changed. Use the current preview; do not call view_preview again unless you make a real change.",
 					};
 				}
-				const shot = previewShots.get(o.shotId);
-				if (!shot) {
-					return {
-						type: "error-text" as const,
-						value:
-							"The preview screenshot could not be attached. Capture the current revision again.",
-					};
-				}
-				if (!convergence.isObservationCurrent({ revision: shot.revision })) {
-					previewShots.delete(o.shotId);
-					return {
-						type: "error-text" as const,
-						value: "The site changed before the screenshot could be attached. Capture it again.",
-					};
-				}
-				if (shot.modelOutput) {
-					shot.conversions += 1;
-					const converted = shot.modelOutput;
-					if (shot.conversions >= 2) previewShots.delete(o.shotId);
-					return converted;
-				}
-				shot.conversions += 1;
-				const maxPreviewImages = options.maxPreviewImages ?? 1;
-				const isFinalPreview = convergence.hasCurrentValidation();
-				const canDeliverExploratory = exploratoryPreviewImagesDelivered < maxPreviewImages;
-				if (!options.previewImagesEnabled || (!isFinalPreview && !canDeliverExploratory)) {
-					shot.modelOutput = {
-						type: "text" as const,
-						value:
-							"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
-					};
-					if (shot.conversions >= 2) previewShots.delete(o.shotId);
-					return shot.modelOutput;
-				}
-				if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
-				const converted: PreviewModelOutput = {
-					type: "content" as const,
-					value: [
-						{
-							type: "text" as const,
-							text: "Current preview screenshot. Review layout, spacing, alignment, colour/contrast, whether images loaded, any empty or broken sections, and how well it matches the brief. If anything looks off, fix it and look again.",
-						},
-						{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
-					],
-				};
-				shot.modelOutput = converted;
-				if (shot.conversions >= 2) previewShots.delete(o.shotId);
-				return converted;
+				return deliverPreviewShot(o.shotId);
 			},
 		}),
 

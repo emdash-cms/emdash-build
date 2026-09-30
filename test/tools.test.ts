@@ -8,9 +8,11 @@ import { generateText, simulateReadableStream, stepCountIs, streamText } from "a
 import { MockLanguageModelV3 } from "ai/test";
 import {
 	BuildConvergence,
+	canCompleteBuild,
 	prepareBuildStep,
 	releaseStepPreviewImages,
 } from "../src/worker/build-convergence.js";
+import { capturedPreviewShotId } from "../src/worker/readiness.js";
 import { createTools, ensurePreviewHmr, guardProtectedFiles } from "../src/worker/tools.js";
 
 function toolCallbacks(capturePreview = vi.fn()) {
@@ -937,14 +939,126 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const finishMutation = convergence.beginMutation();
 		finishMutation();
 
-		await expect(validate()).resolves.toMatchObject({ success: true });
-		const finalPreview = await viewPreview();
+		// Passing validation captures the final preview itself, past the exploratory budget.
+		const validated = await validate();
+		const convertValidation = tools.validate_site.toModelOutput as (input: {
+			output: unknown;
+		}) => unknown;
 
-		expect(convert({ output: finalPreview })).toMatchObject({
+		expect(validated).toMatchObject({ success: true, preview: { shotId: expect.any(String) } });
+		expect(convertValidation({ output: validated })).toMatchObject({
 			type: "content",
 			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
+		expect(convergence.hasCurrentPreviewCapture()).toBe(true);
+		// A later view_preview of the same revision reuses that capture.
+		await expect(viewPreview()).resolves.toMatchObject({ success: true, cached: true });
+		expect(capturePreview).toHaveBeenCalledTimes(2);
+	});
+
+	it("finishes a build one step after validation by delivering the final preview with it", async () => {
+		const exec = vi.fn(async () => ({ success: true, exitCode: 0, stdout: "ok", stderr: "" }));
+		const convergence = new BuildConvergence();
+		const tools = createTools(
+			validatingSandbox(exec) as never,
+			toolCallbacks(
+				vi.fn(async () => ({
+					ok: true as const,
+					base64: "ZmluYWwtcHJldmlldw==",
+					mediaType: "image/png",
+				})),
+			) as never,
+			{ convergence, previewImagesEnabled: true },
+		);
+		const usage = {
+			inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+			outputTokens: { total: 1, text: 1, reasoning: 0 },
+		};
+		const model = new MockLanguageModelV3({
+			doStream: [
+				{
+					stream: simulateReadableStream({
+						chunks: [
+							{ type: "stream-start" as const, warnings: [] },
+							{
+								type: "tool-call" as const,
+								toolCallId: "validate-call",
+								toolName: "validate_site",
+								input: "{}",
+							},
+							{
+								type: "finish" as const,
+								finishReason: { unified: "tool-calls" as const, raw: "tool_calls" },
+								usage,
+							},
+						],
+					}),
+				},
+				{
+					stream: simulateReadableStream({
+						chunks: [
+							{ type: "stream-start" as const, warnings: [] },
+							{ type: "text-start" as const, id: "text-1" },
+							{ type: "text-delta" as const, id: "text-1", delta: "Done" },
+							{ type: "text-end" as const, id: "text-1" },
+							{
+								type: "finish" as const,
+								finishReason: { unified: "stop" as const, raw: "stop" },
+								usage,
+							},
+						],
+					}),
+				},
+			],
+		});
+		const toolNames = ["validate_site", "view_preview"] as const;
+
+		const result = streamText({
+			model,
+			prompt: "Finish the site",
+			tools: { validate_site: tools.validate_site, view_preview: tools.view_preview },
+			stopWhen: stepCountIs(4),
+			prepareStep: ({ messages }) => prepareBuildStep(convergence, messages, toolNames),
+			onStepFinish: (step) => {
+				convergence.finishStep(step);
+				releaseStepPreviewImages(step);
+			},
+		});
+		await result.text;
+		const steps = await result.steps;
+
+		// No separate view_preview step: the model saw the image right after validating.
+		expect(model.doStreamCalls).toHaveLength(2);
+		expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain("ZmluYWwtcHJldmlldw==");
+		expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain("Rendered public-site audit");
+		expect(JSON.stringify(steps[0]!.response.messages)).not.toContain("ZmluYWwtcHJldmlldw==");
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+		expect(canCompleteBuild(convergence, await result.finishReason)).toBe(true);
+		expect(capturedPreviewShotId(steps, convergence.currentRevision())).toMatch(/^[0-9a-f-]{36}$/);
+	});
+
+	it("leaves the final preview to view_preview when validation fails", async () => {
+		const exec = vi.fn(async () => ({
+			success: false,
+			exitCode: 1,
+			stdout: "",
+			stderr: "Type error",
+		}));
+		const capturePreview = vi.fn();
+		const tools = createTools(
+			validatingSandbox(exec) as never,
+			toolCallbacks(capturePreview) as never,
+			{
+				previewImagesEnabled: true,
+			},
+		);
+
+		const failed = await (tools.validate_site.execute as () => Promise<unknown>)();
+
+		expect(failed).toMatchObject({ success: false });
+		expect(failed).not.toHaveProperty("preview");
+		expect(capturePreview).not.toHaveBeenCalled();
 	});
 });
 

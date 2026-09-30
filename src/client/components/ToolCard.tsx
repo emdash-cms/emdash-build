@@ -871,7 +871,12 @@ export function ToolCard({
 		? { ...output, errorText: String(part.errorText) }
 		: output;
 	const success = output?.success !== false;
-	const shotId = typeof output.shotId === "string" ? output.shotId : undefined;
+	// A passing validation carries its final screenshot under `preview`.
+	const previewShot =
+		toolName === "validate_site"
+			? (output.preview as { shotId?: unknown } | undefined)?.shotId
+			: output.shotId;
+	const shotId = typeof previewShot === "string" ? previewShot : undefined;
 	const thumbnail = loadedShot?.shotId === shotId ? loadedShot?.thumbnail : undefined;
 	const hasLoader = typeof loadPreviewThumbnail === "function";
 	useEffect(() => {
@@ -1069,7 +1074,7 @@ export function ToolCard({
 							<ContentOutcome input={input} />
 						) : null}
 						{variant === "timeline" &&
-						toolName === "view_preview" &&
+						(toolName === "view_preview" || toolName === "validate_site") &&
 						isComplete &&
 						success &&
 						thumbnail ? (

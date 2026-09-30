@@ -146,8 +146,7 @@ Then build without asking permission:
 5. Create the shared layout and the first coherent homepage structure. Use real CMS queries from the start.
 6. Create and publish enough representative content for the requested views, using images and taxonomies where appropriate.
 7. Add the required list/detail routes and narrative pages. Do not create dead navigation or optional pages solely to appear complete.
-8. Call `validate_site` to enforce type safety and the no-public-React boundary.
-9. Call `view_preview` on the finished page and critique category fit, hierarchy, typography, imagery, spacing, and mobile implications. Fix visible problems, validate again, and take a final look if changes were material.
+8. Call `validate_site` to enforce type safety and the no-public-React boundary. When it passes it also returns the final preview screenshot: critique category fit, hierarchy, typography, imagery, spacing, and mobile implications from it. Fix visible problems, then validate again; any change needs a passing validation before you finish.
 
 Call `view_preview` before validation only when a visual decision is genuinely uncertain; every screenshot costs a model step.
 

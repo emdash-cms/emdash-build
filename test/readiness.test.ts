@@ -176,6 +176,43 @@ describe("builder readiness", () => {
 		});
 	});
 
+	it("accepts the final preview a passing validation delivers", () => {
+		const summary = summarizeInitialBuildBenchmark(
+			{ buildEligible: 1_000, buildStarting: 1_250, personalized: 2_000, complete: 2_500 },
+			[
+				{ toolCalls: [{ toolName: "write_file" }], toolResults: [] },
+				{
+					toolCalls: [{ toolName: "validate_site" }],
+					toolResults: [
+						{
+							toolName: "validate_site",
+							output: {
+								success: true,
+								preview: { shotId: "00000000-0000-4000-8000-000000000003", revision: 1 },
+							},
+						},
+					],
+				},
+				{ toolCalls: [], toolResults: [] },
+			],
+		);
+
+		expect(summary).toMatchObject({
+			qualityValid: true,
+			rejectionReasons: [],
+			modelToFinishMs: 1_250,
+		});
+		// A passing validation without a capture still needs view_preview afterwards.
+		expect(
+			summarizeInitialBuildBenchmark({}, [
+				{
+					toolCalls: [{ toolName: "validate_site" }],
+					toolResults: [{ toolName: "validate_site", output: { success: true } }],
+				},
+			]).rejectionReasons,
+		).toEqual(["missing-final-preview"]);
+	});
+
 	it("rejects a build without final preview evidence or with a later mutation", () => {
 		const missingPreview = summarizeInitialBuildBenchmark({}, [
 			{
