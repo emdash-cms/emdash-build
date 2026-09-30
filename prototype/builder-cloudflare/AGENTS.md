@@ -63,7 +63,7 @@ Start with the smallest schema that represents the real organisation. Field slug
 
 Schema must be created through `apply_schema_plan`, which applies subject-specific block definitions, collections, and fields in one idempotent pass with one persistence checkpoint. A successful plan regenerates `emdash-env.d.ts` and returns its declarations; write typechecked queries and block renderers from those names. After other schema changes, run `refresh_types`, which returns them too.
 
-When several independent whole-file sources are ready together, use `write_files`. When several exact targeted corrections are ready together, read every affected current file with `read_files` and apply them with `edit_files`, including multiple replacements in the same file. Each batch gets one preview reload and one Artifacts checkpoint. Use `write_file` or `edit_file` for one change, and keep dependent mutations in order.
+When several independent whole-file sources are ready together, use `write_files`. When several exact targeted corrections are ready together, apply them with `edit_files`, including multiple replacements in the same file; read first any affected file you have not read or written in this turn. Each batch gets one preview reload and one Artifacts checkpoint. Use `write_file` or `edit_file` for one change, and keep dependent mutations in order.
 
 ## EmDash rendering patterns
 

@@ -121,8 +121,14 @@ const AUTO_PUBLISH_NOTE =
 const CONTENT_LIST_NOTE =
 	"Pass cursor: null on the first page. On later pages, pass only the exact cursor returned by the previous response; never invent a cursor. Omit orderBy unless the collection schema confirms that field is indexed.";
 
+/** Saves the separate content_publish step EmDash's own description points to. */
+const CREATE_PUBLISHED_NOTE =
+	'In this builder, pass status: "published" to create and publish the entry in one call, unless the user asked for a draft. ' +
+	"Publishing needs a slug, which is derived only from a title or name field, so pass an explicit slug for any other entry.";
+
 /** EmDash's description, plus what the builder does differently. */
 export function mcpToolDescription(toolName: string, description: string): string {
+	if (toolName === "content_create") return `${description} ${CREATE_PUBLISHED_NOTE}`;
 	if (toolName === "content_update") return `${description} ${AUTO_PUBLISH_NOTE}`;
 	if (toolName === "content_list") return `${description} ${CONTENT_LIST_NOTE}`;
 	return description;

@@ -16,7 +16,7 @@ Preserve these EmDash public-runtime invariants when adding or redesigning route
 
 ## Editing workflow
 
-- Inspect the relevant current entry or file before changing it. Before `edit_file`, read that file; before `edit_files`, read every current file together with `read_files`. Use exact current text and whitespace.
+- Inspect the relevant current entry or file before changing it; read several files together in one `read_files` call. A file you already read or wrote in this turn needs no second read unless something has changed it since. Use exact current text and whitespace; if an edit is rejected, read the file and retry.
 - For a published entry, use `content_update` with its current `_rev` and omit `status`; the builder publishes the change automatically. Do not create a duplicate.
 - Use `write_files` when two or more coherent whole-file changes are ready together. Use `edit_files` when two or more exact targeted corrections are ready together, including several replacements in the same file; it applies them atomically with one reload and checkpoint. Keep dependent mutations ordered.
 - Never call `exec` in the same model step as `validate_site` or `view_preview`. Every shell command is conservatively treated as a possible mutation, including read-only diagnostics, so an overlapping command makes validation or preview evidence stale.

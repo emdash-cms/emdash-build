@@ -1417,8 +1417,8 @@ export function createTools(
 
 		edit_file: tool({
 			description:
-				"Apply a search-and-replace edit to a file. You MUST read_file first to see the current " +
-				"contents. Provide the exact text to find (oldText) and the replacement (newText); " +
+				"Apply a search-and-replace edit to a file. Read it first unless you read or wrote its current " +
+				"contents earlier in this turn. Provide the exact text to find (oldText) and the replacement (newText); " +
 				"oldText must match exactly one place, so include enough surrounding text. " +
 				"This is much faster than rewriting entire files -- use it for CSS variable changes, " +
 				"config tweaks, or any targeted edit. The oldText must match exactly (including whitespace). " +
@@ -1547,7 +1547,7 @@ export function createTools(
 		edit_files: tool({
 			description:
 				"Apply 2-12 independent exact replacements across one or more current source files as one atomic batch. " +
-				"Read every affected file first. Multiple replacements may target the same path and are preflighted in order. Every oldText is validated before any file is written; a write failure rolls the batch back. " +
+				"Read first any affected file you have not read or written in this turn. Multiple replacements may target the same path and are preflighted in order. Every oldText is validated before any file is written; a write failure rolls the batch back. " +
 				"The preview reloads and Artifacts checkpoints once for the whole batch. Use edit_file for one file or astro.config.mjs, and do not batch edits whose contents depend on an earlier mutation.",
 			inputSchema: z.object({
 				edits: z

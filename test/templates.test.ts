@@ -47,7 +47,9 @@ describe("builder template prototype", () => {
 			'Do not declare `type: "repeater"` directly in a collection\'s fields',
 		);
 		expect(prompt).toContain("from `src/components/blocks/index.ts` with `../../../emdash-env`");
-		expect(prompt).toContain("Before `edit_files`, read every current file together");
+		// Edits match current text themselves; re-reading a file the model just wrote costs a step.
+		expect(prompt).toContain("without reading it again");
+		expect(prompt).not.toContain("Do this even if you authored the files earlier in the turn");
 		expect(prompt).toContain("use `edit_files`");
 		expect(prompt).toContain(
 			"Never call `exec` in the same model step as `validate_site` or `view_preview`",
@@ -60,9 +62,12 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain("never put scaffolding language");
 		expect(prompt).not.toContain("strong, editable first version");
 		expect(prompt).not.toContain(".agents/skills/frontend-design/SKILL.md");
-		expect(prompt.indexOf("Call `view_preview`")).toBeLessThan(
-			prompt.indexOf("Call `validate_site`"),
+		// A mid-build look is optional; the reviewed final preview follows validation.
+		expect(prompt).toContain("only when a visual decision is genuinely uncertain");
+		expect(prompt.indexOf("Call `validate_site`")).toBeLessThan(
+			prompt.indexOf("Call `view_preview` on the finished page"),
 		);
+		expect(prompt).toContain('`status: "published"`');
 		expect(prompt).not.toContain("Custom Portable Text blocks");
 	});
 

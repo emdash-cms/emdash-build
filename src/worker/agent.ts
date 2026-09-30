@@ -4813,13 +4813,22 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							// react; the UI marks the tool failed.
 							this.sendConsole(`MCP ${t.name} error: ${outcome.text}`);
 							const blocked = failureGuard.recordFailure(t.name, normalized.args, outcome.text);
-							const error =
-								t.name === "content_create" && outcome.text.includes("[VALIDATION_ERROR]")
+							// With status "published", EmDash saves the draft before publishing it,
+							// so a publish-stage failure leaves an entry behind.
+							const publishStageFailure =
+								t.name === "content_create" &&
+								normalized.args.status === "published" &&
+								/Cannot publish|PUBLISH_REJECTED|CONTENT_PUBLISH_ERROR/.test(outcome.text);
+							const error = publishStageFailure
+								? `${outcome.text} The entry may already exist as an unpublished draft. Find it with content_list before retrying, then fix it (for example, give it a slug) and publish it with content_publish rather than creating a duplicate.`
+								: t.name === "content_create" && outcome.text.includes("[VALIDATION_ERROR]")
 									? `${outcome.text} No content was created. Correct the content_create data and retry content_create; do not use content_update for this missing entry.`
 									: outcome.text;
+							// Forcing content_create again would duplicate a saved draft.
 							if (
 								entityFailureKey &&
 								t.name === "content_create" &&
+								!publishStageFailure &&
 								outcome.text.includes("[VALIDATION_ERROR]")
 							) {
 								convergence.recordUnresolvedFailure({
@@ -5889,7 +5898,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					"body text in PARALLEL. Prefer this over many separate content_create calls whenever you",
 					"are seeding multiple entries of the same collection (several blog posts, portfolio",
 					"projects, etc.). You give a short brief per entry and the body prose is written for you;",
-					"entries are created AND published. Inspect the collection with schema_get_collection first.",
+					"entries are created AND published. Inspect the collection with schema_get_collection first, unless you created it with apply_schema_plan in this turn.",
 					"Put ONLY real schema fields (excerpt, image fieldValue from upload_media, date, etc.) in",
 					"each entry's `fields` -- unknown fields are dropped. Credit authors via the per-entry",
 					"`bylines` (byline ids from byline_create), NOT in `fields`. Upload images first.",

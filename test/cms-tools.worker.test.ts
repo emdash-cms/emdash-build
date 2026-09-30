@@ -1518,6 +1518,63 @@ describe("MCP failure recovery", () => {
 	});
 });
 
+describe("content_create published in one call", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("does not claim nothing was created when only the publish step failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000036");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as CmsToolHarness & {
+				getMcpServers: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildMcpTools: (
+					guard: McpToolFailureGuard,
+					convergence: BuildConvergence,
+				) => Record<string, ExecutableTool>;
+			};
+			harness.getMcpServers = () => ({
+				tools: [
+					{
+						name: "content_create",
+						serverId: "emdash",
+						description: "Create content",
+						inputSchema: { type: "object" },
+					},
+				],
+			});
+			harness.mcpToolMeta = () => ({ serverId: "emdash", inputSchema: { type: "object" } });
+			harness.refreshAndReloadPreview = async () => {};
+			harness.backupSite = async () => {};
+			harness.callMcpTool = async () =>
+				mcpError("[VALIDATION_ERROR] Cannot publish routable content without a slug");
+
+			const convergence = new BuildConvergence();
+			const tools = harness.buildMcpTools(new McpToolFailureGuard(), convergence);
+			const result = (await tools.content_create!.execute(
+				{ collection: "quotes", status: "published", data: { quote: "Bread is life." } },
+				toolOptions,
+			)) as { error: string };
+
+			expect(result.error).not.toContain("No content was created");
+			expect(result.error).toContain("draft");
+			expect(result.error).toContain("slug");
+			// A forced content_create retry would duplicate the saved draft.
+			expect(convergence.hasUnresolvedFailures()).toBe(false);
+
+			// A field named after publishing is an ordinary validation failure: nothing was saved.
+			harness.callMcpTool = async () => mcpError("[VALIDATION_ERROR] published_at: Required");
+			const fieldError = (await tools.content_create!.execute(
+				{ collection: "posts", status: "published", data: { title: "Rye" } },
+				toolOptions,
+			)) as { error: string };
+			expect(fieldError.error).toContain("No content was created");
+			expect(convergence.hasUnresolvedFailures()).toBe(true);
+		});
+	});
+});
+
 describe("content_update follow-ups", () => {
 	beforeEach(async () => {
 		await reset();
