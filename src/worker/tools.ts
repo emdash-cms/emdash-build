@@ -404,24 +404,6 @@ export async function mapLimit<T, R>(
 	return results;
 }
 
-/** Result of a temporary-account deploy. */
-export interface DeployResult {
-	success: boolean;
-	liveUrl?: string;
-	claimUrl?: string;
-	error?: string;
-}
-
-/**
- * Cloudflare temporary preview accounts (`wrangler deploy --temporary`)
- * support only a limited set of products. EmDash's Cloudflare template binds
- * R2 (`MEDIA`) and a Worker Loader (`LOADER`) and registers a cron trigger,
- * none of which a temporary account can provision. These helpers produce a
- * stripped, temp-account-safe build so the agent can deploy a working live
- * preview (pages + D1 content) without media uploads, sandboxed plugins, or
- * scheduled publishing. They are pure so they can be unit-tested.
- */
-
 /**
  * Builder-owned Worker entry for every managed site. Development setup/reset
  * stays reachable from the container loopback for provisioning, but the public
@@ -512,59 +494,6 @@ export function stripSandboxFromAstroConfig(src: string): string {
 		.replace(/^[ \t]*sandboxRunner:\s*sandbox\(\),?\s*$\n?/m, "")
 		.replace(/^[ \t]*sandboxed:\s*\[[^\]]*\],?\s*$\n?/m, "")
 		.replace(/^[ \t]*marketplace:\s*["'][^"']*["'],?\s*$\n?/m, "");
-}
-
-/**
- * Remove `storage: r2(...)` from an astro.config. Applied to the deploy build
- * only (R2 isn't on temporary accounts) so the built worker doesn't reference
- * the absent MEDIA binding. The in-builder preview keeps storage.
- */
-export function stripStorageFromAstroConfig(src: string): string {
-	return src.replace(/^[ \t]*storage:\s*r2\([^)]*\),?\s*$\n?/m, "");
-}
-
-/**
- * Drop `r2_buckets` from the (canonical, JSON) wrangler config for the deploy
- * build, so the adapter-generated deploy config has no MEDIA binding the temp
- * account can't provision. Restored after deploy.
- */
-export function stripR2FromWrangler(jsonText: string): string {
-	const cfg = JSON.parse(jsonText) as Record<string, unknown>;
-	delete cfg.r2_buckets;
-	return JSON.stringify(cfg, null, 2);
-}
-
-/**
- * Append statements to a `wrangler d1 export` snapshot that remove everything
- * auth-related before it is loaded into a deployed site: the dev-bypass admin
- * user, its full-scope PAT (the same raw token the Worker holds for the
- * session), OAuth/device/passkey state, and the secret-bearing options.
- * Mirrors the exclusions EmDash's own backup export makes. Clearing
- * `emdash:setup_complete` along with the users sends whoever claims the deploy
- * through the setup wizard to create their own admin; public pages are not
- * gated on setup, so the site still serves. Child tables go before `users`.
- */
-export function scrubAuthFromSnapshot(sql: string): string {
-	const tables = [
-		"_emdash_api_tokens",
-		"_emdash_oauth_tokens",
-		"_emdash_authorization_codes",
-		"_emdash_device_codes",
-		"_emdash_oauth_clients",
-		"_emdash_rate_limits",
-		"auth_challenges",
-		"auth_tokens",
-		"credentials",
-		"oauth_accounts",
-		"audit_logs",
-		"users",
-	];
-	const statements = [
-		...tables.map((t) => `DELETE FROM ${t};`),
-		"DELETE FROM options WHERE name IN ('emdash:setup_complete', 'emdash:site_url', 'emdash:preview_secret');",
-		"DELETE FROM options WHERE name LIKE 'plugin:%' OR name LIKE 'emdash:passkey_pending:%';",
-	];
-	return `${sql.trimEnd()}\n${statements.join("\n")}\n`;
 }
 
 /**
