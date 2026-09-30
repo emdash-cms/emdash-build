@@ -3,7 +3,7 @@ ARG AGENT_BROWSER_VERSION=0.37.1
 FROM node:24-slim AS browser
 ARG AGENT_BROWSER_VERSION
 RUN npm install -g "agent-browser@$AGENT_BROWSER_VERSION"
-RUN useradd -m -s /bin/bash user
+RUN useradd -m -u 1001 -s /bin/bash user
 USER user
 RUN agent-browser install && \
 	mkdir /tmp/agent-browser-browsers && \
@@ -13,19 +13,25 @@ FROM node:24-slim
 
 ARG AGENT_BROWSER_VERSION
 
-# Copy the matching Sandbox server and quick-tunnel daemon from the official image.
+# Copy the matching Sandbox server from the official image. The 1.0 file helper
+# (`sandbox-shim`, which must match the 1.0 package) and cloudflared from its own
+# image are installed ahead of the SDK 1.0 switch, so the first 1.0 deploy can
+# still reach containers started from this image.
 COPY --from=docker.io/cloudflare/sandbox:0.12.10 /container-server/sandbox /sandbox
-COPY --from=docker.io/cloudflare/sandbox:0.12.10 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --from=docker.io/cloudflare/sandbox:1.0.0 /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
+COPY --from=docker.io/cloudflare/cloudflared:2026.3.0 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
-# git/curl/squashfs plus the system libraries headless Chrome needs. agent-browser's
-# own `--with-deps` shells out to `sudo apt-get` (no sudo in this image), so we
-# install the libraries it lists here directly and skip `--with-deps` below.
+# git/curl/squashfs, tini (the init once SDK 1.0 drops `/sandbox`) plus the
+# system libraries headless Chrome needs. agent-browser's own `--with-deps`
+# shells out to `sudo apt-get` (no sudo in this image), so we install the
+# libraries it lists here directly and skip `--with-deps` below.
 RUN apt-get update && apt-get install -y \
 	ca-certificates \
 	git \
 	curl \
 	sqlite3 \
 	squashfs-tools \
+	tini \
 	libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 libxcomposite1 \
 	libxcursor1 libxdamage1 libxfixes3 libxi6 libgtk-3-0 libpangocairo-1.0-0 \
 	libpango-1.0-0 libatk1.0-0 libcairo-gobject2 libcairo2 libgdk-pixbuf-2.0-0 \
@@ -54,7 +60,7 @@ RUN corepack enable
 # reliably reach the proxied preview URL).
 RUN npm install -g "agent-browser@$AGENT_BROWSER_VERSION"
 
-RUN useradd -m -s /bin/bash user
+RUN useradd -m -u 1001 -s /bin/bash user
 USER user
 WORKDIR /home/user
 
