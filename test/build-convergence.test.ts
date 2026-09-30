@@ -7,6 +7,7 @@ import {
 	promoteLatestPreviewImage,
 	prunePreviewImages,
 	releaseStepPreviewImages,
+	type MutationScope,
 } from "../src/worker/build-convergence.js";
 
 function recordCompleteEvidence(convergence: BuildConvergence) {
@@ -684,5 +685,139 @@ describe("stopped build mutations", () => {
 		await expect(first).resolves.toBe("first finished");
 		await expect(second).rejects.toThrow();
 		expect(secondAction).not.toHaveBeenCalled();
+	});
+});
+
+describe("script mutation windows", () => {
+	it("leaves a read-only program's revision and evidence alone", async () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+
+		const result = await convergence.runScript(async () => ({ success: true, read: 3 }));
+
+		expect(result).toEqual({ success: true, read: 3 });
+		expect(convergence.currentRevision()).toBe(0);
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+	});
+
+	it("advances the revision once for a program's mutations and blocks observations until it ends", async () => {
+		const convergence = new BuildConvergence();
+		let observedDuring: unknown = "unset";
+
+		await convergence.runScript(async (scope) => {
+			await scope.runMutation(async () => ({ success: true }));
+			await scope.runConditionalMutation(async () => ({
+				changed: true as const,
+				operation: async () => ({ success: true }),
+			}));
+			await scope.runMutation(async () => ({ success: true }));
+			observedDuring = convergence.beginObservation();
+			return { success: true };
+		});
+
+		expect(convergence.currentRevision()).toBe(1);
+		expect(observedDuring).toBeUndefined();
+		expect(convergence.beginObservation()).toEqual({ revision: 1 });
+	});
+
+	it("queues a direct mutation behind a running program without deadlocking inner calls", async () => {
+		const convergence = new BuildConvergence();
+		const order: string[] = [];
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+
+		const script = convergence.runScript(async (scope) => {
+			await scope.runMutation(async () => order.push("inner-1"));
+			await gate;
+			await scope.runMutation(async () => order.push("inner-2"));
+			expect(await scope.reusedMutationResultQueued("any")).toEqual({ hit: false });
+			return { success: true };
+		});
+		const direct = convergence.runMutation(async () => {
+			order.push("direct");
+			return { success: true };
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		release();
+		await Promise.all([script, direct]);
+
+		expect(order).toEqual(["inner-1", "inner-2", "direct"]);
+		expect(convergence.currentRevision()).toBe(2);
+	});
+
+	it("runs a program's parallel mutations one at a time, as direct calls run", async () => {
+		const convergence = new BuildConvergence();
+		const order: string[] = [];
+		const mutation = (name: string) => async () => {
+			order.push(`${name}:start`);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			order.push(`${name}:end`);
+			return { success: true };
+		};
+
+		await convergence.runScript(async (scope) => {
+			await Promise.all([
+				scope.runMutation(mutation("a")),
+				scope.runConditionalMutation(async () => ({
+					changed: true as const,
+					operation: mutation("b"),
+				})),
+				scope.runMutation(mutation("c")),
+			]);
+			return { success: true };
+		});
+
+		expect(order).toEqual(["a:start", "a:end", "b:start", "b:end", "c:start", "c:end"]);
+		expect(convergence.currentRevision()).toBe(1);
+	});
+
+	it("keeps running a program's queued mutations after one rejects", async () => {
+		const convergence = new BuildConvergence();
+
+		const outcomes = await convergence.runScript(async (scope) =>
+			Promise.allSettled([
+				scope.runMutation(async () => {
+					throw new Error("CMS unavailable");
+				}),
+				scope.runMutation(async () => "second"),
+			]),
+		);
+
+		expect(outcomes).toEqual([
+			{ status: "rejected", reason: new Error("CMS unavailable") },
+			{ status: "fulfilled", value: "second" },
+		]);
+	});
+
+	it("reuses an identical successful program and never a failed one", async () => {
+		const convergence = new BuildConvergence();
+		const runs: string[] = [];
+		const program = (outcome: boolean) => async (scope: MutationScope) => {
+			await scope.runMutation(async () => runs.push("ran"));
+			return { success: outcome };
+		};
+
+		await convergence.runScript(program(true), { key: "script-a" });
+		await expect(convergence.runScript(program(true), { key: "script-a" })).resolves.toMatchObject({
+			cached: true,
+			changed: false,
+		});
+		await convergence.runScript(program(false), { key: "script-b" });
+		await convergence.runScript(program(false), { key: "script-b" });
+
+		expect(runs).toHaveLength(3);
+	});
+
+	it("refuses to start a program after Stop", async () => {
+		const controller = new AbortController();
+		const convergence = new BuildConvergence(controller.signal);
+		controller.abort();
+
+		await expect(
+			convergence.runScript(async (scope) => scope.runMutation(async () => "ran")),
+		).rejects.toThrow();
+		expect(convergence.currentRevision()).toBe(0);
 	});
 });

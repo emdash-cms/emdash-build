@@ -121,6 +121,7 @@ import {
 	mutationKey,
 	prepareBuildStep,
 	releaseStepPreviewImages,
+	type MutationScope,
 } from "./build-convergence.js";
 import {
 	BUILDER_MODEL_ID,
@@ -408,12 +409,18 @@ const MUTATING_MCP_TOOLS = new Set([
 ]);
 
 async function withBuildMutation<T>(
-	convergence: BuildConvergence,
+	convergence: MutationScope,
 	operation: () => Promise<T>,
 	key?: string,
 	cacheResult: (result: T) => boolean = () => true,
 ): Promise<T> {
 	return convergence.runMutation(operation, { key, cacheResult });
+}
+
+/** What a mutation syncs afterwards; a CMS program defers it to the program's end. */
+export interface SiteSync {
+	refreshPreview(): Promise<void>;
+	checkpoint(): Promise<void>;
 }
 
 interface BackupOptions {
@@ -4881,6 +4888,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return failed(reason);
 	}
 
+	/** Preview refresh and checkpoint after a mutation, as tools run them one call at a time. */
+	private immediateSiteSync(metrics?: TurnMetrics): SiteSync {
+		return {
+			refreshPreview: () =>
+				timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview()),
+			checkpoint: async () => {
+				await timeSync(metrics, "backup", () => this.checkpointSite());
+			},
+		};
+	}
+
 	/**
 	 * Build the MCP-derived tool map for the current turn. MCP supplies the
 	 * tool descriptions and JSON schemas; we wrap each execute() with a small
@@ -4888,8 +4906,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private buildMcpTools(
 		failureGuard: McpToolFailureGuard,
-		convergence: BuildConvergence,
+		convergence: MutationScope,
 		metrics?: TurnMetrics,
+		sync: SiteSync = this.immediateSiteSync(metrics),
+		{ quiet = false }: { quiet?: boolean } = {},
 	) {
 		const ALLOWED_MCP_TOOLS = new Set([
 			"schema_list_collections",
@@ -5000,8 +5020,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 										: undefined;
 								},
 								finish: async () => {
-									await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-									await timeSync(metrics, "backup", () => this.checkpointSite());
+									await sync.refreshPreview();
+									await sync.checkpoint();
 								},
 								abortSignal,
 								ambiguousCode: /CONFLICT/,
@@ -5030,8 +5050,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									: outcome.result;
 							if (entityFailureKey) convergence.resolveUnresolvedFailure(entityFailureKey);
 							if (MUTATING_MCP_TOOLS.has(t.name)) {
-								await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-								await timeSync(metrics, "backup", () => this.checkpointSite());
+								await sync.refreshPreview();
+								await sync.checkpoint();
 							}
 							return result;
 						}
@@ -5082,9 +5102,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 			};
 		}
-		this.sendConsole(
-			`MCP tools: ${Object.keys(mcpToolEntries).length} of ${mcpState.tools.length}`,
-		);
+		if (!quiet) {
+			this.sendConsole(
+				`MCP tools: ${Object.keys(mcpToolEntries).length} of ${mcpState.tools.length}`,
+			);
+		}
 		return mcpToolEntries;
 	}
 

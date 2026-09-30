@@ -14,6 +14,7 @@ import {
 	mutationKey,
 	PREVIEW_IMAGE_CAPTION,
 	type BuildObservation,
+	type MutationScope,
 } from "./build-convergence.js";
 import { auditPublicSite } from "./public-site-audit.js";
 import { isSandboxRuntimeReplacement } from "./recovery.js";
@@ -1100,6 +1101,154 @@ async function uploadOneMedia(
 }
 
 /**
+ * Photo search and media upload. Both run in the Worker, so the Unsplash key
+ * and the CMS API token never enter the sandbox. A CMS program builds its own
+ * copies against its mutation scope.
+ */
+export function createMediaTools(options: {
+	mutations: MutationScope;
+	/** Persist the site after a successful upload. */
+	checkpoint: () => Promise<void>;
+	abortSignal?: AbortSignal;
+	unsplashAccessKey?: string;
+	apiToken?: string;
+	cmsBaseUrl?: string;
+}) {
+	return {
+		search_unsplash: tool({
+			description:
+				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
+				"and photographer credits. Use these URLs in content for image references. " +
+				"Always search rather than guessing photo IDs.",
+			inputSchema: z.object({
+				query: z.string().describe("Search query (e.g. 'iceland landscape')"),
+				count: z.number().optional().default(5).describe("Number of results (1-10, default 5)"),
+			}),
+			execute: async ({ query, count }) => {
+				options.abortSignal?.throwIfAborted();
+				const n = Math.min(Math.max(count, 1), 10);
+				const key = options.unsplashAccessKey;
+				if (!key) {
+					return {
+						success: false as const,
+						error: "UNSPLASH_ACCESS_KEY is not configured on the worker.",
+					};
+				}
+				const url = new URL("https://api.unsplash.com/search/photos");
+				url.searchParams.set("query", query);
+				url.searchParams.set("per_page", String(n));
+				const res = await fetch(url, {
+					headers: { Authorization: `Client-ID ${key}` },
+					signal: options.abortSignal,
+				});
+				if (!res.ok) {
+					return {
+						success: false as const,
+						error: `Unsplash API error ${res.status}: ${await res.text()}`,
+					};
+				}
+				const data = (await res.json()) as UnsplashSearchResponse;
+				const photos = data.results.map((p) => ({
+					id: p.id,
+					description: p.description ?? p.alt_description ?? "",
+					url: `${p.urls.raw}&w=1200&h=800&fit=crop&auto=format`,
+					thumb: `${p.urls.raw}&w=400&h=300&fit=crop&auto=format`,
+					photographer: p.user.name,
+					photographerUrl: `https://unsplash.com/@${p.user.username}`,
+				}));
+				return { success: true as const, query, count: photos.length, photos };
+			},
+		}),
+
+		upload_media: tool({
+			description:
+				"Download one or more images from URLs (e.g. those returned by search_unsplash) and " +
+				"register them as CMS media items. Pass ALL the images you need in a single call via the " +
+				"`images` array -- do NOT call this once per image. Image/file fields do NOT accept raw " +
+				"URLs: each result includes a `fieldValue` " +
+				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
+				"field when calling content_create/content_update. Results come back in input order and " +
+				"echo each `url` so you can match them to the right entry.",
+			inputSchema: z.object({
+				images: z
+					.array(
+						z.object({
+							url: z.string().describe("Direct image URL to download"),
+							filename: z
+								.string()
+								.optional()
+								.describe("Filename to store it as, e.g. 'hero.jpg' (default 'image')"),
+							alt: z.string().optional().describe("Alt text describing the image"),
+						}),
+					)
+					.min(1)
+					.describe("All images to upload in this call"),
+			}),
+			execute: async ({ images }) => {
+				const token = options.apiToken;
+				const base = options.cmsBaseUrl;
+				if (!token || !base) {
+					return {
+						success: false as const,
+						changed: false as const,
+						error: "Media upload is unavailable (no CMS token/URL).",
+					};
+				}
+				return options.mutations.runMutation(
+					async () => {
+						// Bounded concurrency (not unbounded Promise.all): each upload
+						// writes to D1 + R2 through the single dev server, and hammering
+						// the media endpoint trips the Vite SSR reload. A small width
+						// overlaps the fetch+upload latency without swamping it. Errors
+						// are per-image, not fatal; `mapLimit` preserves input order.
+						let uploaded = 0;
+						try {
+							const results = await mapLimit(images, 2, async (img) => {
+								if (options.abortSignal?.aborted) {
+									return { url: img.url, success: false as const, error: "Upload stopped." };
+								}
+								const result = await uploadOneMedia(
+									img.url,
+									img.filename,
+									img.alt,
+									token,
+									base,
+									options.abortSignal,
+								);
+								if (result.success) uploaded++;
+								return result;
+							});
+							options.abortSignal?.throwIfAborted();
+							for (const [index, result] of results.entries()) {
+								const image = images[index]!;
+								const identity = image.filename?.trim() || image.alt?.trim() || image.url;
+								const failureKey = `media\0${identity}`;
+								if (result.success) {
+									options.mutations.resolveUnresolvedFailure(failureKey);
+								} else {
+									options.mutations.recordUnresolvedFailure({
+										key: failureKey,
+										toolName: "upload_media",
+										error: `${identity}: ${result.error}`,
+									});
+								}
+							}
+							return { success: uploaded > 0, count: results.length, uploaded, results };
+						} finally {
+							if (uploaded > 0) await options.checkpoint();
+						}
+					},
+					{
+						key: mutationKey("upload_media", { images }),
+						cacheResult: (result) => result.success && result.uploaded === result.count,
+					},
+				);
+			},
+		}),
+	};
+}
+
+/**
  * Creates the tool set, closing over the sandbox instance.
  * Called once per onChatMessage invocation.
  */
@@ -2068,133 +2217,13 @@ export function createTools(
 			},
 		}),
 
-		search_unsplash: tool({
-			description:
-				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
-				"and photographer credits. Use these URLs in content for image references. " +
-				"Always search rather than guessing photo IDs.",
-			inputSchema: z.object({
-				query: z.string().describe("Search query (e.g. 'iceland landscape')"),
-				count: z.number().optional().default(5).describe("Number of results (1-10, default 5)"),
-			}),
-			execute: async ({ query, count }) => {
-				options.abortSignal?.throwIfAborted();
-				const n = Math.min(Math.max(count, 1), 10);
-				const key = options.unsplashAccessKey;
-				if (!key) {
-					return {
-						success: false as const,
-						error: "UNSPLASH_ACCESS_KEY is not configured on the worker.",
-					};
-				}
-				const url = new URL("https://api.unsplash.com/search/photos");
-				url.searchParams.set("query", query);
-				url.searchParams.set("per_page", String(n));
-				const res = await fetch(url, {
-					headers: { Authorization: `Client-ID ${key}` },
-					signal: options.abortSignal,
-				});
-				if (!res.ok) {
-					return {
-						success: false as const,
-						error: `Unsplash API error ${res.status}: ${await res.text()}`,
-					};
-				}
-				const data = (await res.json()) as UnsplashSearchResponse;
-				const photos = data.results.map((p) => ({
-					id: p.id,
-					description: p.description ?? p.alt_description ?? "",
-					url: `${p.urls.raw}&w=1200&h=800&fit=crop&auto=format`,
-					thumb: `${p.urls.raw}&w=400&h=300&fit=crop&auto=format`,
-					photographer: p.user.name,
-					photographerUrl: `https://unsplash.com/@${p.user.username}`,
-				}));
-				return { success: true as const, query, count: photos.length, photos };
-			},
-		}),
-
-		upload_media: tool({
-			description:
-				"Download one or more images from URLs (e.g. those returned by search_unsplash) and " +
-				"register them as CMS media items. Pass ALL the images you need in a single call via the " +
-				"`images` array -- do NOT call this once per image. Image/file fields do NOT accept raw " +
-				"URLs: each result includes a `fieldValue` " +
-				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
-				"field when calling content_create/content_update. Results come back in input order and " +
-				"echo each `url` so you can match them to the right entry.",
-			inputSchema: z.object({
-				images: z
-					.array(
-						z.object({
-							url: z.string().describe("Direct image URL to download"),
-							filename: z
-								.string()
-								.optional()
-								.describe("Filename to store it as, e.g. 'hero.jpg' (default 'image')"),
-							alt: z.string().optional().describe("Alt text describing the image"),
-						}),
-					)
-					.min(1)
-					.describe("All images to upload in this call"),
-			}),
-			execute: async ({ images }) => {
-				const token = options.apiToken;
-				const base = options.cmsBaseUrl;
-				if (!token || !base) {
-					return {
-						success: false as const,
-						changed: false as const,
-						error: "Media upload is unavailable (no CMS token/URL).",
-					};
-				}
-				return trackedMutation(
-					async () => {
-						// Bounded concurrency (not unbounded Promise.all): each upload
-						// writes to D1 + R2 through the single dev server, and hammering
-						// the media endpoint trips the Vite SSR reload. A small width
-						// overlaps the fetch+upload latency without swamping it. Errors
-						// are per-image, not fatal; `mapLimit` preserves input order.
-						let uploaded = 0;
-						try {
-							const results = await mapLimit(images, 2, async (img) => {
-								if (options.abortSignal?.aborted) {
-									return { url: img.url, success: false as const, error: "Upload stopped." };
-								}
-								const result = await uploadOneMedia(
-									img.url,
-									img.filename,
-									img.alt,
-									token,
-									base,
-									options.abortSignal,
-								);
-								if (result.success) uploaded++;
-								return result;
-							});
-							options.abortSignal?.throwIfAborted();
-							for (const [index, result] of results.entries()) {
-								const image = images[index]!;
-								const identity = image.filename?.trim() || image.alt?.trim() || image.url;
-								const failureKey = `media\0${identity}`;
-								if (result.success) {
-									convergence.resolveUnresolvedFailure(failureKey);
-								} else {
-									convergence.recordUnresolvedFailure({
-										key: failureKey,
-										toolName: "upload_media",
-										error: `${identity}: ${result.error}`,
-									});
-								}
-							}
-							return { success: uploaded > 0, count: results.length, uploaded, results };
-						} finally {
-							if (uploaded > 0) await callbacks.checkpointSite();
-						}
-					},
-					mutationKey("upload_media", { images }),
-					(result) => result.success && result.uploaded === result.count,
-				);
-			},
+		...createMediaTools({
+			mutations: convergence,
+			checkpoint: callbacks.checkpointSite,
+			abortSignal: options.abortSignal,
+			unsplashAccessKey: options.unsplashAccessKey,
+			apiToken: options.apiToken,
+			cmsBaseUrl: options.cmsBaseUrl,
 		}),
 
 		restart_dev_server: tool({

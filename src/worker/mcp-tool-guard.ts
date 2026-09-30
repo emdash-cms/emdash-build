@@ -1,3 +1,4 @@
+import type { JSONSchema7 } from "ai";
 import { mutationKey } from "./build-convergence.js";
 
 type JsonObject = Record<string, unknown>;
@@ -21,12 +22,12 @@ const CONTENT_ORDER_ALIASES: Record<string, string> = {
  * that one optional value as required-but-nullable to the builder model while
  * leaving the real MCP contract unchanged.
  */
-export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unknown {
-	if (!isObject(inputSchema)) return inputSchema;
+export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): JSONSchema7 {
+	if (!isObject(inputSchema)) return inputSchema as JSONSchema7;
 
 	const adapted = structuredClone(inputSchema) as JsonObject;
 	const properties = adapted.properties;
-	if (!isObject(properties)) return inputSchema;
+	if (!isObject(properties)) return inputSchema as JSONSchema7;
 	if (PAGINATED_CURSOR_TOOLS.has(toolName) && isObject(properties.cursor)) {
 		const stringCursor: JsonObject = { ...properties.cursor, type: "string" };
 		delete stringCursor.anyOf;
@@ -41,7 +42,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 			: [];
 		if (!required.includes("cursor")) required.push("cursor");
 		adapted.required = required;
-		return adapted;
+		return adapted as JSONSchema7;
 	}
 	if (toolName !== "menu_set_items") return inputSchema;
 	const itemsProperty = properties.items;
@@ -64,7 +65,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 		: [];
 	if (!required.includes("parentIndex")) required.push("parentIndex");
 	itemSchema.required = required;
-	return adapted;
+	return adapted as JSONSchema7;
 }
 
 /**

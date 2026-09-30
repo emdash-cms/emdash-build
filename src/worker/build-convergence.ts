@@ -38,8 +38,31 @@ function canonicalJson(value: unknown): unknown {
  */
 const MAX_FORCED_RECOVERY_STEPS = 3;
 
+function reportsFailure(result: unknown): boolean {
+	return (
+		result !== null &&
+		typeof result === "object" &&
+		(result as { success?: unknown }).success === false
+	);
+}
+
 export function mutationKey(toolName: string, input: unknown): string {
 	return `${toolName}\0${JSON.stringify(canonicalJson(input))}`;
+}
+
+/** The mutation surface a tool needs; a script run hands its tools a scoped one. */
+export type MutationScope = Pick<
+	BuildConvergence,
+	| "runMutation"
+	| "runConditionalMutation"
+	| "reusedMutationResultQueued"
+	| "recordUnresolvedFailure"
+	| "resolveUnresolvedFailure"
+>;
+
+export interface ScriptScope extends MutationScope {
+	/** Whether an inner mutation has started. */
+	readonly mutated: boolean;
 }
 
 /**
@@ -137,6 +160,75 @@ export class BuildConvergence {
 		});
 	}
 
+	/**
+	 * One mutation window for a whole program of tool calls. It holds the
+	 * mutation lane, advances the revision once when the first inner mutation
+	 * starts, and keeps observations out until `operation` (including any sync
+	 * it performs) settles. Inner calls use `scope`, which never re-enters the
+	 * lane, so they cannot deadlock behind the program itself; they still run
+	 * one at a time, as direct calls do.
+	 */
+	runScript<T>(
+		operation: (scope: ScriptScope) => Promise<T>,
+		options: { key?: string; cacheResult?: (result: T) => boolean } = {},
+	): Promise<T> {
+		return this.enqueueMutation(async () => {
+			if (options.key) {
+				const cached = this.reusedMutationResult<T>(options.key);
+				if (cached.hit) return cached.value;
+			}
+			let finish: ((succeeded?: boolean) => void) | undefined;
+			let revision = this.revision;
+			const begin = () => {
+				this.abortSignal?.throwIfAborted();
+				if (finish) return;
+				finish = this.beginMutation();
+				revision = this.revision;
+			};
+			let innerTail: Promise<unknown> = Promise.resolve();
+			const serial = <R>(run: () => Promise<R>): Promise<R> => {
+				const scheduled = innerTail.then(run, run);
+				innerTail = scheduled.catch(() => undefined);
+				return scheduled;
+			};
+			const scope: ScriptScope = {
+				get mutated() {
+					return finish !== undefined;
+				},
+				runMutation: <R>(mutation: () => Promise<R>) =>
+					serial(async () => {
+						begin();
+						return mutation();
+					}),
+				runConditionalMutation: <R>(
+					prepare: () => Promise<
+						{ changed: false; result: R } | { changed: true; operation: () => Promise<R> }
+					>,
+				) =>
+					serial(async () => {
+						const prepared = await prepare();
+						if (!prepared.changed) return prepared.result;
+						begin();
+						return prepared.operation();
+					}),
+				reusedMutationResultQueued: async () => ({ hit: false as const }),
+				recordUnresolvedFailure: (failure) => this.recordUnresolvedFailure(failure),
+				resolveUnresolvedFailure: (key) => this.resolveUnresolvedFailure(key),
+			};
+			let succeeded = false;
+			try {
+				const result = await operation(scope);
+				succeeded = !reportsFailure(result);
+				if (succeeded && finish && options.key && (options.cacheResult?.(result) ?? true)) {
+					this.recordMutationResult(options.key, result, revision);
+				}
+				return result;
+			} finally {
+				finish?.(succeeded);
+			}
+		});
+	}
+
 	private executeMutation<T>(
 		operation: () => Promise<T>,
 		options: { key?: string; cacheResult?: (result: T) => boolean },
@@ -146,11 +238,7 @@ export class BuildConvergence {
 		let succeeded = false;
 		return operation()
 			.then((result) => {
-				succeeded = !(
-					result !== null &&
-					typeof result === "object" &&
-					(result as { success?: unknown }).success === false
-				);
+				succeeded = !reportsFailure(result);
 				if (succeeded && options.key && (options.cacheResult?.(result) ?? true)) {
 					this.recordMutationResult(options.key, result, revision);
 				}
