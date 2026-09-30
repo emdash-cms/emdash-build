@@ -120,7 +120,12 @@ import {
 	prepareBuildStep,
 	releaseStepPreviewImages,
 } from "./build-convergence.js";
-import { BUILDER_MODEL_ID, BUILDER_PROVIDER_OPTIONS, createBuilderModel } from "./model.js";
+import {
+	BUILDER_MODEL_ID,
+	BUILDER_PROVIDER_OPTIONS,
+	createBuilderModel,
+	requestedReasoningEffort,
+} from "./model.js";
 import {
 	McpToolFailureGuard,
 	ToolInputWhitespaceGuard,
@@ -168,6 +173,7 @@ import {
 	timeSync,
 	type TurnMetricsInit,
 	type TurnMetricsRecord,
+	turnMetricsForState,
 } from "./turn-metrics.js";
 import {
 	validateBlockRendererContract,
@@ -496,7 +502,7 @@ export interface BuilderState extends BuilderReadinessState {
 	/** Quality-filtered metrics for the completed first build. */
 	initialBuildBenchmark?: InitialBuildBenchmark;
 	/** Cost and timing of the most recent model turn, for smoke runs. */
-	lastTurnMetrics?: TurnMetricsRecord;
+	lastTurnMetrics?: Omit<TurnMetricsRecord, "stepTimings">;
 	previewUrl?: string;
 	provisionError?: string;
 	/** A visible warning when the latest site checkpoint could not be persisted. */
@@ -5813,7 +5819,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * gets a short result summary out.
 	 */
 	private buildContentBatchTool(convergence: BuildConvergence, metrics?: TurnMetrics) {
-		const genModel = createBuilderModel(this.env);
+		const genModel = this.createTurnModel(metrics, "entry-body");
 		return {
 			create_entries_batch: tool({
 				description: [
@@ -6128,6 +6134,43 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** Model turns awaiting a record, keyed by request id, for the onChatResponse fallback. */
 	private readonly openTurnMetrics = new Map<string, TurnMetrics>();
 
+	private logInitialBuildBenchmark(
+		benchmark: InitialBuildBenchmark,
+		outcome: "completed" | "failed" | "stopped",
+	): void {
+		console.log(
+			JSON.stringify({
+				event: "builder.initial_build_benchmark",
+				sessionId: this.name,
+				outcome,
+				...benchmark,
+			}),
+		);
+	}
+
+	/**
+	 * The builder model, tagged for AI Gateway logs and counted against the turn.
+	 * A `purpose` marks a sub-call, whose attempts are not the current step's.
+	 */
+	private createTurnModel(metrics: TurnMetrics | undefined, purpose?: string) {
+		return createBuilderModel(this.env, {
+			metadata: {
+				session: this.name,
+				// The turn id is the client's chat request id; keep the header value safe.
+				...(metrics
+					? { turn: metrics.turnId.replace(/[^\w.-]/g, "").slice(0, 64), kind: metrics.kind }
+					: {}),
+				...(purpose ? { purpose } : {}),
+			},
+			...(metrics
+				? {
+						onResponse: (status: number) =>
+							metrics.noteModelResponse(status, { step: purpose === undefined }),
+					}
+				: {}),
+		});
+	}
+
 	private startTurnMetrics(
 		requestId: string | undefined,
 		init: Omit<TurnMetricsInit, "turnId" | "model">,
@@ -6206,7 +6249,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!record) return;
 		try {
 			if (record.error) record.error = redactArtifactsToken(record.error);
-			if (keepInState) this.setState({ ...this.state, lastTurnMetrics: record });
+			if (keepInState) {
+				this.setState({ ...this.state, lastTurnMetrics: turnMetricsForState(record) });
+			}
 			console.log(
 				JSON.stringify({ event: "builder.turn_metrics", sessionId: this.name, ...record }),
 			);
@@ -6360,8 +6405,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const closedHistory = closeInterruptedToolCalls(this.messages);
 		if (closedHistory) await this.persistMessages(closedHistory);
 
-		const model = createBuilderModel(this.env);
-
 		const finish = onFinish as (...args: unknown[]) => unknown;
 
 		// Provisioning runs in the background. While the site isn't ready we run
@@ -6450,7 +6493,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				toolCount: interviewTools ? Object.keys(interviewTools).length : 0,
 			});
 			const result = streamText({
-				model,
+				model: this.createTurnModel(metrics),
 				system: interviewSystem,
 				messages: interviewMessages,
 				tools: interviewTools,
@@ -6462,6 +6505,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				maxOutputTokens: 8192,
 				providerOptions: BUILDER_PROVIDER_OPTIONS,
 				abortSignal,
+				experimental_onStepStart: (event) =>
+					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
+				onChunk: ({ chunk }) => metrics.observeChunk(chunk.type),
 				onStepFinish: (step) => {
 					this.touchBuildActivity();
 					metrics.onStep(step);
@@ -6633,16 +6679,24 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							...(isInitialBuild ? {} : { resumed: true }),
 						};
 						this.setState({ ...this.state, initialBuildBenchmark: benchmark });
-						console.log(
-							JSON.stringify({
-								event: "builder.initial_build_benchmark",
-								sessionId: this.name,
-								...benchmark,
-							}),
-						);
+						this.logInitialBuildBenchmark(benchmark, "completed");
 					}
 				} else if (tracksInitialBuild) {
+					const stopped =
+						buildAbortSignal.aborted ||
+						this.state.initialGeneration?.status === "stopping" ||
+						this.state.initialGeneration?.status === "stopped";
 					this.setInitialGenerationStatus("failed");
+					// Unfinished builds are the slow tail; log what they did first.
+					if (outcome?.steps) {
+						this.logInitialBuildBenchmark(
+							{
+								...summarizeInitialBuildBenchmark(this.state.milestones ?? {}, outcome.steps),
+								...(isInitialBuild ? {} : { resumed: true }),
+							},
+							stopped ? "stopped" : "failed",
+						);
+					}
 				}
 				if (tracksInitialBuild) this.setState({ ...this.state, initialBuildInFlight: false });
 				markChatTurnFinished(this, metrics.pendingRecord());
@@ -6656,7 +6710,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			metrics.streamStarted({ promptChars: system.length, toolCount: buildToolNames.length });
 			const result = streamText({
-				model,
+				model: this.createTurnModel(metrics),
 				system,
 				messages: modelMessages,
 				tools,
@@ -6667,6 +6721,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				prepareStep: ({ messages }) => {
 					return prepareBuildStep(convergence, messages, buildToolNames);
 				},
+				experimental_onStepStart: (event) =>
+					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
 				onStepFinish: (step) => {
 					convergence.finishStep(step);
 					if (tracksInitialBuild) {
@@ -6682,6 +6738,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
 				},
+				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
 				onAbort: () => {
 					if (convergence.currentRevision() > 0) this.dropSuggestions();
 					this.recordTurnMetrics(
@@ -6696,6 +6753,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				abortSignal: buildAbortSignal,
 				onChunk: ({ chunk }) => {
 					this.touchBuildActivity();
+					metrics.observeChunk(chunk.type);
 					if (!runawayToolInput.observe(chunk)) return;
 					const error = new Error(
 						"Stopped a malformed tool call after excessive whitespace in its unfinished input.",

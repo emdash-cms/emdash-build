@@ -29,6 +29,24 @@ also kept in agent state as `lastTurnMetrics`. Fields:
 - per-tool `calls`, `ms` and `failures`, including calls the SDK rejected
   without running them (invalid input, unknown or disabled tool) at 0 ms;
   `sync` is the preview re-render and backup time spent inside tools
+- `stepTimings` for the first 64 steps (`stepTimingsOmitted` counts the rest),
+  each measured from the step's start: the requested `effort`; `attempts`, the
+  model HTTP attempts (above 1, the times include the SDK's retry backoff);
+  `firstByteMs` to the successful attempt's response headers; `firstChunkMs`
+  to the first reasoning summary, answer text or tool input; `firstOutputMs`
+  to the first answer text or tool input (queueing plus thinking); `ms` to the
+  step's end including its tools; the step's `tokens`; and `incomplete` when
+  the step never finished (stopped, failed or out of retries)
+- `modelWaitMs`, the sum of the timed steps' `firstOutputMs`
+- `modelHttp`: model HTTP attempts, including SDK retries and entry-body
+  sub-calls, with failed statuses counted by code (`0` is a network error; a
+  Stop is not counted)
+
+`lastTurnMetrics` in agent state omits `stepTimings`; the log line has them.
+Model requests carry `cf-aig-metadata` (`session`, `turn`, `kind`, and
+`purpose` for sub-calls), so AI Gateway logs join to these records.
+`builder.initial_build_benchmark` carries an `outcome` of `completed`,
+`failed` or `stopped`; unfinished first builds are logged too.
 
 Tool times overlap when tools run in parallel, and `sync` includes time spent
 waiting behind another backup. Waiting for MCP before `onChatMessage` and a

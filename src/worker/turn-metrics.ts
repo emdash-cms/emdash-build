@@ -12,6 +12,24 @@ export interface TokenTotals {
 	reasoning: number;
 }
 
+export interface StepTiming {
+	/** Reasoning effort requested for the step, when known. */
+	effort?: string;
+	/** Model HTTP attempts; above 1, the times below include the SDK's retry backoff. */
+	attempts: number;
+	/** Step start to the successful attempt's response headers: gateway and queueing time. */
+	firstByteMs: number | null;
+	/** Step start to its first reasoning summary, answer text or tool input. */
+	firstChunkMs: number | null;
+	/** Step start to its first answer text or tool input: queueing plus thinking. */
+	firstOutputMs: number | null;
+	/** Step start to step finish, including the step's tool calls. */
+	ms: number;
+	/** The step never finished: stopped, failed, or out of retries. */
+	incomplete?: true;
+	tokens: TokenTotals;
+}
+
 export interface TurnMetricsRecord {
 	turnId: string;
 	kind: TurnKind;
@@ -30,9 +48,16 @@ export interface TurnMetricsRecord {
 	finalSaveMs: number | null;
 	/** Completed steps. A stopped turn omits the interrupted step's usage. */
 	steps: number;
+	/** Per-step timing for the first `MAX_STEP_TIMINGS` steps. */
+	stepTimings: StepTiming[];
+	stepTimingsOmitted: number;
+	/** Sum of the timed steps' `firstOutputMs`: how long the turn waited on the model. */
+	modelWaitMs: number;
 	tokens: TokenTotals;
 	peakInputTokens: number;
 	subcalls: { calls: number; tokens: TokenTotals };
+	/** Model HTTP attempts, including ones the SDK retried; status 0 is a network error. */
+	modelHttp: { requests: number; failures: Record<string, number> };
 	tools: Record<string, { calls: number; ms: number; failures: number }>;
 	/**
 	 * Preview re-renders and backups awaited inside tool calls, so a subset of
@@ -54,6 +79,9 @@ export interface TurnMetricsInit {
 }
 
 const MAX_ERROR_CHARS = 300;
+const MAX_STEP_TIMINGS = 64;
+/** Stream parts that mean the model has finished thinking and started its answer. */
+const OUTPUT_CHUNK_TYPES = new Set(["text-delta", "tool-input-start", "tool-call"]);
 
 function emptyTokens(): TokenTotals {
 	return { input: 0, cachedInput: 0, output: 0, reasoning: 0 };
@@ -87,6 +115,20 @@ export class TurnMetrics {
 	private peakInputTokens = 0;
 	private readonly tokens = emptyTokens();
 	private readonly subcalls = { calls: 0, tokens: emptyTokens() };
+	private readonly stepTimings: StepTiming[] = [];
+	private stepTimingsOmitted = 0;
+	private currentStep?: {
+		startedAt: number;
+		effort?: string;
+		attempts: number;
+		firstByteAt?: number;
+		firstChunkAt?: number;
+		firstOutputAt?: number;
+	};
+	private readonly modelHttp: TurnMetricsRecord["modelHttp"] = {
+		requests: 0,
+		failures: Object.create(null),
+	};
 	// Invalid calls carry model-chosen names, so no prototype keys like `__proto__`.
 	private readonly tools: TurnMetricsRecord["tools"] = Object.create(null);
 	private readonly executedToolCalls = new Set<string>();
@@ -103,11 +145,54 @@ export class TurnMetrics {
 		this.startedAt = init.startedAt ?? this.now();
 	}
 
+	get turnId(): string {
+		return this.init.turnId;
+	}
+
+	get kind(): TurnKind {
+		return this.init.kind;
+	}
+
 	/** The model call is about to start; everything before it is setup. */
 	streamStarted(prompt: { promptChars: number; toolCount: number }): void {
 		this.setupMs = this.now() - this.startedAt;
 		this.promptChars = prompt.promptChars;
 		this.toolCount = prompt.toolCount;
+	}
+
+	/** A model step is about to call the provider. */
+	stepStarted(step: { effort?: string }): void {
+		this.currentStep = {
+			startedAt: this.now(),
+			attempts: 0,
+			...(step.effort ? { effort: step.effort } : {}),
+		};
+	}
+
+	/** A streamed part of the current step; tool results arrive after the model finished. */
+	observeChunk(type: string): void {
+		const step = this.currentStep;
+		if (!step || type === "tool-result" || type === "raw") return;
+		const now = this.now();
+		step.firstChunkAt ??= now;
+		if (OUTPUT_CHUNK_TYPES.has(type)) step.firstOutputAt ??= now;
+	}
+
+	/**
+	 * One model HTTP attempt returned `status` (0 when the request failed).
+	 * `step` marks the turn's own model; sub-calls run beside a step and must
+	 * not count as its attempts.
+	 */
+	noteModelResponse(status: number, { step = false }: { step?: boolean } = {}): void {
+		this.modelHttp.requests += 1;
+		const ok = status >= 200 && status < 400;
+		if (step && this.currentStep) {
+			this.currentStep.attempts += 1;
+			if (ok) this.currentStep.firstByteAt ??= this.now();
+		}
+		if (ok) return;
+		const key = String(status);
+		this.modelHttp.failures[key] = (this.modelHttp.failures[key] ?? 0) + 1;
 	}
 
 	onStep(step: {
@@ -116,6 +201,7 @@ export class TurnMetrics {
 	}): void {
 		this.stepCount += 1;
 		addUsage(this.tokens, step.usage);
+		this.recordStepTiming(step.usage);
 		this.peakInputTokens = Math.max(this.peakInputTokens, step.usage.inputTokens ?? 0);
 		// Calls the SDK rejected without running (bad input, unknown or inactive
 		// tool) reach no onToolCallFinish; count them as failed calls here.
@@ -143,6 +229,29 @@ export class TurnMetrics {
 			typeof event.output === "object" &&
 			(event.output as { success?: unknown }).success === false;
 		if (!event.success || reportedFailure) entry.failures += 1;
+	}
+
+	private recordStepTiming(usage: LanguageModelUsage | undefined): void {
+		const step = this.currentStep;
+		this.currentStep = undefined;
+		if (!step) return;
+		if (this.stepTimings.length >= MAX_STEP_TIMINGS) {
+			this.stepTimingsOmitted += 1;
+			return;
+		}
+		const tokens = emptyTokens();
+		if (usage) addUsage(tokens, usage);
+		const since = (at: number | undefined) => (at === undefined ? null : at - step.startedAt);
+		this.stepTimings.push({
+			...(step.effort ? { effort: step.effort } : {}),
+			attempts: step.attempts,
+			firstByteMs: since(step.firstByteAt),
+			firstChunkMs: since(step.firstChunkAt),
+			firstOutputMs: since(step.firstOutputAt),
+			ms: this.now() - step.startedAt,
+			...(usage ? {} : { incomplete: true as const }),
+			tokens,
+		});
 	}
 
 	private toolEntry(name: string): TurnMetricsRecord["tools"][string] {
@@ -218,6 +327,8 @@ export class TurnMetrics {
 		if (this.finished) return null;
 		this.finished = true;
 		if (details.error !== undefined) this.noteError(details.error);
+		// A step that never finished is the slow tail this timing exists for.
+		this.recordStepTiming(undefined);
 		return this.build(outcome, details);
 	}
 
@@ -239,13 +350,31 @@ export class TurnMetrics {
 			setupMs: this.setupMs,
 			finalSaveMs: this.finalSaveMs,
 			steps: this.stepCount,
+			stepTimings: structuredClone(this.stepTimings),
+			stepTimingsOmitted: this.stepTimingsOmitted,
+			modelWaitMs: this.stepTimings.reduce((total, step) => total + (step.firstOutputMs ?? 0), 0),
 			tokens: { ...this.tokens },
 			peakInputTokens: this.peakInputTokens,
 			subcalls: { calls: this.subcalls.calls, tokens: { ...this.subcalls.tokens } },
+			modelHttp: {
+				requests: this.modelHttp.requests,
+				failures: { ...this.modelHttp.failures },
+			},
 			tools: structuredClone(this.tools),
 			sync: structuredClone(this.sync),
 		};
 	}
+}
+
+/**
+ * The record as kept in agent state, which is broadcast to every client on each
+ * state change; per-step timing stays in the log line.
+ */
+export function turnMetricsForState(
+	record: TurnMetricsRecord,
+): Omit<TurnMetricsRecord, "stepTimings"> {
+	const { stepTimings: _, ...stored } = record;
+	return stored;
 }
 
 /** Time `run` against the turn's metrics when there is an active turn. */
