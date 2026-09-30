@@ -137,6 +137,10 @@ replayed with the same key so the control plane reconciles remote identity.
 
 - Guest identities are limited to ten projects in the reference app.
 - Keep Sandbox `max_instances` aligned with the account's deliberate capacity.
+  Production allows 100 concurrent sandboxes (4 vCPU and 12 GiB each), about a
+  quarter of the default account limit of 1,500 vCPU. Past the cap, a new
+  container waits for the SDK's retries (about two minutes) and then fails, so
+  watch for `ContainerUnavailableError` and AI Gateway 429s before raising it.
 - Add provider rate limiting/Turnstile before opening an unrestricted public demo.
 - Expire idle Sandbox compute while retaining source in Artifacts.
 - Commit recovery snapshots from a stable staging copy after initial setup,
