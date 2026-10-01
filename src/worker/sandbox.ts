@@ -40,6 +40,13 @@ const HARD_IDLE_STOP_MS = 2 * 60 * 60_000;
 /** Activity is kept in memory and written at most this often. */
 const ACTIVITY_WRITE_MS = 30_000;
 const ACTIVITY_KEY = "v1:activityAt";
+const PREVIEW_ACTIVITY_KEY = "v1:previewActivityAt";
+/**
+ * Preview traffic alone keeps a container at most this long after BuilderAgent
+ * last used it: anyone holding the preview URL, a shared link or a monitor,
+ * could otherwise hold a container and its slot for good.
+ */
+const PREVIEW_ONLY_MAX_MS = 2 * 60 * 60_000;
 const NAME_KEY = "v1:name";
 /** Where the 0.12 SDK kept the sandbox's name. */
 const LEGACY_NAME_KEY = "sandboxName";
@@ -116,6 +123,8 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 	private runtimeInstance?: SandboxRuntime;
 	private activityAt?: number;
 	private activityWrittenAt = 0;
+	private previewActivityAt?: number;
+	private previewActivityWrittenAt = 0;
 	/** The browser ends of relayed HMR sockets, closed when the container stops. */
 	private readonly sockets = new Set<WebSocket>();
 	/** An idle stop under way; a start waits for it. */
@@ -207,7 +216,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		return mode === "quick-tunnel" ? QUICK_TUNNEL_IDLE_STOP_MS : IDLE_STOP_MS;
 	}
 
-	/** The owner used the site: the preview, the builder, or the CMS. */
+	/** BuilderAgent used the container: a turn, a save, or the owner's builder tab in use. */
 	touch(): void {
 		const now = Date.now();
 		this.activityAt = now;
@@ -217,15 +226,32 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		}
 	}
 
-	private async lastActivity(): Promise<number> {
+	/** Someone loaded a page or an asset of the preview. */
+	private touchPreview(): void {
+		const now = Date.now();
+		this.previewActivityAt = now;
+		if (now - this.previewActivityWrittenAt >= ACTIVITY_WRITE_MS) {
+			this.previewActivityWrittenAt = now;
+			void this.ctx.storage.put(PREVIEW_ACTIVITY_KEY, now);
+		}
+	}
+
+	private async lastBuilderActivity(): Promise<number> {
 		if (this.activityAt !== undefined) return this.activityAt;
 		const stored = await this.ctx.storage.get<number>(ACTIVITY_KEY);
-		if (stored !== undefined) return stored;
+		if (stored !== undefined) return (this.activityAt = stored);
 		// A container this object never saw used, such as one the 0.12 SDK started,
 		// gets a full idle period, so the stop goes through BuilderAgent's save.
 		this.activityAt = Date.now();
 		await this.ctx.storage.put(ACTIVITY_KEY, this.activityAt);
 		return this.activityAt;
+	}
+
+	/** The last activity that keeps the container: BuilderAgent's, or preview traffic within its limit. */
+	private async lastActivity(): Promise<number> {
+		const builder = await this.lastBuilderActivity();
+		this.previewActivityAt ??= (await this.ctx.storage.get<number>(PREVIEW_ACTIVITY_KEY)) ?? 0;
+		return Math.max(builder, Math.min(this.previewActivityAt, builder + PREVIEW_ONLY_MAX_MS));
 	}
 
 	private async armAlarm(): Promise<void> {
@@ -491,7 +517,9 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			request.headers.get("Upgrade")?.toLowerCase() !== "websocket" &&
 			!pathname.startsWith("/_emdash/api/mcp")
 		) {
-			this.touch();
+			// Anyone with the URL can send these, cookies included; the owner's own
+			// presence comes through BuilderAgent (keepSandboxAwake).
+			this.touchPreview();
 		}
 		return this.previews.fetch(request);
 	}

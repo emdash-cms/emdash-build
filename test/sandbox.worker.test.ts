@@ -379,6 +379,86 @@ describe("Sandbox lifetime", () => {
 		});
 	});
 
+	it("lets preview traffic alone keep a container for two hours after BuilderAgent last used it", async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer(async () => new Response("Not found", { status: 404 }));
+			install(instance, container);
+			await instance.ensureRunning();
+			await instance.exposePort(4321, { hostname: "build.emdashcms.com", token: "tok" });
+			const agent = builderAgent({ busy: false });
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", agent.binding);
+
+			// The owner left; an uptime monitor keeps fetching a missing asset.
+			let stoppedAt: number | undefined;
+			for (let minute = 9; minute <= 4 * 60 && stoppedAt === undefined; minute += 9) {
+				vi.setSystemTime(base + minute * 60_000);
+				await instance.fetch(preview("/nope.ico"));
+				await instance.alarm();
+				if (!container.state.running) stoppedAt = minute;
+			}
+
+			expect(stoppedAt).toBeGreaterThanOrEqual(2 * 60);
+			expect(stoppedAt).toBeLessThanOrEqual(2 * 60 + 20);
+			expect(agent.prepareSandboxStop).toHaveBeenCalled();
+		});
+	});
+
+	it("keeps a container while BuilderAgent says the owner's tab is in use, however long", async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			await instance.exposePort(4321, { hostname: "build.emdashcms.com", token: "tok" });
+			Reflect.set(
+				Reflect.get(instance, "env") as object,
+				"BuilderAgent",
+				builderAgent({ busy: false }).binding,
+			);
+
+			for (let minute = 4; minute <= 4 * 60; minute += 4) {
+				vi.setSystemTime(base + minute * 60_000);
+				// The builder's heartbeat, while the owner edits in the Admin tab.
+				instance.touch();
+				await instance.fetch(preview("/_emdash/api/content/posts", { Cookie: "astro-session=s" }));
+				await instance.alarm();
+			}
+
+			expect(container.state.running).toBe(true);
+		});
+	});
+
+	it("counts a preview load with a cookie like any other preview load", async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			await instance.exposePort(4321, { hostname: "build.emdashcms.com", token: "tok" });
+			Reflect.set(
+				Reflect.get(instance, "env") as object,
+				"BuilderAgent",
+				builderAgent({ busy: false }).binding,
+			);
+
+			// Anyone can send a cookie; only BuilderAgent can say the owner is here.
+			for (let minute = 9; minute <= 4 * 60 && container.state.running; minute += 9) {
+				vi.setSystemTime(base + minute * 60_000);
+				await instance.fetch(preview("/", { Cookie: "a=1", Authorization: "Bearer x" }));
+				await instance.alarm();
+			}
+
+			expect(container.state.running).toBe(false);
+		});
+	});
+
 	it("stops after two idle hours even while BuilderAgent reports work, and says so", async () => {
 		await runInDurableObject(stub(), async (instance) => {
 			vi.useFakeTimers({ toFake: ["Date"] });
