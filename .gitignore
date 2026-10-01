@@ -9,3 +9,8 @@ reference
 
 # Local implementation specifications
 .tech-specs/
+
+# Documentation and specifications stay local
+/docs/
+/SPEC.md
+/PLATFORM-ARCHITECTURE.md
