@@ -143,6 +143,13 @@ describe("MCP tool adaptation", () => {
 		});
 	});
 
+	it("removes a blank cursor from any listing, since none means anything", () => {
+		// "[INVALID_CURSOR] Invalid pagination cursor: ."
+		expect(
+			normalizeMcpToolArgs("taxonomy_list_terms", { taxonomy: "section", cursor: "" }),
+		).toEqual({ repaired: true, args: { taxonomy: "section" } });
+	});
+
 	it("normalizes documented snake_case content ordering aliases", () => {
 		expect(
 			normalizeMcpToolArgs("content_list", {

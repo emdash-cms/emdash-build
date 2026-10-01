@@ -80,10 +80,8 @@ export function normalizeMcpToolArgs(
 ): { args: Record<string, unknown>; repaired: boolean } {
 	let normalized = args;
 	let repaired = false;
-	if (
-		PAGINATED_CURSOR_TOOLS.has(toolName) &&
-		(args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim()))
-	) {
+	// A blank cursor means the first page to the model, and nothing to EmDash, for any listing.
+	if (args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim())) {
 		normalized = { ...normalized };
 		delete normalized.cursor;
 		repaired = true;
