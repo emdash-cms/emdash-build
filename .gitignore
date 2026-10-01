@@ -14,3 +14,6 @@ reference
 /docs/
 /SPEC.md
 /PLATFORM-ARCHITECTURE.md
+
+# A pnpm store created inside the project
+.pnpm-store/
