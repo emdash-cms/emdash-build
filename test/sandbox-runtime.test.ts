@@ -15,6 +15,7 @@ import type { CapacityGrant } from "../src/worker/sandbox-capacity.js";
 import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import {
 	BASE_ENV,
+	CONTAINER_ANSWER_MS,
 	CONTAINER_NOT_ANSWERING,
 	SAFETY_INACTIVITY_MS,
 	SandboxRuntime,
@@ -324,6 +325,86 @@ describe("a container that stops answering", { timeout: 30_000 }, () => {
 		// At the root, with no directory to create first.
 		await expect(runtime.writeFile("/b.txt", "b")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
 		await expect(runtime.deleteFile("/b.txt")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+	});
+
+	it("tries a read the container does not answer once more, since reads are safe to repeat", async () => {
+		const { fs, runtime } = await running({
+			answerTimeoutMs: 100,
+			contents: { "/home/user/site/package.json": "{}" },
+		});
+		const answering = fs.fake.readFile;
+		let reads = 0;
+		fs.fake.readFile = (...args) =>
+			++reads % 2 === 1 ? new Promise(() => {}) : answering(...args);
+
+		await expect(runtime.readFile("/home/user/site/package.json")).resolves.toEqual({
+			success: true,
+			content: "{}",
+		});
+		const stream = await runtime.readFileStream("/home/user/site/package.json");
+		expect(await new Response(stream).text()).toBe("{}");
+		expect(reads).toBe(4);
+
+		// Only a read that does not answer is tried again.
+		reads = 1;
+		await expect(runtime.readFile("/missing.txt")).rejects.toThrow("File not found");
+		expect(reads).toBe(2);
+	});
+
+	it("tries an unanswered read again well before the usual bound", async () => {
+		const { fs, runtime } = await running({ contents: { "/a.txt": "a" } });
+		const answering = fs.fake.readFile;
+		let reads = 0;
+		fs.fake.readFile = (...args) => (++reads === 1 ? new Promise(() => {}) : answering(...args));
+		vi.useFakeTimers();
+		try {
+			const read = runtime.readFile("/a.txt");
+			await vi.advanceTimersByTimeAsync(CONTAINER_ANSWER_MS / 2);
+			// Answered by now, not merely pending: awaiting a pending read would stall the fake clock.
+			const outcome = await Promise.race([read, Promise.resolve("still waiting")]);
+			expect(outcome).toEqual({ success: true, content: "a" });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("still takes a slow read that answers within the usual bound", async () => {
+		const { fs, runtime } = await running({ answerTimeoutMs: 300 });
+		let reads = 0;
+		fs.fake.readFile = () =>
+			++reads === 1
+				? new Promise((resolve) => setTimeout(() => resolve(new Response("slow")), 450))
+				: new Promise(() => {});
+
+		await expect(runtime.readFile("/a.txt")).resolves.toEqual({ success: true, content: "slow" });
+		expect(reads).toBe(2);
+	});
+
+	it("lets only the second read's error decide, since the first may fail late", async () => {
+		const { fs, runtime } = await running({ answerTimeoutMs: 200 });
+		let reads = 0;
+		fs.fake.readFile = () =>
+			++reads === 1
+				? new Promise((_, reject) =>
+						setTimeout(() => reject(new Error("Network connection lost")), 250),
+					)
+				: new Promise((resolve) => setTimeout(() => resolve(new Response("second")), 100));
+
+		await expect(runtime.readFile("/a.txt")).resolves.toEqual({ success: true, content: "second" });
+	});
+
+	it("closes the read that lost when it answers late", async () => {
+		const { fs, runtime } = await running({ answerTimeoutMs: 100, contents: { "/a.txt": "a" } });
+		const answering = fs.fake.readFile;
+		let answerLate!: (response: Response) => void;
+		const cancelled = vi.fn();
+		let reads = 0;
+		fs.fake.readFile = (...args) =>
+			++reads === 1 ? new Promise((resolve) => (answerLate = resolve)) : answering(...args);
+
+		await expect(runtime.readFile("/a.txt")).resolves.toEqual({ success: true, content: "a" });
+		answerLate(new Response(new ReadableStream({ cancel: cancelled })));
+		await vi.waitFor(() => expect(cancelled).toHaveBeenCalled());
 	});
 
 	it("fails a start the container does not answer, keeping the slot while it still runs", async () => {

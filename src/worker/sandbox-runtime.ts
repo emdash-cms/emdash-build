@@ -47,6 +47,12 @@ export const SAFETY_INACTIVITY_MS = 15 * 60_000;
  * died without the platform noticing can leave every call waiting for good.
  */
 export const CONTAINER_ANSWER_MS = 15_000;
+/**
+ * How long a file read may take to answer before a second one races it. Reads
+ * answer in milliseconds, but under local workerd a few never answer at all,
+ * while one tried again at once does.
+ */
+export const READ_ANSWER_MS = 5_000;
 /** What a call fails with when the container does not answer it in time. */
 export const CONTAINER_NOT_ANSWERING = "The container did not answer.";
 const READY_TIMEOUT_MS = 30_000;
@@ -269,8 +275,10 @@ export class SandboxRuntime implements ContainerOps {
 	}
 
 	/** A container call that answers at once, failing instead of waiting for good when it does not. */
-	private async answered<T>(call: Promise<T>): Promise<T> {
-		const answerMs = this.deps.answerTimeoutMs ?? CONTAINER_ANSWER_MS;
+	private async answered<T>(
+		call: Promise<T>,
+		answerMs = this.deps.answerTimeoutMs ?? CONTAINER_ANSWER_MS,
+	): Promise<T> {
 		// A container still starting answers once it is up, which a start may take longer for;
 		// one this object found running gets as long, from its first call.
 		this.startingUntil ??= Date.now() + (this.deps.readyTimeoutMs ?? READY_TIMEOUT_MS);
@@ -462,10 +470,45 @@ export class SandboxRuntime implements ContainerOps {
 		}
 	}
 
+	/**
+	 * Open a file. A read that has not answered in READ_ANSWER_MS races a second
+	 * one for the rest of the usual bound, since a read is safe to repeat.
+	 */
+	private async openFile(path: string): Promise<Response> {
+		const answerMs = this.deps.answerTimeoutMs ?? CONTAINER_ANSWER_MS;
+		const readMs = Math.min(READ_ANSWER_MS, answerMs);
+		const read = () => this.deps.files.readFile(path, { user: SANDBOX_USER });
+		const first = read();
+		try {
+			return await this.answered(first, readMs);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== CONTAINER_NOT_ANSWERING) throw error;
+		}
+		const second = read();
+		let response: Response | undefined;
+		try {
+			// The first read counts only if it answers: an error it gives up with late is not the file's.
+			const answer = new Promise<Response>((resolve, reject) => {
+				first.then(resolve, () => undefined);
+				second.then(resolve, reject);
+			});
+			response = await this.answered(answer, Math.max(answerMs - readMs, readMs));
+			return response;
+		} finally {
+			// The read that lost, or both when neither answered, may yet answer; nothing reads it.
+			for (const attempt of [first, second]) {
+				void attempt.then(
+					(late) => late !== response && void late.body?.cancel().catch(() => undefined),
+					() => undefined,
+				);
+			}
+		}
+	}
+
 	private async readBytes(path: string): Promise<Uint8Array> {
 		this.requireRunning();
 		try {
-			const response = await this.answered(this.deps.files.readFile(path, { user: SANDBOX_USER }));
+			const response = await this.openFile(path);
 			return new Uint8Array(await response.arrayBuffer());
 		} catch (error) {
 			// The message the 0.12 SDK used, which callers recognise.
@@ -492,7 +535,7 @@ export class SandboxRuntime implements ContainerOps {
 	async readFileStream(path: string): Promise<ReadableStream<Uint8Array>> {
 		this.requireRunning();
 		try {
-			const response = await this.answered(this.deps.files.readFile(path, { user: SANDBOX_USER }));
+			const response = await this.openFile(path);
 			return response.body ?? new ReadableStream({ start: (controller) => controller.close() });
 		} catch (error) {
 			if (isFileNotFound(error)) throw new Error(`FileNotFoundError: File not found: ${path}`);
