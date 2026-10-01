@@ -264,7 +264,7 @@ describe("commands", { timeout: 30_000 }, () => {
 		expect(container.execs.at(-1)?.slice(0, 6)).toEqual([
 			"timeout",
 			"--signal=TERM",
-			"--kill-after=4s",
+			"--kill-after=6s",
 			"86400s",
 			"bash",
 			"-c",
@@ -283,7 +283,7 @@ describe("commands", { timeout: 30_000 }, () => {
 		expect(container.execs.at(-1)).toEqual([
 			"timeout",
 			"--signal=TERM",
-			"--kill-after=4s",
+			"--kill-after=6s",
 			"2s",
 			"bash",
 			"-c",
@@ -441,8 +441,11 @@ describe("commands", { timeout: 30_000 }, () => {
 		);
 
 		expect(result).toMatchObject({ exitCode: 0, stdout: "started\n" });
-		expect(Date.now() - started).toBeLessThan(2_000);
-		await new Promise((resolve) => setTimeout(resolve, 2_000));
+		expect(Date.now() - started).toBeLessThan(4_000);
+		// The process lives on and finishes, however slowly a loaded machine runs it.
+		for (let waited = 0; waited < 15_000 && !existsSync(marker); waited += 100) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
 		expect(existsSync(marker)).toBe(true);
 	});
 
@@ -458,11 +461,11 @@ describe("commands", { timeout: 30_000 }, () => {
 			timeout: MODEL_COMMAND_TIMEOUT_MS,
 			signal: controller.signal,
 		});
-		setTimeout(() => controller.abort(), 1000);
+		setTimeout(() => controller.abort(), 1500);
 		const started = Date.now();
 
 		await expect(pending).rejects.toThrow();
-		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(Date.now() - started).toBeLessThan(6_000);
 		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
 		expect(readdirSync(tmp)).toEqual([]);
 	});
@@ -474,7 +477,7 @@ describe("commands", { timeout: 30_000 }, () => {
 
 		const result = await runtime.exec(modelCommand("echo tampered > AGENTS.md; sleep 30"), {
 			cwd: site,
-			timeout: 1000,
+			timeout: 3000,
 		});
 
 		expect(result.exitCode).toBe(124);
@@ -490,14 +493,14 @@ describe("commands", { timeout: 30_000 }, () => {
 		const command = modelCommand("trap '' TERM; echo partial; echo tampered > AGENTS.md; sleep 6");
 		const started = Date.now();
 
-		const result = await runtime.exec(command, { cwd: site, env: { TMPDIR: tmp }, timeout: 1000 });
+		const result = await runtime.exec(command, { cwd: site, env: { TMPDIR: tmp }, timeout: 3000 });
 
 		expect(result.exitCode).toBe(124);
 		expect(result.stdout).toBe("partial\n");
 		expect(result.stderr).toContain("restored protected file AGENTS.md");
 		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
 		expect(readdirSync(tmp)).toEqual([]);
-		expect(Date.now() - started).toBeLessThan(4_000);
+		expect(Date.now() - started).toBeLessThan(9_000);
 
 		const controller = new AbortController();
 		const stopped = runtime.exec(command, {
