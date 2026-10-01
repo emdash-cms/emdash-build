@@ -444,14 +444,171 @@ describe("CMS programs", () => {
 		);
 	});
 
-	it("wraps programs so they stay valid JavaScript", () => {
+	it("wraps programs so they stay valid JavaScript", async () => {
 		for (const program of [
 			"async () => 1",
 			"async () => 1;",
 			"async () => 1; // done",
 			"() => {\n  return 1;\n} // done",
+			"async () => 1; /* done */",
+			"async () => 1;\n// a\n// b",
+			"async () => 1 // a\n/* b */ ;",
 		]) {
-			expect(() => new Function(`return ${guardProgram(program)}`)).not.toThrow();
+			const wrapped = new Function(`return ${guardProgram(program)}`)() as () => Promise<unknown>;
+			await expect(wrapped(), program).resolves.toBe(1);
 		}
+	});
+
+	it("fails a program that returns before its calls finish", async () => {
+		const set = tools();
+		const slow = set.content_create;
+		set.content_create = {
+			...slow,
+			execute: async (input: Record<string, unknown>, options: { abortSignal?: AbortSignal }) => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				return slow.execute(input, options);
+			},
+		};
+		const run = new CmsScriptRun({ toolCallId: "call-unawaited" });
+		const executor = new ScriptedExecutor(async (cms) => {
+			// The classic missing await: each publish would start after the program returned.
+			for (const slug of ["a", "b"]) {
+				void (async () => {
+					await cms.content_create!({ collection: "posts", slug });
+					await cms.settings_update!({ title: slug });
+				})().catch(() => undefined);
+			}
+			return "queued";
+		});
+
+		const outcome = await run.execute(executor, "code", bindAll(run, set));
+		await run.close();
+		// The publishes come once the creates resolve, after the program returned.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const output = cmsScriptOutput(outcome, run, true);
+
+		expect(output.success).toBe(false);
+		expect(output.error).toMatch(/returned before 2 cms changes finished/);
+		expect(output.error).toMatch(/made 2 cms changes after it returned, which were refused/);
+		expect(output.error).toMatch(/await/);
+	});
+
+	it("passes a program whose unawaited reads never mattered", async () => {
+		const set = tools();
+		const slow = set.content_get;
+		set.content_get = {
+			...slow,
+			execute: async (input: Record<string, unknown>, options: { abortSignal?: AbortSignal }) => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				return slow.execute(input, options);
+			},
+		};
+		const run = new CmsScriptRun({ toolCallId: "call-race" });
+		const executor = new ScriptedExecutor(async (cms) => {
+			try {
+				await Promise.all([cms.content_get!({ id: "a" }), cms.settings_update!({ title: "bad" })]);
+			} catch {
+				return "settings were refused";
+			}
+			return "unreachable";
+		});
+
+		const outcome = await run.execute(executor, "code", bindAll(run, set));
+		await run.close();
+		const output = cmsScriptOutput(outcome, run, false);
+
+		// The failed change fails it, not the read it left running.
+		expect(output.error).toBeUndefined();
+		expect(output.result).toBe("settings were refused");
+	});
+
+	it("runs a program whose function comes after a helper", async () => {
+		// What codemode's normalizeCode makes of a helper followed by the program's
+		// function: a function that returns the program's function uncalled.
+		const program = guardProgram(
+			"async () => {\nconst slug = (s) => s.toLowerCase();\nreturn (async () => slug('Rye'))\n}",
+		);
+		const wrapped = new Function(`return ${program}`)() as () => Promise<unknown>;
+
+		await expect(wrapped()).resolves.toBe("rye");
+	});
+
+	it("counts and logs an input that is not an object as a refusal", async () => {
+		const set = tools();
+		const run = new CmsScriptRun({ toolCallId: "call-refused-null" });
+		// Arguments arrive as the program sent them; JSON turns undefined into null.
+		const executor: Executor = {
+			execute: async (_code, providers) => {
+				const cms = (providers as ResolvedProvider[])[0]!.fns;
+				try {
+					await cms.content_get!(null);
+				} catch {
+					// Caught, but the run still says so.
+				}
+				return { result: "ok" };
+			},
+		};
+
+		const outcome = await run.execute(executor, "code", {
+			content_get: run.bind("content_get", set.content_get as never),
+		});
+		const output = cmsScriptOutput(outcome, run, false);
+
+		expect(output).toMatchObject({ success: false, refused: 1 });
+		expect(output.log).toEqual([
+			expect.objectContaining({ tool: "content_get", error: expect.stringContaining("object") }),
+		]);
+	});
+
+	it("fails a program that made no calls and returned nothing", async () => {
+		const run = new CmsScriptRun({ toolCallId: "call-noop" });
+		const executor: Executor = { execute: async () => ({ result: undefined }) };
+
+		const outcome = await run.execute(executor, "code", {});
+		const output = cmsScriptOutput(outcome, run, false);
+
+		expect(output.success).toBe(false);
+		expect(output.error).toMatch(/made no cms calls and returned nothing/i);
+	});
+
+	it("bounds the error, refusal and log text a program can send back", async () => {
+		const set = tools();
+		const run = new CmsScriptRun({ toolCallId: "call-flood" });
+		const huge = "x".repeat(CMS_SCRIPT_LIMITS.maxArgBytes + 10);
+		let refusals = 0;
+		const executor = new ScriptedExecutor(async (cms) => {
+			for (let index = 0; index < CMS_SCRIPT_LIMITS.maxCalls + 50; index++) {
+				try {
+					await cms.content_get!({ slug: huge });
+				} catch {
+					refusals++;
+				}
+			}
+			throw new Error("y".repeat(500_000));
+		});
+
+		const outcome = await run.execute(executor, "code", bindAll(run, set));
+		const output = cmsScriptOutput(outcome, run, false);
+
+		expect(refusals).toBe(CMS_SCRIPT_LIMITS.maxCalls + 50);
+		expect(JSON.stringify(output).length).toBeLessThan(20_000);
+		expect(output.error!.length).toBeLessThanOrEqual(2_100);
+		for (const entry of output.log ?? []) expect(entry.ref?.length ?? 0).toBeLessThanOrEqual(100);
+		// Refused calls count against the call budget, so a loop of them ends.
+		expect(run.log).toContainEqual(
+			expect.objectContaining({ error: expect.stringContaining("at most 200 calls") }),
+		);
+	});
+
+	it("refuses an input that is not an object before the tool runs", async () => {
+		const set = tools();
+		const run = new CmsScriptRun({ toolCallId: "call-null" });
+		const call = run.bind("content_get", set.content_get as never);
+
+		for (const input of [null, [], "slug", 3]) {
+			await expect(call(input)).rejects.toThrow("content_get: the input must be an object");
+		}
+		await expect(call(undefined)).resolves.toBeDefined();
+		expect(set.executed).toHaveLength(1);
 	});
 });
