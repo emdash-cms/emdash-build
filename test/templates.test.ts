@@ -39,6 +39,7 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain("Render rich text with `<RichText");
 		expect(prompt).toContain("`emdash/ui` has no `RichText`");
 		expect(prompt).toContain('import RichText from "../../ui/RichText.astro";');
+		expect(prompt).toContain("never pass it an image field's object");
 		expect(prompt).not.toContain("Render rich text with `<PortableText");
 		expect(prompt).not.toContain("Keep the template's existing typefaces");
 		expect(prompt).toContain("Current structured-block contract");
