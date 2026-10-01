@@ -1,4 +1,5 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -15,6 +16,8 @@ import {
 	canReuseFinalSnapshotForTurn,
 	canSkipFinalSnapshot,
 	publishStagingCommand,
+	SNAPSHOT_HISTORY_LIMIT,
+	snapshotCloneCommand,
 	snapshotCommitCommand,
 	snapshotPushCommand,
 	snapshotStagingCommand,
@@ -155,8 +158,6 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 			encoding: "utf8",
 			env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
 		});
-	const looseObjects = () =>
-		Number(sh(`find '${remote}/objects' -type f -path '*/[0-9a-f][0-9a-f]/*' | wc -l`).trim());
 	const snapshotOnce = (message: string) => {
 		run(snapshotStagingCommand(site, snapshot));
 		const commit = run(
@@ -191,24 +192,115 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("keeps one commit on the remote while pushing only what changed", () => {
-		const first = snapshotOnce("first");
-		const afterFirst = looseObjects();
-		write(join(site, "src/pages/page-7.astro"), "page 7, edited");
-		const second = snapshotOnce("second");
-		const added = looseObjects() - afterFirst;
+	/** The bytes a checkpoint's push sends, from git's progress report. */
+	const pushedBytes = (stderr: string) => {
+		const match = [
+			...stderr.matchAll(/Writing objects: 100% \(\d+\/\d+\), ([\d.]+) (bytes|KiB|MiB)/g),
+		].at(-1);
+		return match ? Number(match[1]) * { bytes: 1, KiB: 1024, MiB: 1024 ** 2 }[match[2]!]! : 0;
+	};
+	const checkpoint = (message: string) => {
+		run(snapshotStagingCommand(site, snapshot));
+		const commit = run(
+			snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message, ...identity }),
+		).trim();
+		const push = spawnSync(
+			"bash",
+			[
+				"-c",
+				snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 }).replace(
+					"git push -q",
+					"git push --progress",
+				),
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			},
+		);
+		expect(push.status, push.stderr).toBe(0);
+		return { commit, bytes: pushedBytes(push.stderr) };
+	};
 
-		expect(afterFirst).toBeGreaterThan(30);
-		// One blob, the trees on its path, and the commit.
-		expect(added).toBeLessThanOrEqual(6);
-		expect(second).not.toBe(first);
-		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(second);
-		// Restores and clones still see a single snapshot commit.
-		expect(sh(`git -C '${remote}' rev-list --count main`).trim()).toBe("1");
+	it("uploads only what changed since the last checkpoint", () => {
+		// Photos do not compress.
+		writeFileSync(join(site, ".wrangler/state/v3/r2/media/hero"), randomBytes(512 * 1024));
+		const first = checkpoint("first");
+		write(join(site, "src/pages/page-7.astro"), "page 7, edited");
+		const second = checkpoint("second");
+
+		expect(first.bytes).toBeGreaterThan(512 * 1024);
+		// The edited page, the trees above it and the commit; not the photo again.
+		expect(second.bytes).toBeLessThan(8 * 1024);
+		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(second.commit);
 		expect(sh(`git -C '${remote}' show main:src/pages/page-7.astro`)).toBe("page 7, edited");
 		expect(sh(`git -C '${remote}' show main:.wrangler/state/v3/r2/media/photo`)).toBe(
 			"photo bytes",
 		);
+	});
+
+	// Twenty-one checkpoints of real git and tar.
+	it(
+		"starts the history again after a run of checkpoints, so it stays short",
+		{ timeout: 120_000 },
+		() => {
+			const depths: number[] = [];
+			for (let index = 0; index <= SNAPSHOT_HISTORY_LIMIT; index++) {
+				write(join(site, "src/pages/page-1.astro"), `page 1, edit ${index}`);
+				checkpoint(`checkpoint ${index}`);
+				depths.push(Number(sh(`git -C '${remote}' rev-list --count main`).trim()));
+			}
+
+			expect(Math.max(...depths)).toBe(SNAPSHOT_HISTORY_LIMIT);
+			expect(depths.at(-1)).toBe(1);
+		},
+	);
+
+	it("starts again from a root commit after a failed upload, so one cannot wedge the rest", () => {
+		checkpoint("first");
+		write(join(site, "src/pages/page-1.astro"), "edit");
+		run(snapshotStagingCommand(site, snapshot));
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "unsent", ...identity }));
+		// The upload fails: the remote is gone, as when its repository is recreated.
+		rmSync(remote, { recursive: true, force: true });
+		const failed = spawnSync(
+			"bash",
+			["-c", snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 })],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			},
+		);
+		expect(failed.status).not.toBe(0);
+		sh(`git init -q --bare '${remote}'`);
+
+		const next = checkpoint("after the failure");
+
+		// A root commit: the new remote gets one snapshot, not the unsent chain.
+		expect(sh(`git -C '${remote}' rev-list --count main`).trim()).toBe("1");
+		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(next.commit);
+	});
+
+	it("clears a lock a killed upload left on its own ref", () => {
+		checkpoint("first");
+		write(join(gitDir, "refs/heads/pushed.lock"), "stale");
+		write(join(site, "src/pages/page-1.astro"), "edit");
+
+		const next = checkpoint("second");
+
+		expect(sh(`git --git-dir='${gitDir}' rev-parse refs/heads/pushed`).trim()).toBe(next.commit);
+	});
+
+	it("restores the latest checkpoint without its history", () => {
+		checkpoint("first");
+		write(join(site, "src/pages/page-2.astro"), "page 2, edited");
+		checkpoint("second");
+		const restored = join(root, "restored");
+
+		run(snapshotCloneCommand(`file://${remote}`, restored));
+
+		expect(readFileSync(join(restored, "src/pages/page-2.astro"), "utf8")).toBe("page 2, edited");
+		expect(sh(`git -C '${restored}' rev-list --count HEAD`).trim()).toBe("1");
 	});
 
 	it("leaves the shell session's environment as it found it", () => {

@@ -108,10 +108,20 @@ export function publishStagingCommand(
 export const SNAPSHOT_GIT_DIR = "/tmp/emdash-build-session-git";
 
 /**
- * Commit the staged tree as a new root commit, in a git directory kept beside
- * the staging copy so it survives each rebuild of that copy. The remote still
- * holds one snapshot commit, but the previous snapshot's objects stay local,
- * so the next push sends only what changed. Prints the new commit id.
+ * Checkpoints chained before the history starts again from a root commit.
+ * git sends only what changed when the new commit descends from the one the
+ * remote has; a fresh root commit makes it send everything again.
+ */
+export const SNAPSHOT_HISTORY_LIMIT = 20;
+
+/**
+ * Commit the staged tree, in a git directory kept beside the staging copy so
+ * it survives each rebuild of that copy. The commit's parent is the last one
+ * pushed, so the push sends only what changed: git cannot see that an
+ * unrelated root commit shares objects with the remote. Every
+ * `SNAPSHOT_HISTORY_LIMIT` checkpoints it is a root commit again, which keeps
+ * the remote's history short and lets old snapshots be collected. Prints the
+ * new commit id.
  *
  * It runs in a subshell: the sandbox's default session keeps exported
  * variables and the working directory for later commands. The index is
@@ -139,7 +149,9 @@ export function snapshotCommitCommand(options: {
 		"git config core.logAllRefUpdates false",
 		"git add -A",
 		"tree=$(git write-tree)",
-		`commit=$(git commit-tree "$tree" -m ${shellQuote(options.message)})`,
+		"parent=$(git rev-parse -q --verify refs/heads/pushed || true)",
+		`if [ -n "$parent" ] && [ "$(git rev-list --count "$parent")" -lt ${SNAPSHOT_HISTORY_LIMIT} ]; then set -- -p "$parent"; else set --; fi`,
+		`commit=$(git commit-tree "$tree" "$@" -m ${shellQuote(options.message)})`,
 		'git update-ref refs/heads/snapshot "$commit"',
 		'echo "$commit"',
 	];
@@ -163,11 +175,30 @@ export function snapshotPushCommand(options: {
 		`export GIT_DIR=${shellQuote(options.gitDir)}`,
 		'cd "$GIT_DIR"',
 		"commit=$(git rev-parse refs/heads/snapshot)",
-		`timeout --signal=TERM --kill-after=2s ${options.timeoutSeconds}s git push -q --no-thin ${shellQuote(options.remote)} "$commit:refs/heads/main" --force`,
+		// A failed upload ends the chain: the next checkpoint is a root commit, so an
+		// upload that keeps failing (to a recreated remote, say) cannot hold every
+		// later checkpoint to the same unsent history.
+		`{ timeout --signal=TERM --kill-after=2s ${options.timeoutSeconds}s git push -q --no-thin ${shellQuote(options.remote)} "$commit:refs/heads/main" --force || { git update-ref -d refs/heads/pushed 2>/dev/null; false; }; }`,
+		// Uploads run one at a time, so a lock on this ref is a killed upload's.
+		'rm -f "$GIT_DIR/refs/heads/pushed.lock"',
 		'git update-ref refs/heads/pushed "$commit"',
 		// Objects younger than an hour may belong to a commit still being written.
 		"{ git prune --expire=1.hour.ago >/dev/null 2>&1 || true; }",
 		'echo "$commit"',
 	];
 	return `( ${steps.join(" && ")} )`;
+}
+
+/**
+ * Clone the latest checkpoint into the site directory without the history
+ * before it, which only the checkpoints use; a server that cannot serve a
+ * shallow clone gets a full one.
+ */
+export function snapshotCloneCommand(remote: string, sitePath: string): string {
+	const site = shellQuote(sitePath);
+	return (
+		// The shallow attempt gets half the time, so a stalled one leaves the fallback some.
+		`rm -rf ${site} && { timeout --signal=TERM --kill-after=2s 50s git clone -q --depth 1 ${shellQuote(remote)} ${site} || ` +
+		`{ rm -rf ${site} && git clone -q ${shellQuote(remote)} ${site}; }; }`
+	);
 }

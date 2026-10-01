@@ -150,6 +150,7 @@ import {
 	stagedLiveUpdate,
 } from "./mcp-tool-guard.js";
 import {
+	snapshotCloneCommand,
 	canReuseFinalSnapshotForTurn,
 	canSkipFinalSnapshot,
 	publishStagingCommand,
@@ -3431,10 +3432,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			this.sendStatus("Restoring session...");
 			this.sendConsole("$ git clone session snapshot");
-			const clone = await sandbox.exec(
-				`rm -rf ${SITE_PATH} && git clone -q ${shellQuote(repo.remote)} ${SITE_PATH}`,
-				{ timeout: 120000, env: artifactsGitEnv(repo.token) },
-			);
+			const clone = await sandbox.exec(snapshotCloneCommand(repo.remote, SITE_PATH), {
+				timeout: 120000,
+				env: artifactsGitEnv(repo.token),
+			});
 			if (!clone.success) {
 				this.sendConsole(
 					`Warning: restore failed: ${redactArtifactsToken(clone.stderr || clone.stdout || "git clone failed")}`,
