@@ -1,5 +1,13 @@
-import { isToolUIPart, type UIMessage } from "ai";
+import {
+	InvalidToolInputError,
+	isToolUIPart,
+	JSONParseError,
+	NoSuchToolError,
+	TypeValidationError,
+	type UIMessage,
+} from "ai";
 import type { QuestionnaireMessageLike } from "../shared/questionnaire.js";
+import { redactArtifactsToken } from "./artifacts-auth.js";
 import { shouldGateInitialBuild } from "./questionnaire.js";
 import type { TurnMetricsRecord } from "./turn-metrics.js";
 
@@ -154,6 +162,77 @@ function hasStashFlag(
 		recoveryData !== null &&
 		(recoveryData as Record<string, unknown>)[flag] === true
 	);
+}
+
+/** Longest tool error kept in a reply; a longer one loses its middle. */
+const MAX_TOOL_ERROR_CHARS = 2_000;
+
+/**
+ * Error text for a reply's UI stream, which reports a failed tool call through
+ * the same callback as a failed turn. A tool call keeps its own message, as the
+ * model reads it, so the activity details say why the call failed; anything
+ * else failed the turn and gets `turnErrorText`. The text reaches the owner and
+ * the saved history, and only Artifacts tokens are redacted, so tools must keep
+ * secrets out of their errors.
+ *
+ * Pass `noteToolCall` to `experimental_onToolCallFinish`, which sees an
+ * execution error before the stream reports it. A call the SDK refused to run
+ * (bad input, unknown tool) is reported twice: as its own error type, then as
+ * that error's message.
+ */
+export function replyErrors(turnErrorText: (error: unknown) => string) {
+	const toolErrors = new WeakSet<object>();
+	/** The SDK's message for each refused call, and the text shown for it. */
+	const refusedCalls = new Map<string, string>();
+	const shown = (error: unknown, message: string) => {
+		if (!message) return turnErrorText(error);
+		const text = redactArtifactsToken(message);
+		if (text.length <= MAX_TOOL_ERROR_CHARS) return text;
+		const half = MAX_TOOL_ERROR_CHARS / 2;
+		return `${text.slice(0, half)} … ${text.slice(-half)}`;
+	};
+	return {
+		noteToolCall(event: { success: boolean; error?: unknown }): void {
+			if (!event.success && typeof event.error === "object" && event.error !== null) {
+				toolErrors.add(event.error);
+			}
+		},
+		errorText(error: unknown): string {
+			if (InvalidToolInputError.isInstance(error) || NoSuchToolError.isInstance(error)) {
+				const text = shown(error, refusedCallMessage(error));
+				refusedCalls.set(error.message, text);
+				return text;
+			}
+			if (typeof error === "string") return refusedCalls.get(error) ?? turnErrorText(error);
+			if (typeof error !== "object" || error === null || !toolErrors.has(error)) {
+				return turnErrorText(error);
+			}
+			return shown(error, errorMessage(error));
+		},
+	};
+}
+
+/** Why the SDK refused a call. Its own message for bad input repeats the whole input. */
+function refusedCallMessage(error: InvalidToolInputError | NoSuchToolError): string {
+	if (!InvalidToolInputError.isInstance(error)) return error.message;
+	const cause =
+		TypeValidationError.isInstance(error.cause) || JSONParseError.isInstance(error.cause)
+			? error.cause.cause
+			: error.cause;
+	if (cause == null) return error.message;
+	return `Invalid input for tool ${error.toolName}: ${errorMessage(cause)}`;
+}
+
+/** As the SDK puts an error to the model. */
+function errorMessage(error: unknown): string {
+	if (error == null) return "unknown error";
+	if (typeof error === "string") return error;
+	if (error instanceof Error) return error.message;
+	try {
+		return JSON.stringify(error);
+	} catch {
+		return String(error);
+	}
 }
 
 /**

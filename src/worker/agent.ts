@@ -94,6 +94,7 @@ import {
 	markChatTurnFinished,
 	markChatTurnStarted,
 	planChatRecovery,
+	replyErrors,
 	replyStreamOptions,
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
@@ -7065,6 +7066,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				promptChars: interviewSystem.length,
 				toolCount: interviewTools ? Object.keys(interviewTools).length : 0,
 			});
+			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
 				system: interviewSystem,
@@ -7093,6 +7095,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				experimental_onToolCallFinish: (event) => {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
+					errors.noteToolCall(event);
 				},
 				onAbort: () => this.recordTurnMetrics(metrics.finish("stopped")),
 				onError: ({ error }) => {
@@ -7111,7 +7114,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				stream: withReasoningDurations(
 					result.toUIMessageStream(
 						replyStreamOptions(
-							(error) => friendlyTurnError(error),
+							errors.errorText,
 							initialGenerationId,
 							alreadyInterviewed ? "holding" : undefined,
 						),
@@ -7301,6 +7304,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				if (isInitialBuild) this.markMilestone("buildStarting");
 			}
 			metrics.streamStarted({ promptChars: system.length, toolCount: buildToolNames.length });
+			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
 				system,
@@ -7331,6 +7335,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				experimental_onToolCallFinish: (event) => {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
+					errors.noteToolCall(event);
 				},
 				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
 				onAbort: () => {
@@ -7368,9 +7373,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(
-						replyStreamOptions((error) => friendlyTurnError(error), initialGenerationId),
-					),
+					result.toUIMessageStream(replyStreamOptions(errors.errorText, initialGenerationId)),
 				),
 			});
 		} catch (err) {

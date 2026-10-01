@@ -1,10 +1,20 @@
-import { convertToModelMessages, streamText, type UIMessage } from "ai";
+import {
+	convertToModelMessages,
+	InvalidToolInputError,
+	streamText,
+	tool,
+	TypeValidationError,
+	type UIMessage,
+	type UIMessageChunk,
+} from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
 	closeInterruptedToolCalls,
 	INTERRUPTED_TOOL_ERROR,
 	planChatRecovery,
+	replyErrors,
 	replyStreamOptions,
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
@@ -46,6 +56,31 @@ const interruptedBuild: UIMessage = {
 		},
 	],
 };
+
+/** A model that makes these tool calls in one step. */
+function toolCallModel(calls: { toolName: string; input: string }[]) {
+	return new MockLanguageModelV3({
+		doStream: async () => ({
+			stream: new ReadableStream({
+				start(controller) {
+					controller.enqueue({ type: "stream-start", warnings: [] });
+					calls.forEach((call, index) =>
+						controller.enqueue({ type: "tool-call", toolCallId: `call-${index}`, ...call }),
+					);
+					controller.enqueue({
+						type: "finish",
+						finishReason: { unified: "tool-calls", raw: "tool_calls" },
+						usage: {
+							inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+							outputTokens: { total: 1, text: 1, reasoning: 0 },
+						},
+					});
+					controller.close();
+				},
+			}),
+		}),
+	});
+}
 
 function finishedModel() {
 	return new MockLanguageModelV3({
@@ -197,6 +232,89 @@ describe("reply stream", () => {
 
 		expect(first.value).toMatchObject({ type: "start", messageId: expect.any(String) });
 		expect((first.value as { messageId: string }).messageId).not.toBe(interruptedBuild.id);
+	});
+	it("says why a tool call failed, and gives a failed turn the turn message", async () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const result = streamText({
+			model: toolCallModel([
+				{ toolName: "read_file", input: '{"path":"a.astro"}' },
+				{ toolName: "read_file", input: '{"path":1}' },
+				{ toolName: "missing_tool", input: "{}" },
+			]),
+			tools: {
+				read_file: tool({
+					inputSchema: z.object({ path: z.string() }),
+					execute: async ({ path }): Promise<string> => {
+						throw new Error(`Could not read ${path}: The container did not answer.`);
+					},
+				}),
+			},
+			experimental_onToolCallFinish: errors.noteToolCall,
+			prompt: "Build",
+		});
+		const chunks: UIMessageChunk[] = [];
+		for await (const chunk of result.toUIMessageStream(replyStreamOptions(errors.errorText))) {
+			chunks.push(chunk);
+		}
+		const errorText = (type: string, toolCallId: string) =>
+			chunks.find(
+				(chunk): chunk is Extract<UIMessageChunk, { errorText: string; toolCallId: string }> =>
+					chunk.type === type && "toolCallId" in chunk && chunk.toolCallId === toolCallId,
+			)?.errorText;
+
+		expect(errorText("tool-output-error", "call-0")).toBe(
+			"Could not read a.astro: The container did not answer.",
+		);
+		// The reason, without the SDK's copy of the whole input, which the details show already.
+		expect(errorText("tool-input-error", "call-1")).toMatch(
+			/^Invalid input for tool read_file: [^]*expected string/,
+		);
+		expect(errorText("tool-input-error", "call-1")).not.toContain("Type validation failed");
+		expect(errorText("tool-output-error", "call-1")).toBe(errorText("tool-input-error", "call-1"));
+		expect(errorText("tool-output-error", "call-2")).toMatch(/missing_tool/);
+		expect(errors.errorText(new Error("Could not read a.astro"))).toBe("Turn failed.");
+	});
+	it("keeps the end of a long tool error, where the reason is", () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const error = new Error(`Invalid input: ${"x".repeat(10_000)} expected string`);
+		errors.noteToolCall({ success: false, error });
+
+		const text = errors.errorText(error);
+
+		expect(text.length).toBeLessThan(2_100);
+		expect(text).toMatch(/^Invalid input: x+ … x+ expected string$/);
+	});
+	it("gives a tool error with no message the turn message", () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const error = new Error("");
+		errors.noteToolCall({ success: false, error });
+
+		expect(errors.errorText(error)).toBe("Turn failed.");
+	});
+	it("says something for a tool error that cannot be put as JSON", () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const cyclic: Record<string, unknown> = { code: "E_LOOP" };
+		cyclic.self = cyclic;
+		errors.noteToolCall({ success: false, error: cyclic });
+
+		expect(errors.errorText(cyclic)).toBe("[object Object]");
+	});
+	it("keeps the SDK's message for bad input whose validation gave no reason", () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const error = new InvalidToolInputError({
+			toolName: "write_file",
+			toolInput: "{}",
+			cause: new TypeValidationError({ value: {}, cause: undefined }),
+		});
+
+		expect(errors.errorText(error)).toBe(error.message);
+	});
+	it("never repeats an Artifacts token from a tool error", () => {
+		const errors = replyErrors(() => "Turn failed.");
+		const error = new Error("git push failed: token art_v1_abc123?expires=99 rejected");
+		errors.noteToolCall({ success: false, error });
+
+		expect(errors.errorText(error)).toBe("git push failed: token art_*** rejected");
 	});
 });
 
