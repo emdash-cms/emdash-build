@@ -50,11 +50,15 @@ import {
 	CANONICAL_WORKER_TS,
 	CANONICAL_WRANGLER_JSONC,
 	stripSandboxFromAstroConfig,
+	scrubStagedContentCommand,
+	stripStorageFromAstroConfig,
+	stripR2FromWrangler,
 	ensureSsrOptimizeDep,
 	ensurePreviewHmr,
 	readFilesFromSandbox,
 	refreshLiveTypes,
 	typeDeclarationsForModel,
+	type DeployResult,
 } from "./tools.js";
 import { buildInterviewPrompt, buildHoldingPrompt, buildBuildPrompt } from "./prompts.js";
 import {
@@ -255,6 +259,8 @@ const PREPARED_TEMPLATES_PATH = "/home/user/.prepared";
 const BUILDER_TEMPLATE_DIR = "builder-cloudflare";
 const SNAPSHOT_PATH = "/tmp/emdash-build-session-snapshot";
 const PUBLISH_PATH = "/tmp/emdash-build-publish";
+const DEPLOY_PATH = "/tmp/emdash-build-deploy";
+const DEPLOY_HOME = "/tmp/emdash-build-deploy-home";
 const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
 const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
@@ -4403,6 +4409,214 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
+	 * Build the site and deploy it to a Cloudflare temporary preview account
+	 * (`wrangler deploy --temporary`), returning a live URL and a claim URL the
+	 * user can open within 60 minutes to take ownership.
+	 *
+	 * Nothing calls this yet; it is kept working so the path can be switched on.
+	 * Like publishing, it saves the site and works on a staged copy of that
+	 * checkpoint, so the preview keeps running and nothing it changes for the
+	 * deploy can reach the site or its snapshot. Chat turns wait while it runs.
+	 *
+	 * The session was already created without the sandbox runner / Worker
+	 * Loader / crons. Temp accounts also can't provision R2, so the copy has
+	 * `storage` stripped from astro.config and `r2_buckets` from wrangler.jsonc
+	 * before the build (so the built worker doesn't reference the absent MEDIA
+	 * binding). The copy's D1 (schema + content) is scrubbed of users, tokens
+	 * and secrets (`scrubStagedContentCommand`), exported, and loaded into the
+	 * temp account's D1 after deploy via `d1 execute --remote --temporary` (D1
+	 * is covered by the temp preview-account token). The deployed copy
+	 * therefore has the content but no media (R2), and the claimant creates
+	 * their own admin through the setup wizard.
+	 *
+	 * Deploy uses the adapter-generated `dist/server/wrangler.json` (correct
+	 * built `main` + `no_bundle: true`) rather than a hand-built config -- the
+	 * latter pointed at the source worker entry and made wrangler re-bundle it,
+	 * failing on Astro/EmDash virtual modules. A current Wrangler is pulled via
+	 * `npx wrangler@latest` (the template pins an older one without `--temporary`),
+	 * and the sandbox is unauthenticated, which `--temporary` requires. Wrangler
+	 * runs with its own home, removed afterwards, so the temporary account's
+	 * cached claim token does not stay where the model's shell can read it.
+	 */
+	private async deploySite(): Promise<DeployResult> {
+		if (
+			this.isDeletionPending() ||
+			!this.state.siteReady ||
+			Boolean(this.state.initialGeneration && this.state.initialGeneration.status !== "ready")
+		) {
+			return { success: false, error: "The site is not ready to deploy yet." };
+		}
+		const busy = {
+			success: false,
+			error: "Wait for the current site activity to finish, then deploy again.",
+		};
+		if (this.hasOwnerActivity()) return busy;
+		return this.withOwnerActivity("deploy", async () => {
+			if (
+				(this.stateWrittenHere && this.hasProgressInState()) ||
+				this.provisionPromise ||
+				this.recoveryPromise ||
+				!(await this.waitUntilStable({ timeout: 1 }))
+			) {
+				return busy;
+			}
+			const sandbox = this.sandboxOps();
+			const astroPath = `${DEPLOY_PATH}/astro.config.mjs`;
+			const wranglerPath = `${DEPLOY_PATH}/wrangler.jsonc`;
+			const contentPath = `${DEPLOY_PATH}.sql`;
+			// Credentials cleared: `--temporary` only works when Wrangler is unauthenticated.
+			const wrangler =
+				"CLOUDFLARE_API_TOKEN= CLOUDFLARE_API_KEY= CLOUDFLARE_EMAIL= CI=1 " +
+				`HOME=${DEPLOY_HOME} npm_config_cache=/home/user/.npm npx -y wrangler@latest`;
+			let buildProcessId: string | undefined;
+			try {
+				const siteProbe = `test -f ${SITE_PATH}/package.json && test -d ${SITE_PATH}/node_modules`;
+				const siteAvailable = await this.execRecoveryCommand(siteProbe, 5000).catch(() => null);
+				if (!siteAvailable?.success) {
+					this.sendStatus("Restoring the site before deploying...");
+					const recovered = await this.recoverSite(this.recoveryHostname()).catch(() => ({
+						ready: false as const,
+						error: undefined,
+					}));
+					const restoredSite = recovered.ready
+						? await this.execRecoveryCommand(siteProbe, 5000).catch(() => null)
+						: null;
+					if (!recovered.ready || !restoredSite?.success) {
+						throw new Error(
+							recovered.error ?? "The saved site could not be restored before deploying.",
+						);
+					}
+				}
+
+				this.sendStatus("Preparing deploy...");
+				const backupError = await this.backupSite();
+				if (backupError) throw new Error("The latest draft could not be saved before deploying.");
+				const staged = await sandbox.exec(
+					`timeout --signal=TERM --kill-after=2s ${PUBLISH_STAGING_TIMEOUT_SECONDS}s ` +
+						`sh -c ${shellQuote(`${publishStagingCommand(SNAPSHOT_PATH, SITE_PATH, DEPLOY_PATH)} && rm -f ${DEPLOY_PATH}/.dev.vars`)}`,
+					{ timeout: 120_000 },
+				);
+				if (!staged.success) {
+					throw new Error(
+						staged.exitCode === 124
+							? "Deploy staging timed out."
+							: staged.stderr || staged.stdout || "deploy staging copy failed",
+					);
+				}
+
+				// The copy runs without the preview's .dev.vars (localhost and preview URLs).
+				// Drop R2 for the build: from astro.config (so the built code doesn't
+				// wire the MEDIA binding) and from wrangler.jsonc (so the generated
+				// deploy config has no MEDIA binding the temp account can't create).
+				const astro = await sandbox.readFile(astroPath, { encoding: "utf-8" });
+				const wranglerConfig = await sandbox.readFile(wranglerPath, { encoding: "utf-8" });
+				await sandbox.writeFile(astroPath, stripStorageFromAstroConfig(astro.content));
+				await sandbox.writeFile(wranglerPath, stripR2FromWrangler(wranglerConfig.content));
+
+				// The copy's D1 carries the dev-bypass admin and the hash of this
+				// session's full-scope PAT; neither may reach a public site. Deploy
+				// without content if they cannot be removed first.
+				this.sendStatus("Exporting content...");
+				this.sendConsole("$ wrangler d1 export DB --local");
+				const scrubbed = await sandbox.exec(scrubStagedContentCommand(DEPLOY_PATH), {
+					cwd: DEPLOY_PATH,
+					timeout: 60_000,
+				});
+				let haveContent = scrubbed.success;
+				if (!haveContent) {
+					this.sendConsole(
+						`Warning: could not remove credentials from the content; deployed site will be empty: ${(scrubbed.stderr || scrubbed.stdout).slice(0, 300)}`,
+					);
+				} else {
+					const dump = await sandbox.exec(
+						`${wrangler} d1 export DB --local --output ${contentPath} -c wrangler.jsonc && ` +
+							// An export of some other, empty local database would deploy nothing.
+							`grep -Eq 'INSERT INTO "?_emdash_migrations"?' ${contentPath}`,
+						{ cwd: DEPLOY_PATH, timeout: 120000 },
+					);
+					haveContent = dump.success;
+					if (!haveContent) {
+						this.sendConsole(
+							`Warning: content export failed; deployed site will be empty: ${(dump.stderr || dump.stdout).slice(0, 300)}`,
+						);
+					}
+				}
+
+				this.sendStatus("Building site for deploy...");
+				this.sendConsole("$ EMDASH_DEPLOY_MODE=temporary pnpm build");
+				const build = `deploy-build-${crypto.randomUUID().slice(0, 8)}`;
+				await sandbox.startProcess(build, "EMDASH_DEPLOY_MODE=temporary pnpm build", {
+					cwd: DEPLOY_PATH,
+				});
+				buildProcessId = build;
+				const buildLogsDone = this.pumpLogs(await sandbox.followProcessLogs(build));
+				const buildResult = await sandbox.waitForProcessExit(build, 300000);
+				buildProcessId = undefined;
+				await buildLogsDone.catch(() => {});
+				if (buildResult.exitCode !== 0) {
+					throw new Error(`Build failed with exit code ${buildResult.exitCode}`);
+				}
+
+				this.sendStatus("Deploying to Cloudflare...");
+				this.sendConsole("$ wrangler deploy --temporary");
+				// Deploy the adapter-generated config (built entry + `no_bundle`).
+				const deploy = await sandbox.exec(
+					`${wrangler} deploy --temporary -c dist/server/wrangler.json`,
+					{ cwd: DEPLOY_PATH, timeout: 180000 },
+				);
+				const output = `${deploy.stdout}\n${deploy.stderr}`;
+				for (const line of output.split("\n")) {
+					if (line.trim()) this.sendConsole(line);
+				}
+				if (!deploy.success) {
+					throw new Error(`Deploy failed: ${(deploy.stderr || deploy.stdout).slice(0, 300)}`);
+				}
+
+				// Load the content into the temp account's freshly-provisioned D1.
+				// D1 commands accept `--temporary` (the temp preview-account token
+				// covers D1), so this reuses the temp account the deploy cached in
+				// Wrangler's home. Non-fatal: a failure leaves the deployed site up
+				// but empty rather than aborting the deploy.
+				if (haveContent) {
+					this.sendStatus("Loading content into the deployed site...");
+					this.sendConsole("$ wrangler d1 execute DB --remote --temporary --file <content>");
+					const load = await sandbox.exec(
+						`${wrangler} d1 execute DB --remote --temporary -y --file ${contentPath} -c dist/server/wrangler.json`,
+						{ cwd: DEPLOY_PATH, timeout: 180000 },
+					);
+					if (load.success) {
+						this.sendConsole("Content loaded into the deployed site.");
+					} else {
+						this.sendConsole(
+							`Warning: content load failed; deployed site may be empty: ${(load.stderr || load.stdout).slice(0, 300)}`,
+						);
+					}
+				}
+
+				const liveUrl = output.match(/https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev[^\s]*/i)?.[0];
+				const claimUrl = output.match(/https:\/\/dash\.cloudflare\.com\/claim[^\s'"]*/i)?.[0];
+				if (!claimUrl) {
+					this.sendConsole("Warning: no claim URL found in the deploy output.");
+				}
+
+				this.setState({ ...this.state, deploy: { liveUrl, claimUrl, at: Date.now() } });
+				this.sendConsole(liveUrl ? `Deployed: ${liveUrl}` : "Deploy completed.");
+				return { success: true, liveUrl, claimUrl };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				this.sendConsole(`ERROR: ${message}`);
+				return { success: false, error: message };
+			} finally {
+				if (buildProcessId) await sandbox.stopProcess(buildProcessId).catch(() => {});
+				await sandbox
+					.exec(`rm -rf ${DEPLOY_PATH} ${contentPath} ${DEPLOY_HOME}`, { timeout: 60_000 })
+					.catch(() => undefined);
+				this.sendStatus("");
+			}
+		});
+	}
+
+	/**
 	 * Scaffold the chosen template, install deps, start the dev server,
 	 * run dev-bypass, expose the port, and connect to the MCP server.
 	 * Idempotent — recovers an established session or provisions a new one.
@@ -6625,11 +6839,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const resuming = options?.continuation === true || this.restartingInterruptedTurn;
 		const turnUserMessageId = this.latestUserMessageId();
 		this.restartingInterruptedTurn = false;
-		if (this.hasOwnerActivityKind("publish")) {
+		const exclusive = this.hasOwnerActivityKind("publish")
+			? "Publishing is in progress."
+			: this.hasOwnerActivityKind("deploy")
+				? "A deploy is in progress."
+				: undefined;
+		if (exclusive) {
 			try {
 				await this.registerProjectForCurrentOwner();
 			} catch {}
-			return this.errorTurn("Publishing is in progress. Wait for it to finish, then try again.");
+			return this.errorTurn(`${exclusive} Wait for it to finish, then try again.`);
 		}
 		// A resumed turn already passed the gate; keep that if it is evicted again.
 		if (resuming) markChatTurnStarted(this);

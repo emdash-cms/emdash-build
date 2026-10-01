@@ -390,6 +390,24 @@ export async function mapLimit<T, R>(
 	return results;
 }
 
+/** Result of a temporary-account deploy. */
+export interface DeployResult {
+	success: boolean;
+	liveUrl?: string;
+	claimUrl?: string;
+	error?: string;
+}
+
+/**
+ * Cloudflare temporary preview accounts (`wrangler deploy --temporary`)
+ * support only a limited set of products. EmDash's Cloudflare template binds
+ * R2 (`MEDIA`) and a Worker Loader (`LOADER`) and registers a cron trigger,
+ * none of which a temporary account can provision. These helpers produce a
+ * stripped, temp-account-safe build so the agent can deploy a working live
+ * preview (pages + D1 content) without media uploads, sandboxed plugins, or
+ * scheduled publishing. They are pure so they can be unit-tested.
+ */
+
 /**
  * Builder-owned Worker entry for every managed site. Development setup/reset
  * stays reachable from the container loopback for provisioning, but the public
@@ -480,6 +498,92 @@ export function stripSandboxFromAstroConfig(src: string): string {
 		.replace(/^[ \t]*sandboxRunner:\s*sandbox\(\),?\s*$\n?/m, "")
 		.replace(/^[ \t]*sandboxed:\s*\[[^\]]*\],?\s*$\n?/m, "")
 		.replace(/^[ \t]*marketplace:\s*["'][^"']*["'],?\s*$\n?/m, "");
+}
+
+/**
+ * Remove `storage: r2(...)` from an astro.config. Applied to the deploy build
+ * only (R2 isn't on temporary accounts) so the built worker doesn't reference
+ * the absent MEDIA binding. The in-builder preview keeps storage.
+ */
+export function stripStorageFromAstroConfig(src: string): string {
+	return src.replace(/^[ \t]*storage:\s*r2\([^)]*\),?\s*$\n?/m, "");
+}
+
+/**
+ * Drop `r2_buckets` from the (canonical, JSON) wrangler config for the deploy
+ * build, so the adapter-generated deploy config has no MEDIA binding the temp
+ * account can't provision. Restored after deploy.
+ */
+export function stripR2FromWrangler(jsonText: string): string {
+	const cfg = JSON.parse(jsonText) as Record<string, unknown>;
+	delete cfg.r2_buckets;
+	return JSON.stringify(cfg, null, 2);
+}
+
+/**
+ * Tables a deployed copy must not carry, matched by prefix as EmDash's own
+ * snapshot export matches them: the dev-bypass admin and its sessions, the
+ * session's full-scope PAT, OAuth/device/passkey state, transfer leases and
+ * plugin storage, plus the auth tables of older EmDash versions.
+ */
+const UNDEPLOYED_TABLE_PREFIXES = [
+	"_emdash_api_tokens",
+	"_emdash_oauth_tokens",
+	"_emdash_oauth_clients",
+	"_emdash_authorization_codes",
+	"_emdash_device_codes",
+	"_emdash_rate_limits",
+	"_emdash_migrations_lock",
+	"_emdash_transfer_",
+	"_plugin_",
+	"users",
+	"sessions",
+	"credentials",
+	"challenges",
+	"auth_challenges",
+	"auth_tokens",
+	"oauth_accounts",
+	"audit_logs",
+];
+
+/**
+ * Delete everything auth-related from a staged copy's local D1 before its
+ * content is exported for a deploy, so none of it reaches the deployed
+ * database, not even its history. Options other than `site:` settings go too,
+ * as in EmDash's own export: they hold plugin secrets, passkey challenges and
+ * setup state. Clearing setup with the users sends whoever claims the deploy
+ * through the setup wizard to create their own admin; public pages are not
+ * gated on setup, so the site still serves.
+ *
+ * The deletes run with foreign keys on (sqlite3 leaves them off), so EmDash's
+ * cascades and SET NULLs apply, and they fail together if content would still
+ * refer to a deleted row: D1 enforces foreign keys and would refuse to load
+ * it. It also fails if there is no database.
+ */
+const SCRUB_EACH_DATABASE = [
+	"for db do",
+	'deletes=$(sqlite3 -bail "$db" "$0") || exit 1',
+	"{ printf '%s\\n' 'PRAGMA foreign_keys=ON;' 'BEGIN;' 'PRAGMA defer_foreign_keys=ON;' \"$deletes\" 'COMMIT;'; } | " +
+		'sqlite3 -bail "$db" || exit 1',
+	"done",
+].join("\n");
+
+export function scrubStagedContentCommand(stagedPath: string): string {
+	const tables = UNDEPLOYED_TABLE_PREFIXES.map(
+		(prefix) => `substr(name, 1, ${prefix.length}) = '${prefix}'`,
+	).join(" OR ");
+	const deletes =
+		`SELECT 'DELETE FROM "' || replace(name, '"', '""') || '";' FROM sqlite_master ` +
+		`WHERE type = 'table' AND (${tables}); ` +
+		`SELECT 'DELETE FROM options WHERE substr(name, 1, 5) <> ''site:'';' FROM sqlite_master ` +
+		`WHERE type = 'table' AND name = 'options';`;
+	const databases = shellQuote(`${stagedPath}/.wrangler/state/v3/d1`);
+	return (
+		`test -n "$(find ${databases} -type f -name '*.sqlite' -print -quit)" && ` +
+		`find ${databases} -type f -name '*.sqlite' -exec sh -c ` +
+		`${shellQuote(SCRUB_EACH_DATABASE)} ` +
+		`${shellQuote(deletes)} {} +`
+	);
 }
 
 /**
