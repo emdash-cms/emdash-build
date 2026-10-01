@@ -450,10 +450,29 @@ function shellQuote(s: string): string {
 	return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function decodeBase64(value: string): Uint8Array {
-	const decoded = atob(value);
-	const bytes = new Uint8Array(decoded.length);
-	for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+/** The stream's first `limit` bytes, or all of it if shorter; the rest is not read. */
+async function readAtMost(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	try {
+		while (length < limit) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+			length += value.byteLength;
+		}
+	} finally {
+		await reader.cancel().catch(() => undefined);
+	}
+	const bytes = new Uint8Array(Math.min(length, limit));
+	let offset = 0;
+	for (const chunk of chunks) {
+		const part = chunk.subarray(0, bytes.length - offset);
+		bytes.set(part, offset);
+		offset += part.byteLength;
+		if (offset === bytes.length) break;
+	}
 	return bytes;
 }
 
@@ -3935,13 +3954,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			): Promise<BuiltSnapshotAsset | undefined> => {
 				const target = builtAssetTarget(path);
 				if (!target) return;
-				const command = `test -f ${shellQuote(target.filePath)} && head -c ${maximumBytes + 1} -- ${shellQuote(target.filePath)} | base64`;
-				const file = await sandbox.exec(`bash -o pipefail -c ${shellQuote(command)}`, {
-					cwd: PUBLISH_PATH,
-					timeout: 15_000,
-				});
-				if (!file.success) return;
-				const bytes = decodeBase64((file.stdout ?? "").replace(/\s+/g, ""));
+				// As a file, not command output, which is cut at 1 MiB.
+				const stream = await sandbox.readFileStream(target.filePath).catch(() => undefined);
+				if (!stream) return;
+				const bytes = await readAtMost(stream, maximumBytes + 1);
 				if (bytes.byteLength > maximumBytes) {
 					throw new StaticSiteSnapshotError(
 						"SNAPSHOT_TOO_LARGE",
