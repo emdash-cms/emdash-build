@@ -54,11 +54,21 @@ type RenderResult = Omit<PreviewRefreshResult, "path">;
 
 export type PreviewSnapshotState = "current" | "stale" | "missing";
 
-async function readBodyUpTo(response: Response, maximumBytes: number): Promise<ArrayBuffer | null> {
+/** Whether HTML is (the start of) a whole page rather than a fragment. */
+function isPageMarkup(html: string): boolean {
+	return /<html[\s>]/i.test(html);
+}
+
+async function readBodyUpTo(
+	response: Response,
+	maximumBytes: number,
+): Promise<ArrayBuffer | "too-large" | null> {
+	// Not awaited: this is often one branch of a clone, whose cancel waits for the other.
+	const drop = (cancel: () => Promise<void>) => void cancel().catch(() => undefined);
 	const declaredLength = Number(response.headers.get("Content-Length"));
 	if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
-		await response.body?.cancel().catch(() => undefined);
-		return null;
+		if (response.body) drop(() => response.body!.cancel());
+		return "too-large";
 	}
 	if (!response.body) return null;
 	const reader = response.body.getReader();
@@ -70,8 +80,8 @@ async function readBodyUpTo(response: Response, maximumBytes: number): Promise<A
 			if (done) break;
 			total += value.byteLength;
 			if (total > maximumBytes) {
-				await reader.cancel();
-				return null;
+				drop(() => reader.cancel());
+				return "too-large";
 			}
 			chunks.push(value);
 		}
@@ -208,13 +218,16 @@ export class PreviewSnapshots {
 		path: string,
 		response: Response,
 		generation: number,
-	): Promise<"stored" | "invalid" | "uncacheable"> {
+	): Promise<"stored" | "invalid" | "fragment" | "uncacheable"> {
 		if (!response.ok || !response.headers.get("Content-Type")?.includes("text/html")) {
 			await response.body?.cancel().catch(() => undefined);
 			return "uncacheable";
 		}
 		const body = await readBodyUpTo(response, MAX_CACHED_HTML_BYTES);
-		if (!body || !isCompletePublicHtml(new TextDecoder().decode(body))) return "invalid";
+		if (body === "too-large") return "uncacheable";
+		if (!body) return "invalid";
+		const text = new TextDecoder().decode(body);
+		if (!isCompletePublicHtml(text)) return isPageMarkup(text) ? "invalid" : "fragment";
 		if (response.headers.has("Set-Cookie") || hasNegotiatedVary(response)) return "uncacheable";
 		const headers = [...response.headers.entries()].filter(
 			([name]) => !UNSAFE_CACHED_HEADERS.has(name.toLowerCase()),
@@ -324,7 +337,7 @@ export class PreviewSnapshots {
 			success,
 			rendered,
 			status: response.status,
-			...(outcome === "invalid"
+			...(outcome === "invalid" || outcome === "fragment"
 				? { invalidHtml: true, error: "The public page returned empty or incomplete HTML." }
 				: {}),
 		};
@@ -439,8 +452,9 @@ export class PreviewSnapshots {
 		) {
 			if (isShareablePreviewResponse(request, response)) {
 				try {
-					if ((await this.storePreview(cachePath, response.clone(), generation)) === "invalid") {
-						if (!isPageNavigation(request)) return response;
+					const stored = await this.storePreview(cachePath, response.clone(), generation);
+					// A fragment a page fetches is fine; a cut-off page is not, however it is loaded.
+					if (stored === "invalid" || (stored === "fragment" && isPageNavigation(request))) {
 						await response.body?.cancel().catch(() => undefined);
 						return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 							status: 503,
@@ -452,8 +466,12 @@ export class PreviewSnapshots {
 				}
 			} else if (!isCredentialedPreviewRequest(request)) {
 				const body = await readBodyUpTo(response.clone(), MAX_CACHED_HTML_BYTES);
-				if (!body || !isCompletePublicHtml(new TextDecoder().decode(body))) {
-					if (!isPageNavigation(request)) return response;
+				const text = body && body !== "too-large" ? new TextDecoder().decode(body) : "";
+				if (
+					body !== "too-large" &&
+					!isCompletePublicHtml(text) &&
+					(isPageMarkup(text) || isPageNavigation(request))
+				) {
 					await response.body?.cancel().catch(() => undefined);
 					return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 						status: 503,

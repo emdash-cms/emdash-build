@@ -67,6 +67,25 @@ describe("preview snapshots of partial HTML", () => {
 		expect(previews.hasCachedPreview("/_server-islands/Cart?e=default&p=&s=")).toBe(false);
 	});
 
+	it("still refuses a cut-off page a script fetches, as a client router does", async () => {
+		const { get } = snapshots(() => html("<!doctype html><html><body><h1>Half"));
+
+		const response = await get("/about", { Accept: "text/html", "Sec-Fetch-Dest": "empty" });
+
+		expect(response.status).toBe(503);
+	});
+
+	it("serves a page larger than a snapshot can hold, live", async () => {
+		const page = `<!doctype html><html><body><p>${"x".repeat(1_200_000)}</p></body></html>`;
+		const { previews, get } = snapshots(() => html(page));
+
+		const response = await get("/long", { Accept: "text/html", "Sec-Fetch-Dest": "document" });
+
+		expect(response.status).toBe(200);
+		expect((await response.text()).length).toBe(page.length);
+		expect(previews.hasCachedPreview("/long")).toBe(false);
+	});
+
 	it("still refuses an incomplete page someone navigates to", async () => {
 		const { get } = snapshots(() => html("<!doctype html><html><body><h1>Half"));
 
