@@ -166,10 +166,24 @@ describe("sandbox capacity", () => {
 		});
 	});
 
-	it("reads the cap from SANDBOX_MAX_CONCURRENT", () => {
+	it("reads the cap from SANDBOX_MAX_CONCURRENT, decimal digits only", () => {
 		expect(capacityLimit("25")).toBe(25);
 		expect(capacityLimit(undefined)).toBe(100);
-		expect(capacityLimit("0")).toBe(100);
 		expect(capacityLimit("ten")).toBe(100);
+		expect(capacityLimit("1e1")).toBe(100);
+		expect(capacityLimit("0x0A")).toBe(100);
+		expect(capacityLimit(" 10")).toBe(100);
+		// 0 stops new starts, for draining before maintenance.
+		expect(capacityLimit("0")).toBe(0);
+	});
+
+	it("starts nothing new at a cap of 0 while running containers keep their slots", async () => {
+		await withCapacity(1, (capacity) => {
+			capacity.acquire("running");
+			(Reflect.get(capacity, "env") as Record<string, unknown>).SANDBOX_MAX_CONCURRENT = "0";
+
+			expect(capacity.acquire("new")).toMatchObject({ granted: false, position: 1 });
+			expect(capacity.renew("running")).toBe(true);
+		});
 	});
 });

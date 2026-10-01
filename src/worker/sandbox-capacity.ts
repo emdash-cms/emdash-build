@@ -12,10 +12,15 @@ export type CapacityGrant =
 	| { granted: true; expiresAt: number }
 	| { granted: false; position: number; retryAfterMs: number };
 
-/** `SANDBOX_MAX_CONCURRENT`, or 100 when it is unset or invalid. */
+/**
+ * `SANDBOX_MAX_CONCURRENT` in decimal digits, or 100 when it is unset or
+ * invalid. 0 starts nothing new, for draining before maintenance; running
+ * containers keep their slots.
+ */
 export function capacityLimit(value: string | undefined): number {
+	if (!value || !/^\d+$/.test(value)) return DEFAULT_LIMIT;
 	const limit = Number(value);
-	return Number.isSafeInteger(limit) && limit > 0 ? limit : DEFAULT_LIMIT;
+	return Number.isSafeInteger(limit) ? limit : DEFAULT_LIMIT;
 }
 
 /**
