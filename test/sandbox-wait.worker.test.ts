@@ -165,6 +165,48 @@ describe("stopping an idle container", () => {
 		});
 	});
 
+	it("keeps it when work starts during the save", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000010");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			harness.backupSite = async () => {
+				// The owner sends a message while the checkpoint uploads.
+				harness.beginOwnerActivity("chat:2", "chat");
+				return undefined;
+			};
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			harness.finishOwnerActivity("chat:2");
+		});
+	});
+
+	it("runs one stop check at a time, so slow saves do not pile up", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000011");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			let finish!: () => void;
+			const saved = new Promise<undefined>((resolve) => (finish = () => resolve(undefined)));
+			const backupSite = vi.fn(async () => saved);
+			harness.backupSite = backupSite;
+
+			// An alarm gave up waiting and asks again while the first save still runs.
+			const first = harness.prepareSandboxStop(20 * 60_000);
+			const second = harness.prepareSandboxStop(21 * 60_000);
+			finish();
+
+			await expect(Promise.all([first, second])).resolves.toEqual([
+				{ busy: false },
+				{ busy: false },
+			]);
+			expect(backupSite).toHaveBeenCalledOnce();
+			// Once it settles, the next check runs afresh.
+			await harness.prepareSandboxStop(22 * 60_000);
+			expect(backupSite).toHaveBeenCalledTimes(2);
+		});
+	});
+
 	it("holds it while the save fails, for at most an hour", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000005");
 		await runInDurableObject(agent, async (instance) => {

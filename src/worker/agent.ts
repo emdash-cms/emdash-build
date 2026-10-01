@@ -1544,6 +1544,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
+	/** An idle-stop check under way, which later asks share. */
+	private stopCheck?: Promise<{ busy: boolean }>;
 	private recoveryReconnectMcp = false;
 
 	/** Astro's Cloudflare dev runner becomes unresponsive under parallel MCP requests. */
@@ -3504,12 +3506,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * container after an hour: an idle container must not run forever.
 	 */
 	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
+		// One check at a time: an alarm that stopped waiting asks again while the save runs.
+		this.stopCheck ??= this.checkSandboxStop(idleForMs).finally(() => {
+			this.stopCheck = undefined;
+		});
+		return this.stopCheck;
+	}
+
+	private async checkSandboxStop(idleForMs: number): Promise<{ busy: boolean }> {
 		// Work this instance runs counts however long it takes (the Sandbox stops a
 		// container idle for two hours regardless); rows left by an earlier instance
 		// count while young enough to be a turn that chat recovery resumes.
-		if (this.liveOwnerWork.size > 0 || this.hasRecentOwnerActivity() || this.recoveryPromise) {
-			return { busy: true };
-		}
+		const busy = () =>
+			this.liveOwnerWork.size > 0 || this.hasRecentOwnerActivity() || Boolean(this.recoveryPromise);
+		if (busy()) return { busy: true };
 		if (this.state.siteReady && !this.isDeletionPending()) {
 			// A save skipped during the failure cooldown is no save.
 			const failed =
@@ -3517,7 +3527,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				this.state.persistenceError;
 			if (failed && idleForMs < 60 * 60_000) return { busy: true };
 		}
-		return { busy: false };
+		// The owner may have come back during the save.
+		return { busy: busy() };
 	}
 
 	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
