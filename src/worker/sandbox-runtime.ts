@@ -47,6 +47,25 @@ const READY_TIMEOUT_MS = 30_000;
 const UNTIMED_COMMAND_SECONDS = 24 * 60 * 60;
 /** Command output crosses Workers RPC, whose messages are capped. */
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
+/**
+ * Runs the command, then prints the end mark on both streams: the reader
+ * stops there, so output that trails the exit is not lost and a process the
+ * command left running cannot hold the call. A TERM waits for the command,
+ * so what it printed is still marked.
+ */
+const EXIT_MARK_WRAPPER = [
+	"mark=$1; shift",
+	"trap true TERM",
+	// In the background, which bash does not report as "Terminated" when a TERM kills it.
+	'"$@" & child=$!',
+	'wait "$child"; rc=$?',
+	// A TERM interrupts the wait; wait again for the command to exit.
+	'while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done',
+	'printf %s "$mark"; printf %s "$mark" >&2',
+	'exit "$rc"',
+].join("\n");
+/** How long after the exit the marks may take, or the streams to end without them. */
+const OUTPUT_DRAIN_MAX_MS = 5_000;
 const PLATFORM_RETRY_MS = 15_000;
 const TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 
@@ -85,9 +104,93 @@ export interface SandboxRuntimeDeps {
 
 export type ContainerOps = Omit<SandboxOps, "exposePort" | "unexposePort">;
 
-function decodeLimited(bytes: ArrayBuffer): string {
-	const view = new Uint8Array(bytes, 0, Math.min(bytes.byteLength, OUTPUT_LIMIT_BYTES));
-	return new TextDecoder().decode(view);
+/**
+ * Reads one of a command's output streams up to the end mark the exec wrapper
+ * prints once the command exits, keeping the first `OUTPUT_LIMIT_BYTES`.
+ * Whatever a process the command left running prints afterwards is drained
+ * and dropped, so it neither blocks on a full pipe nor dies of a closed one.
+ */
+class OutputReader {
+	private readonly chunks: Uint8Array[] = [];
+	private kept = 0;
+	/** Bytes that might begin the mark, held until the next chunk decides. */
+	private pending = new Uint8Array(0);
+	private resolveEnded!: () => void;
+	/** Resolves at the mark, or when the stream ends without one. */
+	readonly ended = new Promise<void>((resolve) => (this.resolveEnded = resolve));
+	private marked = false;
+
+	constructor(
+		stream: ReadableStream<Uint8Array> | null,
+		private readonly mark: Uint8Array,
+	) {
+		if (stream) void this.read(stream.getReader());
+		else this.resolveEnded();
+	}
+
+	private async read(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (this.marked) continue;
+				const bytes = concat(this.pending, value);
+				const at = indexOf(bytes, this.mark);
+				if (at >= 0) {
+					this.keep(bytes.subarray(0, at));
+					this.pending = new Uint8Array(0);
+					this.marked = true;
+					this.resolveEnded();
+					continue;
+				}
+				const safe = Math.max(0, bytes.length - (this.mark.length - 1));
+				this.keep(bytes.subarray(0, safe));
+				this.pending = bytes.slice(safe);
+			}
+		} catch {
+			// The container went away.
+		}
+		if (!this.marked) this.keep(this.pending);
+		this.pending = new Uint8Array(0);
+		this.resolveEnded();
+	}
+
+	private keep(bytes: Uint8Array): void {
+		const room = OUTPUT_LIMIT_BYTES - this.kept;
+		if (room <= 0 || bytes.length === 0) return;
+		const kept = bytes.length > room ? bytes.slice(0, room) : bytes.slice();
+		this.chunks.push(kept);
+		this.kept += kept.length;
+	}
+
+	text(): string {
+		// Without the mark, bytes held back for it are output too: the wait may have given up.
+		const tail = this.marked
+			? new Uint8Array(0)
+			: this.pending.subarray(0, Math.max(0, OUTPUT_LIMIT_BYTES - this.kept));
+		return new TextDecoder().decode(concat(...this.chunks, tail));
+	}
+}
+
+function concat(...parts: Uint8Array[]): Uint8Array {
+	const total = parts.reduce((sum, part) => sum + part.length, 0);
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const part of parts) {
+		bytes.set(part, offset);
+		offset += part.length;
+	}
+	return bytes;
+}
+
+function indexOf(haystack: Uint8Array, needle: Uint8Array): number {
+	outer: for (let start = 0; start + needle.length <= haystack.length; start++) {
+		for (let index = 0; index < needle.length; index++) {
+			if (haystack[start + index] !== needle[index]) continue outer;
+		}
+		return start;
+	}
+	return -1;
 }
 
 function shellQuote(value: string): string {
@@ -237,12 +340,18 @@ export class SandboxRuntime implements ContainerOps {
 		signal?.throwIfAborted();
 		const seconds =
 			options.timeout !== undefined ? Math.max(1, Math.ceil(options.timeout / 1000)) : undefined;
+		const mark = `__emdash_exit_${crypto.randomUUID()}__`;
 		// GNU timeout stops the command and its children, and exits 124.
 		const argv = [
 			"timeout",
 			"--signal=TERM",
 			"--kill-after=2s",
 			`${seconds ?? UNTIMED_COMMAND_SECONDS}s`,
+			"bash",
+			"-c",
+			EXIT_MARK_WRAPPER,
+			"exec",
+			mark,
 			...command,
 		];
 		const process = await container.exec(argv, {
@@ -257,14 +366,20 @@ export class SandboxRuntime implements ContainerOps {
 		if (signal?.aborted) onAbort();
 		const backstop =
 			seconds !== undefined ? setTimeout(() => kill(9), (seconds + 5) * 1000) : undefined;
+		const markBytes = new TextEncoder().encode(mark);
+		const stdout = new OutputReader(process.stdout, markBytes);
+		const stderr = new OutputReader(process.stderr, markBytes);
 		try {
-			const output = await process.output();
+			const exitCode = await process.exitCode;
+			// A command killed before its marks ends its streams instead, unless
+			// something it left running holds them.
+			await settleWithin(Promise.all([stdout.ended, stderr.ended]), OUTPUT_DRAIN_MAX_MS);
 			signal?.throwIfAborted();
 			return {
-				success: output.exitCode === 0,
-				exitCode: output.exitCode,
-				stdout: decodeLimited(output.stdout),
-				stderr: decodeLimited(output.stderr),
+				success: exitCode === 0,
+				exitCode,
+				stdout: stdout.text(),
+				stderr: stderr.text(),
 			};
 		} finally {
 			signal?.removeEventListener("abort", onAbort);

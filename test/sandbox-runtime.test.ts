@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,19 +28,28 @@ beforeAll(() => {
 		"setsid",
 		'#!/bin/sh\n[ "$1" = "-w" ] && shift\nexec perl -e \'use POSIX qw(setsid); setsid() or die; exec @ARGV or die\' "$@"\n',
 	);
-	// GNU timeout: TERM after the duration, exit 124.
+	// GNU timeout: it puts itself in a new process group, runs the command in it,
+	// and passes TERM (its own, or at the deadline) to the command and the whole
+	// group, then KILL after --kill-after. It exits 124 at the deadline.
 	tool(
 		"timeout",
 		[
 			"#!/usr/bin/perl",
-			"my @args = @ARGV; shift @args while @args && $args[0] =~ /^--/;",
+			"use POSIX ();",
+			"my @args = @ARGV; my $kill_after = 0;",
+			"while (@args && $args[0] =~ /^--/) { my $a = shift @args; $kill_after = $1 if $a =~ /^--kill-after=(\\d+)s?$/; }",
 			"my $duration = shift @args; $duration =~ s/s$//;",
-			// Like GNU timeout, run the command in its own group and pass TERM on to all of it.
-			"my $pid = fork(); if (!$pid) { setpgrp(0, 0); exec @args or exit 127; }",
-			"local $SIG{TERM} = sub { kill 'TERM', -$pid };",
-			"local $SIG{ALRM} = sub { kill 'TERM', -$pid; waitpid($pid, 0); exit 124 };",
-			"alarm $duration; while (waitpid($pid, 0) == -1 && $!{EINTR}) {}",
-			"exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);",
+			"setpgrp(0, 0);",
+			"my $pid = fork(); if (!$pid) { exec @args or POSIX::_exit(127); }",
+			"my $timed_out = 0;",
+			"sub cleanup { my $sig = shift; if ($sig eq 'ALRM') { $timed_out = 1; $sig = 'TERM'; }",
+			"  if ($kill_after) { $SIG{ALRM} = sub { kill 'KILL', $pid; kill 'KILL', 0; }; alarm $kill_after; $kill_after = 0; }",
+			"  local $SIG{TERM} = 'IGNORE'; kill $sig, $pid; kill $sig, 0; }",
+			"$SIG{TERM} = sub { cleanup('TERM') }; $SIG{ALRM} = sub { cleanup('ALRM') };",
+			"alarm $duration;",
+			"while (waitpid($pid, 0) == -1) { last unless $!{EINTR}; }",
+			"my $st = $?; exit 124 if $timed_out;",
+			"exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);",
 			"",
 		].join("\n"),
 	);
@@ -238,6 +247,11 @@ describe("commands", { timeout: 30_000 }, () => {
 			"2s",
 			"bash",
 			"-c",
+			expect.stringContaining('"$@" & child=$!'),
+			"exec",
+			expect.stringMatching(/^__emdash_exit_[0-9a-f-]{36}__$/),
+			"bash",
+			"-c",
 			"sleep 60",
 		]);
 	});
@@ -263,6 +277,133 @@ describe("commands", { timeout: 30_000 }, () => {
 
 		await expect(pending).rejects.toThrow();
 		expect(Date.now() - started).toBeLessThan(6_000);
+	});
+
+	it("returns when the command does, even if it leaves a process running", async () => {
+		const { runtime } = await running();
+		const started = Date.now();
+
+		const result = await runtime.exec("sleep 21.5 & echo started", { timeout: 10_000 });
+
+		expect(result).toMatchObject({ success: true, exitCode: 0, stdout: "started\n" });
+		expect(Date.now() - started).toBeLessThan(5_000);
+		await runtime.exec("pkill -f 'sleep 21.5' || true");
+	});
+
+	it("stops on abort even if the command left a process running", async () => {
+		const { runtime } = await running();
+		const controller = new AbortController();
+		const started = Date.now();
+		const pending = runtime.exec("sleep 21.6 & sleep 30", { signal: controller.signal });
+		setTimeout(() => controller.abort(), 300);
+
+		await expect(pending).rejects.toThrow();
+		expect(Date.now() - started).toBeLessThan(6_000);
+		await runtime.exec("pkill -f 'sleep 21.6' || true");
+	});
+
+	it("keeps what a command printed before its timeout", async () => {
+		const { runtime } = await running();
+
+		const result = await runtime.exec("echo before; echo warn >&2; sleep 30", { timeout: 1000 });
+
+		expect(result).toEqual({ success: false, exitCode: 124, stdout: "before\n", stderr: "warn\n" });
+	});
+
+	it("keeps the first 1 MiB of each stream, and all of a smaller one", async () => {
+		const { runtime } = await running();
+
+		const large = await runtime.exec("head -c 1500000 /dev/zero | tr '\\0' a; echo e >&2");
+		const small = await runtime.exec("head -c 200000 /dev/zero | tr '\\0' b");
+
+		expect(large.stdout).toHaveLength(1024 * 1024);
+		expect(large.stderr).toBe("e\n");
+		expect(small.stdout).toBe("b".repeat(200000));
+	});
+
+	it("reads output that arrives after the command's exit", async () => {
+		const { container, runtime } = await running();
+		const exec = container.exec.bind(container);
+		// Output crosses the network separately from the exit status, and can trail it.
+		container.exec = async (argv, options) => {
+			const process = await exec(argv, options);
+			const delayed = process.stdout!.pipeThrough(
+				new TransformStream({
+					async transform(chunk, controller) {
+						await new Promise((resolve) => setTimeout(resolve, 300));
+						controller.enqueue(chunk);
+					},
+				}),
+			);
+			return Object.assign(process, { stdout: delayed });
+		};
+
+		const result = await runtime.exec("echo first; echo second");
+
+		expect(result.stdout).toBe("first\nsecond\n");
+	});
+
+	it("returns at its deadline even when a process in another group holds the output", async () => {
+		const { runtime } = await running();
+		const started = Date.now();
+
+		const result = await runtime.exec("setsid sleep 6 & echo before; sleep 30", { timeout: 1000 });
+
+		expect(result).toMatchObject({ exitCode: 124, stdout: "before\n" });
+		expect(Date.now() - started).toBeLessThan(3_000);
+	});
+
+	it("keeps the end of the output when its mark never comes", async () => {
+		const { runtime } = await running();
+
+		// The command outlives TERM, so KILL ends the wrapper before its mark, while
+		// a process in another group holds the pipes open.
+		const result = await runtime.exec("trap '' TERM; printf tail; setsid sleep 20 & sleep 20", {
+			timeout: 1000,
+		});
+
+		expect(result.stdout).toBe("tail");
+		expect(result.exitCode).toBeGreaterThanOrEqual(124);
+	});
+
+	it("finds the end mark when the stream splits it", async () => {
+		const { container, runtime } = await running();
+		const exec = container.exec.bind(container);
+		container.exec = async (argv, options) => {
+			const process = await exec(argv, options);
+			const split = (stream: ReadableStream<Uint8Array> | null) =>
+				stream?.pipeThrough(
+					new TransformStream<Uint8Array, Uint8Array>({
+						transform(chunk, controller) {
+							for (let at = 0; at < chunk.length; at += 7)
+								controller.enqueue(chunk.slice(at, at + 7));
+						},
+					}),
+				) ?? null;
+			return Object.assign(process, {
+				stdout: split(process.stdout),
+				stderr: split(process.stderr),
+			});
+		};
+
+		const result = await runtime.exec("printf 'no newline'; echo err >&2");
+
+		expect(result).toMatchObject({ stdout: "no newline", stderr: "err\n" });
+	});
+
+	it("returns while a process the command left running keeps printing, and leaves it running", async () => {
+		const { runtime } = await running();
+		const marker = join(mkdtempSync(join(root, "left-")), "done");
+		const started = Date.now();
+
+		const result = await runtime.exec(
+			`(sleep 0.3; for i in 1 2 3 4 5 6 7 8; do echo tick; sleep 0.1; done; touch ${marker}) & echo started`,
+		);
+
+		expect(result).toMatchObject({ exitCode: 0, stdout: "started\n" });
+		expect(Date.now() - started).toBeLessThan(2_000);
+		await new Promise((resolve) => setTimeout(resolve, 2_000));
+		expect(existsSync(marker)).toBe(true);
 	});
 
 	it("stops a command on abort and rejects", async () => {
