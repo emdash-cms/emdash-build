@@ -78,6 +78,7 @@ function preview(path = "/", headers: Record<string, string> = {}) {
 }
 
 const stub = (name = ID) => testEnv.Sandbox.getByName(name);
+const capacityStub = () => testEnv.SandboxCapacity.getByName("global");
 
 describe("Sandbox preview routing", () => {
 	beforeEach(async () => {
@@ -401,6 +402,148 @@ describe("Sandbox lifetime", () => {
 			expect(container.state.running).toBe(false);
 			expect(prepareSandboxStop).toHaveBeenCalledOnce();
 			expect(markSandboxStopped).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("keeps its slot while BuilderAgent's save before a stop is slow, then stays up", async () => {
+		await runInDurableObject(capacityStub(), (capacity) => {
+			(Reflect.get(capacity, "env") as Record<string, unknown>).SANDBOX_MAX_CONCURRENT = "1";
+		});
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			Reflect.set(instance, "prepareStopTimeoutMs", 50);
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", {
+				getByName: () => ({
+					// The save never finishes, as with an Artifacts outage.
+					prepareSandboxStop: () => new Promise(() => {}),
+					markSandboxStopped: async () => {},
+				}),
+			});
+			// The lease would have lapsed by now without the alarm's renewal.
+			vi.setSystemTime(base + 2.5 * 60_000);
+			await instance.alarm();
+			vi.setSystemTime(base + 12 * 60_000);
+			const asked = Date.now();
+
+			await instance.alarm();
+
+			expect(container.state.running).toBe(true);
+			const lease = await runInDurableObject(capacityStub(), (capacity) => {
+				const sql = Reflect.get(capacity, "sql") as SqlStorage;
+				return sql.exec<{ holder: string; expires_at: number }>("SELECT * FROM leases").toArray();
+			});
+			expect(lease).toEqual([expect.objectContaining({ holder: ID })]);
+			expect(lease[0]!.expires_at).toBeGreaterThanOrEqual(asked + 2 * 60_000);
+		});
+	});
+
+	it("takes its slot back when the lease lapsed while it ran", async () => {
+		await runInDurableObject(capacityStub(), (capacity) => {
+			(Reflect.get(capacity, "env") as Record<string, unknown>).SANDBOX_MAX_CONCURRENT = "1";
+		});
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			install(instance, fakeContainer());
+			await instance.ensureRunning();
+			Reflect.set(
+				Reflect.get(instance, "env") as object,
+				"BuilderAgent",
+				builderAgent({ busy: true }).binding,
+			);
+			// No alarm ran for four minutes, and another site took the slot.
+			vi.setSystemTime(base + 4 * 60_000);
+			await expect(capacityStub().acquire("other-site")).resolves.toMatchObject({ granted: true });
+
+			await instance.alarm();
+		});
+		const stats = await runInDurableObject(capacityStub(), (capacity) => capacity.stats());
+		expect(stats).toMatchObject({ active: 2, waiting: 0 });
+	});
+
+	it("does not keep a slot for a site deleted while the alarm renewed it", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			install(instance, fakeContainer());
+			await instance.ensureRunning();
+			const instanceEnv = Reflect.get(instance, "env") as Record<string, unknown>;
+			const real = instanceEnv.SandboxCapacity as typeof testEnv.SandboxCapacity;
+			let renewing!: () => void;
+			let entered!: () => void;
+			const renewed = new Promise<void>((resolve) => (renewing = resolve));
+			const inRenewal = new Promise<void>((resolve) => (entered = resolve));
+			instanceEnv.SandboxCapacity = {
+				getByName: () => ({
+					renew: async () => {
+						entered();
+						await renewed;
+						return false;
+					},
+					reclaim: (holder: string) => real.getByName("global").reclaim(holder),
+					release: (holder: string) => real.getByName("global").release(holder),
+					releaseLease: (holder: string) => real.getByName("global").releaseLease(holder),
+				}),
+			};
+			try {
+				const alarm = instance.alarm();
+				await inRenewal;
+				await instance.deleteProjectData();
+				renewing();
+				await alarm;
+			} finally {
+				instanceEnv.SandboxCapacity = real;
+			}
+
+			expect(await state.storage.getAlarm()).toBeNull();
+		});
+		const stats = await runInDurableObject(capacityStub(), (capacity) => capacity.stats());
+		expect(stats.active).toBe(0);
+	});
+
+	it("leaves a site deleted while BuilderAgent was asked to stop it alone", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			install(instance, fakeContainer());
+			await instance.ensureRunning();
+			const markSandboxStopped = vi.fn(async () => {});
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", {
+				getByName: () => ({
+					prepareSandboxStop: async () => {
+						await instance.deleteProjectData();
+						return { busy: false };
+					},
+					markSandboxStopped,
+				}),
+			});
+
+			vi.setSystemTime(base + 10 * 60_000);
+			await instance.alarm();
+
+			// Its BuilderAgent is gone with it: telling it the container stopped would wake it.
+			expect(markSandboxStopped).not.toHaveBeenCalled();
+			expect(await state.storage.getAlarm()).toBeNull();
+		});
+	});
+
+	it("does not arm an alarm for a site deleted as the alarm finished", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			container.setInactivityTimeout = async () => {
+				await instance.deleteProjectData();
+			};
+
+			await instance.alarm();
+
+			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});
 

@@ -6,6 +6,7 @@ import {
 	PREVIEW_SANDBOX_ID_HEADER,
 	PREVIEW_TOKEN_HEADER,
 } from "./preview-router.js";
+import { settleWithin } from "./preview-cache.js";
 import { PreviewSnapshots, type PreviewRefreshResult } from "./preview-snapshots.js";
 import {
 	deletePortToken,
@@ -119,7 +120,11 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 	private readonly sockets = new Set<WebSocket>();
 	/** An idle stop under way; a start waits for it. */
 	private stopping?: Promise<void>;
+	/** How long an alarm waits for BuilderAgent to agree to an idle stop. */
+	private prepareStopTimeoutMs = 60_000;
 	private nameStored = false;
+	/** The site was deleted; an alarm already running must not take its slot back. */
+	private deleted = false;
 	/** The stored name, for an instance woken without one (an old alarm). */
 	private storedNameValue?: string;
 
@@ -249,31 +254,51 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		// Without a name there is no BuilderAgent to ask and no slot to renew; the
 		// safety timeout stops the container.
 		if (!name) return;
+		// The slot first, so a slow save before an idle stop cannot let it lapse.
+		await this.keepSlot(name);
+		// Deleted meanwhile: the slot taken back must not outlive the site.
+		if (this.deleted) {
+			await this.releaseSlot(name);
+			return;
+		}
 		const idleFor = Date.now() - (await this.lastActivity());
 		if (idleFor >= this.idleStopMs()) {
 			const lastActivity = await this.lastActivity();
-			// BuilderAgent saves the site first, and keeps it running while work is under way.
 			const verdict =
-				idleFor >= HARD_IDLE_STOP_MS
-					? { busy: false }
-					: await this.env.BuilderAgent.getByName(name)
-							.prepareSandboxStop(idleFor)
-							.catch((error: unknown) => {
-								console.warn("[Sandbox] could not prepare an idle stop:", error);
-								return { busy: true };
-							});
+				idleFor >= HARD_IDLE_STOP_MS ? { busy: false } : await this.askToStop(name, idleFor);
+			// Deleted while BuilderAgent was asked: deleteProjectData did the rest.
+			if (this.deleted) return;
 			if (!verdict.busy && (await this.lastActivity()) === lastActivity) {
 				await this.stopContainer(name);
 				return;
 			}
 		}
-		const capacity = this.env.SandboxCapacity.getByName("global");
-		// A slot lost to an outage is taken again: this container runs either way.
-		if (!(await capacity.renew(name, CAPACITY_LEASE_TTL_MS))) {
-			await capacity.acquire(name, { reason: "renew" });
-		}
 		await container.setInactivityTimeout(SAFETY_INACTIVITY_MS);
-		await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+		if (!this.deleted) await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+	}
+
+	/** Renew the running container's slot, or take it again, past the cap if need be, if it lapsed. */
+	private async keepSlot(name: string): Promise<void> {
+		const capacity = this.env.SandboxCapacity.getByName("global");
+		if (!(await capacity.renew(name, CAPACITY_LEASE_TTL_MS))) {
+			await capacity.reclaim(name, CAPACITY_LEASE_TTL_MS);
+		}
+	}
+
+	/**
+	 * BuilderAgent saves the site first, and keeps it running while work is under
+	 * way. An answer that does not come within the deadline counts as busy, so
+	 * the next alarm renews the slot and asks again.
+	 */
+	private async askToStop(name: string, idleFor: number): Promise<{ busy: boolean }> {
+		const asked = this.env.BuilderAgent.getByName(name).prepareSandboxStop(idleFor);
+		const settled = await settleWithin(asked, this.prepareStopTimeoutMs);
+		if (settled.status === "fulfilled") return settled.value;
+		console.warn(
+			"[Sandbox] could not prepare an idle stop:",
+			settled.status === "rejected" ? settled.reason : "no answer in time",
+		);
+		return { busy: true };
 	}
 
 	/** Stop the idle container; a start that arrives meanwhile waits for it. */
@@ -319,6 +344,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 
 	/** Tear down the container and everything stored for a deleted site. */
 	async deleteProjectData(): Promise<void> {
+		this.deleted = true;
 		const container = this.container();
 		this.closeSockets();
 		if (container?.running) await container.destroy().catch(() => undefined);

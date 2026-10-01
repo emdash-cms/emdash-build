@@ -105,6 +105,22 @@ describe("sandbox capacity", () => {
 		});
 	});
 
+	it("gives a running container its lapsed slot back, past the cap, and out of the queue", async () => {
+		await withCapacity(1, (capacity) => {
+			expect(capacity.acquire("running")).toMatchObject({ granted: true });
+			vi.setSystemTime(1_000_000 + CAPACITY_LEASE_TTL_MS + 1);
+			expect(capacity.acquire("waiting")).toMatchObject({ granted: true });
+			expect(capacity.acquire("running", { reason: "renew" })).toMatchObject({ granted: false });
+
+			capacity.reclaim("running");
+
+			// Both containers run, so both count, and nobody else starts until one stops.
+			expect(capacity.stats()).toEqual({ limit: 1, active: 2, waiting: 0 });
+			expect(capacity.renew("running")).toBe(true);
+			expect(capacity.acquire("new")).toMatchObject({ granted: false, position: 1 });
+		});
+	});
+
 	it("reads the cap from SANDBOX_MAX_CONCURRENT", () => {
 		expect(capacityLimit("25")).toBe(25);
 		expect(capacityLimit(undefined)).toBe(100);

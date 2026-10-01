@@ -79,6 +79,22 @@ export class SandboxCapacity extends DurableObject<Env> {
 		return this.extend(holder, now + ttlMs);
 	}
 
+	/**
+	 * Take a running container's slot again after its lease lapsed, past the cap
+	 * if others took the free slots meanwhile: it runs either way, so it counts.
+	 */
+	reclaim(holder: string, ttlMs = CAPACITY_LEASE_TTL_MS): void {
+		const now = Date.now();
+		this.sql.exec(
+			`INSERT INTO leases (holder, acquired_at, expires_at, reason) VALUES (?, ?, ?, 'reclaim')
+			 ON CONFLICT(holder) DO UPDATE SET expires_at = excluded.expires_at`,
+			holder,
+			now,
+			now + ttlMs,
+		);
+		this.sql.exec("DELETE FROM waiters WHERE holder = ?", holder);
+	}
+
 	/** Give up a slot or a place in the queue. */
 	release(holder: string): void {
 		this.sql.exec("DELETE FROM leases WHERE holder = ?", holder);
