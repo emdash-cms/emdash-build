@@ -3041,12 +3041,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const stopInstall = () => void sandbox.stopProcess(install);
 		signal?.addEventListener("abort", stopInstall, { once: true });
 		if (signal?.aborted) stopInstall();
+		let exited = false;
 		try {
 			const installResult = await sandbox.waitForProcessExit(install, 300000);
+			exited = true;
 			signal?.throwIfAborted();
 			return installResult.exitCode;
 		} finally {
 			signal?.removeEventListener("abort", stopInstall);
+			// Its log follows the install, so an install still running must stop first.
+			if (!exited) await sandbox.stopProcess(install).catch(() => undefined);
 			await installLogsDone.catch(() => {});
 		}
 	}

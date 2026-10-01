@@ -313,6 +313,45 @@ describe("tool calls that find the container stopped", () => {
 	});
 });
 
+describe("installing dependencies", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("stops an install that outlives its wait instead of following it forever", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000020");
+		await runInDurableObject(agent, async (instance) => {
+			let endLogs!: () => void;
+			const stopped: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				installDeps: () => Promise<number>;
+			};
+			harness.sandboxOps = () => ({
+				startProcess: async () => undefined,
+				// The output stream lasts as long as the install does.
+				followProcessLogs: async () =>
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							endLogs = () => controller.close();
+						},
+					}),
+				waitForProcessExit: async (id: string) => {
+					throw new Error(`Process ${id} did not exit within 300000ms.`);
+				},
+				stopProcess: async (id: string) => {
+					stopped.push(id);
+					endLogs();
+				},
+			});
+
+			await expect(harness.installDeps()).rejects.toThrow("did not exit");
+			expect(stopped).toHaveLength(1);
+			expect(stopped[0]).toMatch(/^install-/);
+		});
+	});
+});
+
 describe("the tools' view of the Sandbox", () => {
 	beforeEach(async () => {
 		await reset();
