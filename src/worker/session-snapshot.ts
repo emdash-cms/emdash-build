@@ -130,7 +130,8 @@ export function snapshotCommitCommand(options: {
 		`export GIT_DIR=${shellQuote(options.gitDir)} GIT_WORK_TREE=${shellQuote(options.snapshotPath)}`,
 		`cd ${shellQuote(options.snapshotPath)}`,
 		'{ test -f "$GIT_DIR/HEAD" || git init -q; }',
-		'rm -f "$GIT_DIR/index" "$GIT_DIR/index.lock" "$GIT_DIR"/refs/heads/*.lock',
+		// Only the locks a killed commit leaves; an upload beside it holds pushed.lock.
+		'rm -f "$GIT_DIR/index" "$GIT_DIR/index.lock" "$GIT_DIR/refs/heads/snapshot.lock"',
 		`git config user.email ${shellQuote(options.email)}`,
 		`git config user.name ${shellQuote(options.name)}`,
 		// A background gc would stall a checkpoint; old snapshots are pruned after uploads.

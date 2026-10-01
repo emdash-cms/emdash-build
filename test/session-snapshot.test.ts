@@ -224,6 +224,19 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		expect(leaked).toBe(`[][][${process.cwd()}]`);
 	});
 
+	it("clears its own stale lock but not the lock of an upload in progress", () => {
+		snapshotOnce("first");
+		// A killed commit left its ref lock; an upload running now holds its own.
+		write(join(gitDir, "refs/heads/snapshot.lock"), "stale");
+		write(join(gitDir, "refs/heads/pushed.lock"), "held");
+		run(snapshotStagingCommand(site, snapshot));
+
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "second", ...identity }));
+
+		expect(existsSync(join(gitDir, "refs/heads/pushed.lock"))).toBe(true);
+		expect(existsSync(join(gitDir, "refs/heads/snapshot.lock"))).toBe(false);
+	});
+
 	it("uploads even when the next checkpoint is rebuilding the staging copy", () => {
 		run(snapshotStagingCommand(site, snapshot));
 		const commit = run(
