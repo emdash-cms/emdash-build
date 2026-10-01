@@ -730,6 +730,36 @@ describe("apply_schema_plan", () => {
 		});
 	});
 
+	it("takes a collection url field as the string field it has to be", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000a1");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = installBlockCms(instance, []);
+			const tool = harness.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan as unknown as {
+				inputSchema: {
+					safeParse: (value: unknown) => {
+						success: boolean;
+						data?: { collections: Array<{ fields: Array<{ type: string }> }> };
+					};
+				};
+			};
+
+			// Block fields have a url type; collection fields do not, and the model mixes them up.
+			const parsed = tool.inputSchema.safeParse({
+				collections: [
+					{
+						slug: "events",
+						label: "Events",
+						fields: [{ slug: "booking_url", label: "Booking link", type: "url" }],
+					},
+				],
+			});
+
+			expect(parsed.success).toBe(true);
+			expect(parsed.data?.collections[0]?.fields[0]?.type).toBe("string");
+		});
+	});
+
 	it("skips fields that already exist in the live collection", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000001");
 		await runInDurableObject(agent, async (instance) => {

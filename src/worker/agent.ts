@@ -937,22 +937,27 @@ const blockFieldSchema = z.discriminatedUnion("type", [
 const ordinaryFieldSchema = z.object({
 	slug: collectionFieldSlug,
 	label: z.string().min(1),
-	type: z.enum([
-		"string",
-		"text",
-		"number",
-		"integer",
-		"boolean",
-		"datetime",
-		"select",
-		"multiSelect",
-		"portableText",
-		"image",
-		"file",
-		"reference",
-		"json",
-		"slug",
-	]),
+	// Block fields have a url type and collection fields do not, so the model
+	// mixes them up: a collection's link field is a string.
+	type: z
+		.enum([
+			"string",
+			"text",
+			"number",
+			"integer",
+			"boolean",
+			"datetime",
+			"select",
+			"multiSelect",
+			"portableText",
+			"image",
+			"file",
+			"reference",
+			"json",
+			"slug",
+			"url",
+		])
+		.transform((type) => (type === "url" ? "string" : type)),
 	required: z.boolean().optional(),
 	unique: z.boolean().optional(),
 	defaultValue: z.unknown().optional(),
