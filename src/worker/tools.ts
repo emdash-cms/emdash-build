@@ -321,8 +321,10 @@ const PROTECTED_FILE_NOTICE = "emdash-build-guard: ";
 /**
  * Wrap a shell command (run from the site root) so protected site files
  * survive it: copy them aside first, then restore any the command changed
- * or deleted and report each on stderr. The command's exit status is kept.
- * Runs in a subshell, so the guard's own `exit` ends only the guard.
+ * or deleted and report each on stderr, also when the command is stopped.
+ * The command's exit status is kept. It must be one simple command, run in
+ * the background in its own process group. The guard is the whole command,
+ * not a subshell, so whoever waits for it waits for the restore.
  *
  * This catches accidental edits, not a determined model: it shares the
  * command's permissions, and background processes can outlive it. The
@@ -339,14 +341,35 @@ export function guardProtectedFiles(command: string): string {
 		'guard=$(mktemp -d "${TMPDIR:-/tmp}/emdash-guard.XXXXXX") || exit 1',
 		"backed=",
 		`for f in ${files}; do if [ -f "$f" ]; then { mkdir -p "$guard/$(dirname "$f")" && cp "$f" "$guard/$f" && backed="$backed $f"; } || ${notice("could not back up protected file $f")}; fi; done`,
-		command,
-		"rc=$?",
+		// The command runs in its own process group (job control), so on a TERM
+		// (Stop, or the deadline) the guard can stop all of it, KILLing what
+		// ignores the TERM after a second, and still restore before the runtime's
+		// own KILL ends the guard.
+		// The trap comes first, so a TERM just as the command starts still stops it.
+		`trap 'trap "" TERM; if [ -n "\${inner:-}" ]; then kill -TERM -- "-$inner" 2>/dev/null; n=0; while kill -0 -- "-$inner" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 0.1; n=$((n + 1)); done; kill -KILL -- "-$inner" 2>/dev/null; fi' TERM`,
+		"set -m",
+		// Steps join with "; ", which may not follow "&".
+		`${command} & inner=$!`,
+		"set +m",
+		'wait "$inner"; rc=$?',
 		// Word splitting over $backed is safe: protected paths contain no spaces.
 		`for f in $backed; do if [ ! -f "$guard/$f" ]; then ${notice("could not check protected file $f: its backup was removed")}; elif ! cmp -s "$guard/$f" "$f"; then { if [ -L "$f" ]; then rm -f "$f"; elif [ -d "$f" ]; then rm -rf "$f"; fi; mkdir -p "$(dirname "$f")" && ${restore}; } || ${notice("could not restore protected file $f")}; fi; done`,
 		'rm -rf "$guard"',
 		"exit $rc",
 	];
-	return `( ${steps.join("; ")} )`;
+	return `{ ${steps.join("; ")}; }`;
+}
+
+/** How long the model's shell commands may run, so a hung one cannot block later tools. */
+export const MODEL_COMMAND_TIMEOUT_MS = 12_000;
+
+/**
+ * The model's shell command as the exec tool runs it: in a login shell, with
+ * protected files guarded. At the runtime's deadline, as on Stop, the guard
+ * stops the command and restores files.
+ */
+export function modelCommand(command: string): string {
+	return guardProtectedFiles(`bash -lc ${shellQuote(command)}`);
 }
 
 /**
@@ -2027,13 +2050,9 @@ export function createTools(
 					};
 				}
 				return trackedMutation(async () => {
-					// The model's deadline is enforced inside the container, with a small
-					// outer margin for the termination result to cross RPC.
-					const boundedCommand =
-						`timeout --signal=TERM --kill-after=2s 12s ` + `bash -lc ${shellQuote(command)}`;
-					const result = await currentSandbox().exec(guardProtectedFiles(boundedCommand), {
+					const result = await currentSandbox().exec(modelCommand(command), {
 						cwd: SITE_PATH,
-						timeout: 17000,
+						timeout: MODEL_COMMAND_TIMEOUT_MS,
 						signal: options.abortSignal,
 					});
 					const notices = protectedFileNotices(result.stderr);

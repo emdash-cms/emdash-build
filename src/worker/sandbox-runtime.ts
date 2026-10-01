@@ -345,7 +345,8 @@ export class SandboxRuntime implements ContainerOps {
 		const argv = [
 			"timeout",
 			"--signal=TERM",
-			"--kill-after=2s",
+			// Time for a command's own cleanup on TERM, such as the exec tool's restore.
+			"--kill-after=4s",
 			`${seconds ?? UNTIMED_COMMAND_SECONDS}s`,
 			"bash",
 			"-c",
@@ -365,7 +366,7 @@ export class SandboxRuntime implements ContainerOps {
 		// Stop may have come while the command was starting.
 		if (signal?.aborted) onAbort();
 		const backstop =
-			seconds !== undefined ? setTimeout(() => kill(9), (seconds + 5) * 1000) : undefined;
+			seconds !== undefined ? setTimeout(() => kill(9), (seconds + 7) * 1000) : undefined;
 		const markBytes = new TextEncoder().encode(mark);
 		const stdout = new OutputReader(process.stdout, markBytes);
 		const stderr = new OutputReader(process.stderr, markBytes);

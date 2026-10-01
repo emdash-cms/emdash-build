@@ -18,6 +18,8 @@ import {
 	createTools,
 	ensurePreviewHmr,
 	guardProtectedFiles,
+	MODEL_COMMAND_TIMEOUT_MS,
+	modelCommand,
 	typecheckInputsFingerprintCommand,
 } from "../src/worker/tools.js";
 
@@ -1969,9 +1971,10 @@ describe("protected site files", () => {
 		await expect(run({ command: "sed -i s/a/b/ wrangler.jsonc" })).resolves.toMatchObject({
 			protectedFiles: ["restored protected file wrangler.jsonc"],
 		});
-		const [command] = exec.mock.calls[0] as unknown as [string];
-		expect(command.startsWith("( guard=$(mktemp -d")).toBe(true);
-		expect(command).toContain("timeout --signal=TERM --kill-after=2s 12s bash -lc");
+		const [command, options] = exec.mock.calls[0] as unknown as [string, { timeout: number }];
+		expect(command).toBe(modelCommand("sed -i s/a/b/ wrangler.jsonc"));
+		expect(command.startsWith("{ guard=$(mktemp -d")).toBe(true);
+		expect(options.timeout).toBe(MODEL_COMMAND_TIMEOUT_MS);
 	});
 
 	it("refuses shell commands while validation is current, so a diagnostic cannot void it", async () => {

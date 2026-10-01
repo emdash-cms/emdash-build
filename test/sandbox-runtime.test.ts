@@ -1,4 +1,13 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +19,7 @@ import {
 	SandboxRuntime,
 	type FilesLike,
 } from "../src/worker/sandbox-runtime.js";
+import { MODEL_COMMAND_TIMEOUT_MS, modelCommand } from "../src/worker/tools.js";
 import { LocalContainer } from "./fixtures/local-container.js";
 
 let root: string;
@@ -224,7 +234,7 @@ describe("commands", { timeout: 30_000 }, () => {
 		expect(container.execs.at(-1)?.slice(0, 6)).toEqual([
 			"timeout",
 			"--signal=TERM",
-			"--kill-after=2s",
+			"--kill-after=4s",
 			"86400s",
 			"bash",
 			"-c",
@@ -243,7 +253,7 @@ describe("commands", { timeout: 30_000 }, () => {
 		expect(container.execs.at(-1)).toEqual([
 			"timeout",
 			"--signal=TERM",
-			"--kill-after=2s",
+			"--kill-after=4s",
 			"2s",
 			"bash",
 			"-c",
@@ -404,6 +414,87 @@ describe("commands", { timeout: 30_000 }, () => {
 		expect(Date.now() - started).toBeLessThan(2_000);
 		await new Promise((resolve) => setTimeout(resolve, 2_000));
 		expect(existsSync(marker)).toBe(true);
+	});
+
+	it("restores protected files when the model's command is stopped", async () => {
+		const { runtime } = await running();
+		const site = mkdtempSync(join(root, "site-"));
+		writeFileSync(join(site, "AGENTS.md"), "original\n");
+		const tmp = mkdtempSync(join(root, "tmp-"));
+		const controller = new AbortController();
+		const pending = runtime.exec(modelCommand("echo tampered > AGENTS.md; sleep 3"), {
+			cwd: site,
+			env: { TMPDIR: tmp },
+			timeout: MODEL_COMMAND_TIMEOUT_MS,
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 1000);
+		const started = Date.now();
+
+		await expect(pending).rejects.toThrow();
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
+		expect(readdirSync(tmp)).toEqual([]);
+	});
+
+	it("restores protected files when the model's command runs past its deadline", async () => {
+		const { runtime } = await running();
+		const site = mkdtempSync(join(root, "site-"));
+		writeFileSync(join(site, "AGENTS.md"), "original\n");
+
+		const result = await runtime.exec(modelCommand("echo tampered > AGENTS.md; sleep 30"), {
+			cwd: site,
+			timeout: 1000,
+		});
+
+		expect(result.exitCode).toBe(124);
+		expect(result.stderr).toContain("restored protected file AGENTS.md");
+		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
+	});
+
+	it("stops a model command that ignores TERM, and still restores files and reports output", async () => {
+		const { runtime } = await running();
+		const site = mkdtempSync(join(root, "site-"));
+		writeFileSync(join(site, "AGENTS.md"), "original\n");
+		const tmp = mkdtempSync(join(root, "tmp-"));
+		const command = modelCommand("trap '' TERM; echo partial; echo tampered > AGENTS.md; sleep 6");
+		const started = Date.now();
+
+		const result = await runtime.exec(command, { cwd: site, env: { TMPDIR: tmp }, timeout: 1000 });
+
+		expect(result.exitCode).toBe(124);
+		expect(result.stdout).toBe("partial\n");
+		expect(result.stderr).toContain("restored protected file AGENTS.md");
+		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
+		expect(readdirSync(tmp)).toEqual([]);
+		expect(Date.now() - started).toBeLessThan(4_000);
+
+		const controller = new AbortController();
+		const stopped = runtime.exec(command, {
+			cwd: site,
+			env: { TMPDIR: tmp },
+			timeout: MODEL_COMMAND_TIMEOUT_MS,
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 500);
+		await expect(stopped).rejects.toThrow();
+		expect(readFileSync(join(site, "AGENTS.md"), "utf8")).toBe("original\n");
+		expect(readdirSync(tmp)).toEqual([]);
+	});
+
+	it("returns from the model's command when it leaves a process running", async () => {
+		const { runtime } = await running();
+		const site = mkdtempSync(join(root, "site-"));
+		const started = Date.now();
+
+		const result = await runtime.exec(modelCommand("sleep 21.7 &"), {
+			cwd: site,
+			timeout: MODEL_COMMAND_TIMEOUT_MS,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(Date.now() - started).toBeLessThan(5_000);
+		await runtime.exec("pkill -f 'sleep 21.7' || true");
 	});
 
 	it("stops a command on abort and rejects", async () => {
