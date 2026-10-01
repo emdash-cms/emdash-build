@@ -41,8 +41,25 @@ describe("preview hosts", () => {
 		["a privileged port", `https://0080-${ID}-tok.${HOST}/`],
 		["a token longer than 16 characters", `https://4321-${ID}-${"a".repeat(17)}.${HOST}/`],
 		["a token with other characters", `https://4321-${ID}-to-k.${HOST}/`],
+		["a port with a leading zero", `https://04321-${ID}-tok.${HOST}/`],
 	])("ignores %s", (_, url) => {
 		expect(parsePreviewHost(new URL(url), HOST)).toBeUndefined();
+	});
+
+	it("reads a fully qualified host with its trailing dot", () => {
+		expect(parsePreviewHost(new URL(`https://4321-${ID}-tok.${HOST}./`), HOST)).toMatchObject({
+			port: 4321,
+			token: "tok",
+		});
+	});
+
+	it("still serves local previews and leaves other hosts alone without a preview hostname", () => {
+		expect(
+			parsePreviewHost(new URL(`http://4321-${ID}-tok.localhost:5173/`), undefined as never),
+		).toMatchObject({ port: 4321 });
+		expect(
+			parsePreviewHost(new URL("https://build.example.com/"), undefined as never),
+		).toBeUndefined();
 	});
 });
 
