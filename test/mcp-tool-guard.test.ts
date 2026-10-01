@@ -170,6 +170,53 @@ describe("MCP tool adaptation", () => {
 	});
 });
 
+describe("content_create arguments EmDash never accepts", () => {
+	it("moves a slug out of the entry data, where it is never a field", () => {
+		expect(
+			normalizeMcpToolArgs("content_create", {
+				collection: "authors",
+				status: "published",
+				data: { slug: "mara", name: "Mara" },
+			}),
+		).toEqual({
+			repaired: true,
+			args: { collection: "authors", status: "published", slug: "mara", data: { name: "Mara" } },
+		});
+		expect(
+			normalizeMcpToolArgs("content_create", {
+				collection: "authors",
+				slug: "mara-ellison",
+				data: { slug: "mara", name: "Mara" },
+			}),
+		).toEqual({
+			repaired: true,
+			args: { collection: "authors", slug: "mara-ellison", data: { name: "Mara" } },
+		});
+		// Anything but a slug string is left for EmDash to refuse, so the model hears of it.
+		const numbered = { collection: "issues", data: { slug: 2024, title: "Spring" } };
+		expect(normalizeMcpToolArgs("content_create", numbered)).toEqual({
+			repaired: false,
+			args: numbered,
+		});
+	});
+
+	it("drops an empty locale or translation source", () => {
+		expect(
+			normalizeMcpToolArgs("content_create", {
+				collection: "authors",
+				data: { name: "Mara" },
+				locale: "",
+				translationOf: "",
+			}),
+		).toEqual({ repaired: true, args: { collection: "authors", data: { name: "Mara" } } });
+		const french = { collection: "authors", data: { name: "Mara" }, locale: "fr" };
+		expect(normalizeMcpToolArgs("content_create", french)).toEqual({
+			repaired: false,
+			args: french,
+		});
+	});
+});
+
 describe("MCP failure guard", () => {
 	it("blocks only an identical rejected call and clears that attempt on success", () => {
 		const guard = new McpToolFailureGuard(2);

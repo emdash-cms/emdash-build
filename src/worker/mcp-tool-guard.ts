@@ -97,6 +97,13 @@ export function normalizeMcpToolArgs(
 		normalized.orderBy = normalizedOrderBy;
 		repaired = true;
 	}
+	if (toolName === "content_create") {
+		const created = normalizeContentCreate(normalized);
+		if (created !== normalized) {
+			normalized = created;
+			repaired = true;
+		}
+	}
 	if (toolName !== "menu_set_items" || !Array.isArray(normalized.items)) {
 		return { args: normalized, repaired };
 	}
@@ -113,6 +120,26 @@ export function normalizeMcpToolArgs(
 	return repaired
 		? { args: { ...normalized, items: normalizedItems }, repaired: true }
 		: { args: normalized, repaired: false };
+}
+
+/**
+ * Luna builds entries from objects that carry their slug, and fills optional
+ * identifiers with "". EmDash rejects both: `slug` is a built-in entry field,
+ * never a data field, and "" names no locale or entry. An explicit slug wins.
+ */
+function normalizeContentCreate(args: JsonObject): JsonObject {
+	let next = args;
+	const copy = () => (next === args ? (next = { ...args }) : next);
+	if (isObject(args.data) && typeof args.data.slug === "string" && args.data.slug) {
+		const { slug, ...data } = args.data;
+		const target = copy();
+		target.data = data;
+		if (!target.slug) target.slug = slug;
+	}
+	for (const key of ["locale", "translationOf"]) {
+		if (args[key] === "") delete copy()[key];
+	}
+	return next;
 }
 
 const AUTO_PUBLISH_NOTE =
