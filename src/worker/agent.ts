@@ -55,6 +55,7 @@ import {
 	stripR2FromWrangler,
 	ensureSsrOptimizeDep,
 	ensurePreviewHmr,
+	previewScreenshotCommand,
 	readFilesFromSandbox,
 	refreshLiveTypes,
 	typeDeclarationsForModel,
@@ -3206,13 +3207,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		try {
 			const shot = await this.runSandboxRead((sandbox) => {
 				const browserSession = `preview-${crypto.randomUUID().slice(0, 8)}`;
-				return sandbox.exec(
-					`AGENT_BROWSER_DEFAULT_TIMEOUT=45000 AGENT_BROWSER_ARGS=--disable-dev-shm-usage agent-browser --session ${browserSession} ` +
-						`--allowed-domains localhost,127.0.0.1 ` +
-						`batch 'open http://127.0.0.1:4321/' 'set viewport 1024 640' ` +
-						`'screenshot ${outPath}' 'close'`,
-					{ timeout: 90000, signal },
-				);
+				return sandbox.exec(previewScreenshotCommand(browserSession, outPath), {
+					timeout: 90000,
+					signal,
+				});
 			}, signal);
 			if (!shot.success) {
 				return {

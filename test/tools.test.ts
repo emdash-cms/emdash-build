@@ -28,6 +28,7 @@ import {
 	guardProtectedFiles,
 	MODEL_COMMAND_TIMEOUT_MS,
 	modelCommand,
+	previewScreenshotCommand,
 	typecheckInputsFingerprintCommand,
 } from "../src/worker/tools.js";
 
@@ -56,6 +57,59 @@ function validatingSandbox(
 		),
 	};
 }
+
+describe("preview screenshot", () => {
+	/** Run the screenshot's wait condition against fake images, as agent-browser would in the page. */
+	function settled(
+		images: Array<{ complete: boolean; top: number; left?: number; hidden?: boolean }>,
+		waitedMs = 0,
+	) {
+		const condition = previewScreenshotCommand("preview-1", "/tmp/shot.png").match(
+			/'wait --fn "([^"]+)"'/,
+		)?.[1];
+		const document = {
+			images: images.map((image) => ({
+				complete: image.complete,
+				getBoundingClientRect: () => ({ top: image.top, left: image.left ?? 0 }),
+				getClientRects: () => (image.hidden ? [] : [{}]),
+			})),
+		};
+		const window: Record<string, number> = {};
+		const now = Date.now();
+		const clock = { now: () => now };
+		const check = new Function(
+			"document",
+			"innerHeight",
+			"innerWidth",
+			"window",
+			"Date",
+			`return (${condition});`,
+		);
+		check(document, 640, 1024, window, clock);
+		clock.now = () => now + waitedMs;
+		return Boolean(check(document, 640, 1024, window, clock));
+	}
+
+	it("waits for the images in view, which the viewport change makes fetch a new size", () => {
+		const steps = [
+			...previewScreenshotCommand("preview-1", "/tmp/shot.png").matchAll(/'([a-z]+)[^']*'/g),
+		];
+		expect(steps.map((step) => step[1])).toEqual(["open", "set", "wait", "screenshot", "close"]);
+
+		expect(settled([{ complete: false, top: 120 }])).toBe(false);
+		expect(
+			settled([
+				{ complete: true, top: 120 },
+				{ complete: false, top: 900 },
+			]),
+		).toBe(true);
+		// Nor does a lazy image that is hidden, or off to the side, which never loads.
+		expect(settled([{ complete: false, top: 0, hidden: true }])).toBe(true);
+		expect(settled([{ complete: false, top: 120, left: 1100 }])).toBe(true);
+		// An image that never loads holds the shot five seconds at most.
+		expect(settled([{ complete: false, top: 120 }], 5_001)).toBe(true);
+	});
+});
 
 describe("preview HMR configuration", () => {
 	const config = `import { defineConfig } from "astro/config";

@@ -983,6 +983,27 @@ export function typecheckInputsFingerprintCommand(): string {
 	);
 }
 
+/**
+ * True once every image in view has loaded or failed, or five seconds after
+ * the first check. The viewport is set after the page loads, so responsive
+ * images fetch another size, and a screenshot taken at once shows them empty.
+ * Images hidden, below the fold or off to the side do not count.
+ */
+const IN_VIEW_IMAGES_SETTLED =
+	"(window.__shotCheckedAt ??= Date.now()) && (Date.now() - window.__shotCheckedAt > 5000 || " +
+	"[...document.images].every((image) => image.complete || !image.getClientRects().length || " +
+	"image.getBoundingClientRect().top >= innerHeight || image.getBoundingClientRect().left >= innerWidth))";
+
+/** Screenshot the dev server's home page from inside the container, in a session of its own. */
+export function previewScreenshotCommand(session: string, outPath: string): string {
+	return (
+		`AGENT_BROWSER_DEFAULT_TIMEOUT=45000 AGENT_BROWSER_ARGS=--disable-dev-shm-usage agent-browser --session ${session} ` +
+		`--allowed-domains localhost,127.0.0.1 ` +
+		`batch 'open http://127.0.0.1:4321/' 'set viewport 1024 640' 'wait --fn "${IN_VIEW_IMAGES_SETTLED}"' ` +
+		`'screenshot ${outPath}' 'close'`
+	);
+}
+
 /** Undefined when the digest cannot be computed. */
 async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string | undefined> {
 	try {
