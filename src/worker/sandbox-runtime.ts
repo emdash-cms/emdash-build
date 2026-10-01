@@ -47,6 +47,8 @@ export const SAFETY_INACTIVITY_MS = 15 * 60_000;
  * died without the platform noticing can leave every call waiting for good.
  */
 export const CONTAINER_ANSWER_MS = 15_000;
+/** What a call fails with when the container does not answer it in time. */
+export const CONTAINER_NOT_ANSWERING = "The container did not answer.";
 const READY_TIMEOUT_MS = 30_000;
 /** Every command runs under GNU timeout, which passes Stop on to the command's children. */
 const UNTIMED_COMMAND_SECONDS = 24 * 60 * 60;
@@ -107,6 +109,8 @@ export interface SandboxRuntimeDeps {
 	tunnelWaitMs?: number;
 	/** How long a new container has to become ready. */
 	readyTimeoutMs?: number;
+	/** How long a call that answers at once may take; tests shorten it. */
+	answerTimeoutMs?: number;
 }
 
 export type ContainerOps = Omit<SandboxOps, "exposePort" | "unexposePort">;
@@ -249,6 +253,10 @@ function killer(process: ExecProcess) {
 export class SandboxRuntime implements ContainerOps {
 	private starting?: Promise<SandboxStart>;
 	private stopping = false;
+	/** The container has answered since it last started; until then it may still be starting. */
+	private answering = false;
+	/** How long a container that has not answered yet may still be starting: a start's deadline. */
+	private startingUntil?: number;
 
 	constructor(private readonly deps: SandboxRuntimeDeps) {}
 
@@ -258,6 +266,36 @@ export class SandboxRuntime implements ContainerOps {
 
 	private dir(id: string): string {
 		return processDir(id, this.deps.processRoot);
+	}
+
+	/** A container call that answers at once, failing instead of waiting for good when it does not. */
+	private async answered<T>(call: Promise<T>): Promise<T> {
+		const answerMs = this.deps.answerTimeoutMs ?? CONTAINER_ANSWER_MS;
+		// A container still starting answers once it is up, which a start may take longer for;
+		// one this object found running gets as long, from its first call.
+		this.startingUntil ??= Date.now() + (this.deps.readyTimeoutMs ?? READY_TIMEOUT_MS);
+		const ms = this.answering ? answerMs : Math.max(answerMs, this.startingUntil - Date.now());
+		const settled = await settleWithin(call, ms);
+		if (settled.status === "fulfilled") {
+			this.answering = true;
+			return settled.value;
+		}
+		if (settled.status === "rejected") throw settled.reason;
+		throw new Error(CONTAINER_NOT_ANSWERING);
+	}
+
+	/** Start a process in the container; one that starts after its caller gave up is stopped. */
+	private async spawn(argv: string[], options: ContainerExecOptions): Promise<ExecProcess> {
+		const spawned = this.container.exec(argv, options);
+		try {
+			return await this.answered(spawned);
+		} catch (error) {
+			void spawned.then(
+				(late) => killer(late)(15),
+				() => undefined,
+			);
+			throw error;
+		}
 	}
 
 	private requireRunning(): ContainerLike {
@@ -307,6 +345,8 @@ export class SandboxRuntime implements ContainerOps {
 			};
 		}
 		const container = this.container;
+		this.answering = false;
+		this.startingUntil = Date.now() + (this.deps.readyTimeoutMs ?? READY_TIMEOUT_MS);
 		try {
 			container.start(this.deps.startOptions());
 			// exec waits for a starting container. Process directories restored from a
@@ -326,15 +366,17 @@ export class SandboxRuntime implements ContainerOps {
 					? settled.reason
 					: new Error("The container did not become ready in time.");
 			}
-			await container.setInactivityTimeout(SAFETY_INACTIVITY_MS);
+			this.answering = true;
+			await this.answered(container.setInactivityTimeout(SAFETY_INACTIVITY_MS));
 			return { ok: true };
 		} catch (error) {
-			await container.destroy().catch(() => undefined);
+			await this.answered(container.destroy()).catch(() => undefined);
 			if (isPlatformCapacityError(error)) {
 				await this.deps.capacity.requeue(holder).catch(() => undefined);
 				return { ok: false, reason: "capacity", retryAfterMs: PLATFORM_RETRY_MS };
 			}
-			await this.deps.capacity.release(holder).catch(() => undefined);
+			// One that still runs keeps its slot, as one that failed to stop does.
+			if (!container.running) await this.deps.capacity.release(holder).catch(() => undefined);
 			throw error;
 		}
 	}
@@ -345,7 +387,7 @@ export class SandboxRuntime implements ContainerOps {
 		try {
 			if (this.container.running) {
 				try {
-					await this.container.destroy();
+					await this.answered(this.container.destroy());
 				} catch (error) {
 					// Still running, it keeps its slot, and the caller tries again.
 					if (this.container.running) throw error;
@@ -367,7 +409,7 @@ export class SandboxRuntime implements ContainerOps {
 	}
 
 	private async run(command: string[], options: SandboxExecOptions): Promise<SandboxExecResult> {
-		const container = this.requireRunning();
+		this.requireRunning();
 		const { signal } = options;
 		signal?.throwIfAborted();
 		const seconds =
@@ -387,7 +429,7 @@ export class SandboxRuntime implements ContainerOps {
 			mark,
 			...command,
 		];
-		const process = await container.exec(argv, {
+		const process = await this.spawn(argv, {
 			cwd: options.cwd ?? SANDBOX_HOME,
 			env: { ...BASE_ENV, ...options.env },
 			user: SANDBOX_USER,
@@ -423,7 +465,7 @@ export class SandboxRuntime implements ContainerOps {
 	private async readBytes(path: string): Promise<Uint8Array> {
 		this.requireRunning();
 		try {
-			const response = await this.deps.files.readFile(path, { user: SANDBOX_USER });
+			const response = await this.answered(this.deps.files.readFile(path, { user: SANDBOX_USER }));
 			return new Uint8Array(await response.arrayBuffer());
 		} catch (error) {
 			// The message the 0.12 SDK used, which callers recognise.
@@ -450,7 +492,7 @@ export class SandboxRuntime implements ContainerOps {
 	async readFileStream(path: string): Promise<ReadableStream<Uint8Array>> {
 		this.requireRunning();
 		try {
-			const response = await this.deps.files.readFile(path, { user: SANDBOX_USER });
+			const response = await this.answered(this.deps.files.readFile(path, { user: SANDBOX_USER }));
 			return response.body ?? new ReadableStream({ start: (controller) => controller.close() });
 		} catch (error) {
 			if (isFileNotFound(error)) throw new Error(`FileNotFoundError: File not found: ${path}`);
@@ -462,15 +504,17 @@ export class SandboxRuntime implements ContainerOps {
 		this.requireRunning();
 		// 0.12 created missing parent directories; Files does not.
 		const parent = path.slice(0, path.lastIndexOf("/"));
-		if (parent) await this.deps.files.mkdir(parent, { recursive: true, user: SANDBOX_USER });
-		await this.deps.files.writeFile(path, content, { user: SANDBOX_USER });
+		if (parent) {
+			await this.answered(this.deps.files.mkdir(parent, { recursive: true, user: SANDBOX_USER }));
+		}
+		await this.answered(this.deps.files.writeFile(path, content, { user: SANDBOX_USER }));
 		return { success: true };
 	}
 
 	async deleteFile(path: string): Promise<{ success: boolean }> {
 		this.requireRunning();
 		try {
-			await this.deps.files.remove(path, { user: SANDBOX_USER });
+			await this.answered(this.deps.files.remove(path, { user: SANDBOX_USER }));
 		} catch (error) {
 			if (isFileNotFound(error)) throw new Error(`FileNotFoundError: File not found: ${path}`);
 			throw error;
@@ -547,7 +591,7 @@ export class SandboxRuntime implements ContainerOps {
 		command: string,
 		options: { cwd?: string; env?: Record<string, string> },
 	): Promise<void> {
-		const container = this.requireRunning();
+		this.requireRunning();
 		const dir = this.dir(id);
 		const previous = await this.processState(id);
 		if (previous.state === "running" || previous.state === "starting") {
@@ -557,7 +601,7 @@ export class SandboxRuntime implements ContainerOps {
 		if (previous.state === "exited")
 			await this.exec(`rm -rf ${shellQuote(dir)}`, { timeout: 15_000 });
 		// The runner keeps going until the process exits; nothing waits for it here.
-		const runner = await container.exec(
+		const runner = await this.spawn(
 			["bash", "-c", RUN_PROCESS, "run", dir, "bash", "-c", command],
 			{
 				cwd: options.cwd ?? SANDBOX_HOME,
@@ -584,11 +628,11 @@ export class SandboxRuntime implements ContainerOps {
 	}
 
 	async followProcessLogs(id: string): Promise<ReadableStream<Uint8Array>> {
-		const container = this.requireRunning();
+		this.requireRunning();
 		if ((await this.processState(id)).state === "missing") {
 			throw new Error(`Process ${id} is not running.`);
 		}
-		const follower = await container.exec(["bash", "-c", FOLLOW_PROCESS, "follow", this.dir(id)], {
+		const follower = await this.spawn(["bash", "-c", FOLLOW_PROCESS, "follow", this.dir(id)], {
 			env: { ...BASE_ENV },
 			user: SANDBOX_USER,
 			stderr: "ignore",

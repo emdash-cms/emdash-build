@@ -218,6 +218,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			},
 			holder: () => this.name,
 			startOptions: () => this.startOptions(),
+			answerTimeoutMs: this.containerAnswerMs,
 		});
 		return this.runtimeInstance;
 	}

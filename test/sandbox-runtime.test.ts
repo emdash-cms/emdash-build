@@ -15,6 +15,7 @@ import type { CapacityGrant } from "../src/worker/sandbox-capacity.js";
 import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import {
 	BASE_ENV,
+	CONTAINER_NOT_ANSWERING,
 	SAFETY_INACTIVITY_MS,
 	SandboxRuntime,
 	type FilesLike,
@@ -105,6 +106,7 @@ function setup(
 		contents?: Record<string, string>;
 		tunnelWaitMs?: number;
 		readyTimeoutMs?: number;
+		answerTimeoutMs?: number;
 		path?: string;
 	} = {},
 ) {
@@ -127,6 +129,7 @@ function setup(
 		processRoot,
 		tunnelWaitMs: options.tunnelWaitMs,
 		readyTimeoutMs: options.readyTimeoutMs,
+		answerTimeoutMs: options.answerTimeoutMs,
 	});
 	return { container, capacity, runtime, fs, processRoot };
 }
@@ -270,6 +273,112 @@ describe("starting the container", { timeout: 30_000 }, () => {
 		await expect(runtime.exec("true")).rejects.toThrow(NOT_RUNNING);
 		await expect(runtime.readFile("/home/user/site/package.json")).rejects.toThrow(NOT_RUNNING);
 		expect(container.starts).toEqual([]);
+	});
+});
+
+describe("a container that stops answering", { timeout: 30_000 }, () => {
+	// Local workerd's habit with a container that died unnoticed: it reads as
+	// running, and calls to it never return.
+	it("fails a command the container does not start, and stops it if it starts late", async () => {
+		const { container, runtime } = await running({ answerTimeoutMs: 100 });
+		const marker = join(root, `late-${crypto.randomUUID()}`);
+		container.execDelayMs = 400;
+
+		await expect(runtime.exec(`sleep 0.3; touch ${marker}`, { timeout: 5_000 })).rejects.toThrow(
+			CONTAINER_NOT_ANSWERING,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
+		expect(existsSync(marker)).toBe(false);
+	});
+
+	it("fails to start or follow a background process the container does not start", async () => {
+		const { container, runtime } = await running({ answerTimeoutMs: 100 });
+		const runner = (argv: string[]) => argv.includes("run");
+		container.hang = runner;
+		await expect(runtime.startProcess("dev-1", "sleep 5")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+
+		container.hang = undefined;
+		await runtime.startProcess("dev-2", "sleep 5");
+		container.hang = (argv) => argv.includes("follow");
+		await expect(runtime.followProcessLogs("dev-2")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		container.hang = undefined;
+		await runtime.stopProcess("dev-2");
+	});
+
+	it("fails a file call the container does not answer", async () => {
+		const { fs, runtime } = await running({ answerTimeoutMs: 100 });
+		fs.fake.readFile = () => new Promise<Response>(() => {});
+		fs.fake.mkdir = () => new Promise<void>(() => {});
+
+		await expect(runtime.readFile("/home/user/site/package.json")).rejects.toThrow(
+			CONTAINER_NOT_ANSWERING,
+		);
+		await expect(runtime.readFileStream("/home/user/site/package.json")).rejects.toThrow(
+			CONTAINER_NOT_ANSWERING,
+		);
+		await expect(runtime.writeFile("/home/user/site/a/b.txt", "b")).rejects.toThrow(
+			CONTAINER_NOT_ANSWERING,
+		);
+		fs.fake.writeFile = () => new Promise<void>(() => {});
+		fs.fake.remove = () => new Promise<void>(() => {});
+		// At the root, with no directory to create first.
+		await expect(runtime.writeFile("/b.txt", "b")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		await expect(runtime.deleteFile("/b.txt")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+	});
+
+	it("fails a start the container does not answer, keeping the slot while it still runs", async () => {
+		const { container, capacity, runtime } = setup({ answerTimeoutMs: 100 });
+		container.setInactivityTimeout = () => new Promise<void>(() => {});
+		container.destroy = () => new Promise<void>(() => {});
+
+		await expect(runtime.ensureRunning()).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		expect(container.running).toBe(true);
+		expect(capacity.release).not.toHaveBeenCalled();
+	});
+
+	it("gives a container it finds running as long to answer as a start, until it has answered", async () => {
+		const { container, runtime } = setup({ answerTimeoutMs: 100, readyTimeoutMs: 2_000 });
+		// As after this object restarted while its container was starting.
+		container.running = true;
+		container.execDelayMs = 300;
+
+		await expect(runtime.exec("true")).resolves.toMatchObject({ success: true });
+		await expect(runtime.exec("true")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+	});
+
+	it("gives a container that never answers no more than a start's time, then the usual bound", async () => {
+		const { container, runtime } = setup({ answerTimeoutMs: 100, readyTimeoutMs: 400 });
+		container.running = true;
+		container.execDelayMs = 2_000;
+
+		const first = Date.now();
+		await expect(runtime.exec("true")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		expect(Date.now() - first).toBeGreaterThanOrEqual(350);
+		const second = Date.now();
+		await expect(runtime.exec("true")).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		expect(Date.now() - second).toBeLessThan(300);
+	});
+
+	it("gives a call made while the container starts as long as the start", async () => {
+		const { container, runtime } = await running({ answerTimeoutMs: 100, readyTimeoutMs: 600 });
+		await runtime.stop();
+		// Past the first start's own window, so only the new start's can cover the call.
+		await new Promise((resolve) => setTimeout(resolve, 700));
+		container.execDelayMs = 300;
+
+		const starting = runtime.ensureRunning();
+		// The container counts as running as soon as it is asked to start.
+		while (!container.running) await new Promise((resolve) => setTimeout(resolve, 5));
+		await expect(runtime.exec("true")).resolves.toMatchObject({ success: true });
+		await expect(starting).resolves.toEqual({ ok: true });
+	});
+
+	it("keeps the slot of a container whose stop does not answer, so the stop is tried again", async () => {
+		const { container, capacity, runtime } = await running({ answerTimeoutMs: 100 });
+		container.destroy = () => new Promise<void>(() => {});
+
+		await expect(runtime.stop()).rejects.toThrow(CONTAINER_NOT_ANSWERING);
+		expect(capacity.release).not.toHaveBeenCalled();
 	});
 });
 

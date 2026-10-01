@@ -768,6 +768,35 @@ describe("Sandbox lifetime", () => {
 		});
 	});
 
+	it("keeps its alarm, and later starts, going when the container does not answer its idle stop", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer();
+			install(instance, container);
+			// Before the runtime exists, which takes the bound when it is made.
+			Reflect.set(instance, "containerAnswerMs", 50);
+			await instance.ensureRunning();
+			const agent = builderAgent({ busy: false });
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", agent.binding);
+			container.destroy = () => new Promise<void>(() => {});
+
+			vi.setSystemTime(base + 10 * 60_000);
+			// The platform clears an alarm as it fires it.
+			await state.storage.deleteAlarm();
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				await instance.alarm();
+			} finally {
+				warn.mockRestore();
+			}
+
+			expect(await state.storage.getAlarm()).not.toBeNull();
+			await expect(instance.ensureRunning()).resolves.toEqual({ ok: true });
+		});
+	});
+
 	it("wakes and arms its alarm when the container it finds running does not answer", async () => {
 		// Its own name: a wake-up that never finishes holds this object's input gate.
 		await runInDurableObject(
