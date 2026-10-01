@@ -1151,7 +1151,7 @@ export function createMediaTools(options: {
 	apiToken?: string;
 	cmsBaseUrl?: string;
 }) {
-	return {
+	const tools = {
 		search_unsplash: tool({
 			description:
 				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
@@ -1283,6 +1283,10 @@ export function createMediaTools(options: {
 			},
 		}),
 	};
+	if (options.unsplashAccessKey) return tools;
+	// Every search would fail, so the model is not offered one.
+	const { search_unsplash: _, ...withoutSearch } = tools;
+	return withoutSearch;
 }
 
 /**

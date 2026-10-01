@@ -1210,6 +1210,21 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	});
 });
 
+describe("photo search", () => {
+	it("is offered only with an Unsplash key, since every search fails without one", () => {
+		const options = { apiToken: "test-token", cmsBaseUrl: "https://site.example/" };
+		const keyless = createTools({} as never, toolCallbacks() as never, options);
+		const keyed = createTools({} as never, toolCallbacks() as never, {
+			...options,
+			unsplashAccessKey: "unsplash-key",
+		});
+
+		expect(Object.keys(keyless)).not.toContain("search_unsplash");
+		expect(Object.keys(keyless)).toContain("upload_media");
+		expect(Object.keys(keyed)).toContain("search_unsplash");
+	});
+});
+
 describe("stopped media batch", () => {
 	afterEach(() => vi.unstubAllGlobals());
 
