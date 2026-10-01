@@ -970,13 +970,15 @@ export async function refreshLiveTypes(
  * installed dependencies (pinned by the hashed lockfile), build output, git
  * metadata, local CMS state and static assets. Anything else a check might
  * include, such as generated declarations or a root-level module, changes it.
+ * Symlinks are followed, so a linked file's content counts, and a file it
+ * cannot read fails the digest rather than drop out of it.
  */
 export function typecheckInputsFingerprintCommand(): string {
 	const skipped = ["node_modules", ".git", "dist", ".astro", ".wrangler", "public"]
 		.map((dir) => `-path ./${dir}`)
 		.join(" -o ");
 	return (
-		`find . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
+		`set -o pipefail; find -L . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
 		"| sha256sum | cut -d ' ' -f 1"
 	);
 }

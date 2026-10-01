@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -335,6 +343,31 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 				write("worker-configuration.d.ts", "declare const env: { DB: D1Database }");
 				expect(fingerprint()).not.toBe(first);
 				expect(first).toMatch(/^[0-9a-f]{64}$/);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("fingerprints what symlinks point to, and fails rather than skip a file it cannot read", () => {
+			const root = mkdtempSync(join(tmpdir(), "emdash-fingerprint-"));
+			try {
+				const site = join(root, "site");
+				mkdirSync(join(site, "src"), { recursive: true });
+				writeFileSync(join(site, "src/index.ts"), "export {}");
+				writeFileSync(join(root, "shared.ts"), "export const a = 1;");
+				symlinkSync(join(root, "shared.ts"), join(site, "src/shared.ts"));
+				const fingerprint = () =>
+					spawnSync("bash", ["-c", typecheckInputsFingerprintCommand()], {
+						cwd: site,
+						encoding: "utf8",
+					});
+				const first = fingerprint().stdout.trim();
+				writeFileSync(join(root, "shared.ts"), "export const a: number = 'broken';");
+				expect(fingerprint().stdout.trim()).not.toBe(first);
+
+				writeFileSync(join(site, "src/secret.ts"), "export {}");
+				chmodSync(join(site, "src/secret.ts"), 0o000);
+				expect(fingerprint().status).not.toBe(0);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
