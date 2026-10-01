@@ -66,6 +66,17 @@ function isNotListening(error: unknown): boolean {
 }
 
 /**
+ * The close code to pass on for one received. Reserved codes say what happened
+ * to a connection and cannot be sent: no status becomes a normal close, and an
+ * abnormal or failed connection an internal error, so the far side still closes.
+ */
+export function sendableCloseCode(code: number): number {
+	if (code === 1005) return 1000;
+	if (code === 1004 || code === 1006 || code === 1015) return 1011;
+	return code;
+}
+
+/**
  * Relay a WebSocket between the browser and the container. Holding both ends
  * here keeps this object, and with it the container, awake while a preview
  * tab is open, so HMR survives; the idle policy decides when to stop.
@@ -91,8 +102,7 @@ export function bridgeWebSocket(upstream: Response, sockets?: Set<WebSocket>): R
 		from.addEventListener("close", (event) => {
 			sockets?.delete(server);
 			try {
-				// 1005 and 1006 are reserved: they cannot be sent.
-				to.close(event.code === 1005 || event.code === 1006 ? 1000 : event.code, event.reason);
+				to.close(sendableCloseCode(event.code), event.reason);
 			} catch {
 				// Already closed.
 			}

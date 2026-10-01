@@ -1,7 +1,7 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PORT_TOKENS_KEY } from "../src/worker/preview-tokens.js";
-import type { Sandbox } from "../src/worker/sandbox.js";
+import { sendableCloseCode, type Sandbox } from "../src/worker/sandbox.js";
 import type { SandboxCapacity } from "../src/worker/sandbox-capacity.js";
 
 const testEnv = env as typeof env & {
@@ -188,6 +188,21 @@ describe("Sandbox preview routing", () => {
 			expect(await reached).toBe("from browser");
 			expect(await received).toBe("from vite");
 		});
+	});
+
+	it("passes on a close code it can send for every code it can receive", () => {
+		expect(sendableCloseCode(1000)).toBe(1000);
+		expect(sendableCloseCode(1012)).toBe(1012);
+		expect(sendableCloseCode(4001)).toBe(4001);
+		expect(sendableCloseCode(1005)).toBe(1000);
+		for (const reserved of [1004, 1006, 1015]) expect(sendableCloseCode(reserved)).toBe(1011);
+		// Each mapped code is accepted by close().
+		for (const code of [1000, 1011, 1012]) {
+			const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
+			server.accept();
+			client.accept();
+			expect(() => server.close(code, "test")).not.toThrow();
+		}
 	});
 
 	it("builds the same preview URL the 0.12 SDK issued", async () => {
