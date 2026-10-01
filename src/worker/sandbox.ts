@@ -184,6 +184,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			capacity: {
 				acquire: (holder, options) => capacity().acquire(holder, options),
 				release: (holder) => capacity().release(holder),
+				requeue: (holder) => capacity().requeue(holder),
 			},
 			holder: () => this.name,
 			startOptions: () => this.startOptions(),

@@ -121,6 +121,51 @@ describe("sandbox capacity", () => {
 		});
 	});
 
+	it("puts a start the platform refused back at its place in line", async () => {
+		await withCapacity(1, (capacity) => {
+			capacity.acquire("running");
+			expect(capacity.acquire("first")).toMatchObject({ position: 1 });
+			vi.setSystemTime(1_000_001);
+			expect(capacity.acquire("second")).toMatchObject({ position: 2 });
+			capacity.release("running");
+			vi.setSystemTime(1_000_005);
+			expect(capacity.acquire("first")).toMatchObject({ granted: true });
+
+			// The platform had no instance for it: its slot goes back, its place stays.
+			capacity.requeue("first");
+
+			vi.setSystemTime(1_010_000);
+			expect(capacity.acquire("second")).toMatchObject({ granted: false, position: 2 });
+			expect(capacity.acquire("first")).toMatchObject({ granted: true });
+		});
+	});
+
+	it("keeps the place of a lease taken before places were recorded with it", async () => {
+		await runInDurableObject(testEnv.SandboxCapacity.getByName("global"), (instance, state) => {
+			const sql = state.storage.sql;
+			sql.exec("DROP TABLE leases");
+			sql.exec(`CREATE TABLE leases (
+				holder TEXT PRIMARY KEY,
+				acquired_at INTEGER NOT NULL,
+				expires_at INTEGER NOT NULL,
+				reason TEXT NOT NULL
+			)`);
+			sql.exec("INSERT INTO leases VALUES ('old', 999000, 9999999, 'start')");
+			const instanceEnv = Reflect.get(instance, "env") as Record<string, unknown>;
+			instanceEnv.SANDBOX_MAX_CONCURRENT = "1";
+			// The object starts again over the table an earlier version made.
+			const capacity = new (instance.constructor as new (
+				ctx: DurableObjectState,
+				env: unknown,
+			) => SandboxCapacity)(state, instanceEnv);
+
+			expect(capacity.acquire("waiting")).toMatchObject({ position: 1 });
+			capacity.requeue("old");
+			expect(capacity.acquire("waiting")).toMatchObject({ granted: false, position: 2 });
+			expect(capacity.acquire("old")).toMatchObject({ granted: true });
+		});
+	});
+
 	it("reads the cap from SANDBOX_MAX_CONCURRENT", () => {
 		expect(capacityLimit("25")).toBe(25);
 		expect(capacityLimit(undefined)).toBe(100);

@@ -115,6 +115,7 @@ function setup(
 			async (): Promise<CapacityGrant> => options.grant ?? { granted: true, expiresAt: 0 },
 		),
 		release: vi.fn(async () => {}),
+		requeue: vi.fn(async () => {}),
 	};
 	const fs = files(options.contents);
 	const runtime = new SandboxRuntime({
@@ -205,7 +206,36 @@ describe("starting the container", { timeout: 30_000 }, () => {
 			reason: "capacity",
 			retryAfterMs: 15_000,
 		});
-		expect(capacity.release).toHaveBeenCalledTimes(2);
+		// The platform had no room: the slot goes back, the place in line stays.
+		expect(capacity.release).toHaveBeenCalledTimes(1);
+		expect(capacity.requeue).toHaveBeenCalledWith("project-1");
+	});
+
+	it("keeps the slot of a start already under way when its wait is cancelled", async () => {
+		const { container, capacity, runtime } = setup();
+		let grant!: (value: CapacityGrant) => void;
+		capacity.acquire.mockImplementationOnce(() => new Promise((resolve) => (grant = resolve)));
+
+		const start = runtime.ensureRunning();
+		const cancel = runtime.cancelStart();
+		grant({ granted: true, expiresAt: 0 });
+
+		await expect(start).resolves.toEqual({ ok: true });
+		await cancel;
+		expect(container.running).toBe(true);
+		expect(capacity.release).not.toHaveBeenCalled();
+	});
+
+	it("gives up the place in line of a start that was refused a slot", async () => {
+		const { capacity, runtime } = setup({
+			grant: { granted: false, position: 2, retryAfterMs: 1 },
+		});
+
+		const start = runtime.ensureRunning();
+		await runtime.cancelStart();
+
+		await expect(start).resolves.toMatchObject({ ok: false, position: 2 });
+		expect(capacity.release).toHaveBeenCalledWith("project-1");
 	});
 
 	it("refuses commands until the container runs, instead of starting an empty one", async () => {

@@ -85,6 +85,8 @@ export interface FilesLike {
 export interface CapacityLike {
 	acquire(holder: string, options?: { reason?: string }): Promise<CapacityGrant>;
 	release(holder: string): Promise<void>;
+	/** Give a slot back after the platform refused its start, keeping the place in line. */
+	requeue(holder: string): Promise<void>;
 }
 
 export interface SandboxRuntimeDeps {
@@ -273,6 +275,16 @@ export class SandboxRuntime implements ContainerOps {
 	}
 
 	async cancelStart(): Promise<void> {
+		// A start under way holds a slot it is about to use; only a refused one leaves a place to give up.
+		const starting = this.starting;
+		if (
+			starting &&
+			(await starting.then(
+				(start) => start.ok,
+				() => false,
+			))
+		)
+			return;
 		if (!this.container.running) await this.deps.capacity.release(this.deps.holder());
 	}
 
@@ -311,10 +323,11 @@ export class SandboxRuntime implements ContainerOps {
 			return { ok: true };
 		} catch (error) {
 			await container.destroy().catch(() => undefined);
-			await this.deps.capacity.release(holder).catch(() => undefined);
 			if (isPlatformCapacityError(error)) {
+				await this.deps.capacity.requeue(holder).catch(() => undefined);
 				return { ok: false, reason: "capacity", retryAfterMs: PLATFORM_RETRY_MS };
 			}
+			await this.deps.capacity.release(holder).catch(() => undefined);
 			throw error;
 		}
 	}
