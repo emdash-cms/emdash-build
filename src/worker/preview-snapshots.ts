@@ -1,4 +1,5 @@
 import {
+	isPageNavigation,
 	hasNegotiatedVary,
 	isCredentialedPreviewRequest,
 	isPreviewContentMutation,
@@ -439,6 +440,7 @@ export class PreviewSnapshots {
 			if (isShareablePreviewResponse(request, response)) {
 				try {
 					if ((await this.storePreview(cachePath, response.clone(), generation)) === "invalid") {
+						if (!isPageNavigation(request)) return response;
 						await response.body?.cancel().catch(() => undefined);
 						return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 							status: 503,
@@ -451,6 +453,7 @@ export class PreviewSnapshots {
 			} else if (!isCredentialedPreviewRequest(request)) {
 				const body = await readBodyUpTo(response.clone(), MAX_CACHED_HTML_BYTES);
 				if (!body || !isCompletePublicHtml(new TextDecoder().decode(body))) {
+					if (!isPageNavigation(request)) return response;
 					await response.body?.cancel().catch(() => undefined);
 					return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 						status: 503,
