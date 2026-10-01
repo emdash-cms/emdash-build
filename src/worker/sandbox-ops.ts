@@ -32,7 +32,22 @@ export interface SandboxFileEntry {
 	size: number;
 }
 
+/**
+ * Whether the Sandbox has a running container, or else its place in the queue
+ * for one (`position` is unknown when the platform, not the queue, is full).
+ */
+export type SandboxStart =
+	| { ok: true }
+	| { ok: false; reason: "capacity"; position?: number; retryAfterMs: number };
+
 export interface SandboxOps {
+	/**
+	 * Start the container unless it runs, within the deployment's cap. On 0.12
+	 * the platform's `max_instances` is the cap, so this always succeeds.
+	 */
+	ensureRunning(): Promise<SandboxStart>;
+	/** Give up the site's place in the queue for a container. Does nothing once one runs. */
+	cancelStart(): Promise<void>;
 	exec(command: string, options?: SandboxExecOptions): Promise<SandboxExecResult>;
 	readFile(
 		path: string,

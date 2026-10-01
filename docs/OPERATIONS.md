@@ -141,6 +141,9 @@ replayed with the same key so the control plane reconciles remote identity.
   quarter of the default account limit of 1,500 vCPU. Past the cap, a new
   container waits for the SDK's retries (about two minutes) and then fails, so
   watch for `ContainerUnavailableError` and AI Gateway 429s before raising it.
+  `SANDBOX_MAX_CONCURRENT` holds the same number for the app-owned cap
+  (`SandboxCapacity`) that replaces `max_instances` with Sandbox SDK 1.0; past
+  it, a site shows its place in the queue and starts when a slot frees up.
 - Add provider rate limiting/Turnstile before opening an unrestricted public demo.
 - Expire idle Sandbox compute while retaining source in Artifacts.
 - Commit recovery snapshots from a stable staging copy after initial setup,

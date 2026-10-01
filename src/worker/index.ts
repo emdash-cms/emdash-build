@@ -30,6 +30,7 @@ export { BuilderAgent } from "./agent.js";
 export { ProjectCatalog } from "./project-catalog.js";
 export { ProviderControlPlane } from "./provider-control-plane.js";
 export { Sandbox } from "./sandbox.js";
+export { SandboxCapacity } from "./sandbox-capacity.js";
 export { SiteReadCapability, SiteService } from "./site-service.js";
 
 const app = new Hono<{ Bindings: Env }>();

@@ -146,6 +146,44 @@ describe("preview shell", () => {
 		expect(toolbar?.nextElementSibling?.classList.contains("p-3")).toBe(true);
 	});
 
+	it("says when a new or saved site waits for a free build slot", () => {
+		const { rerender } = render(<PreviewPanel slotWait={{ ahead: 2 }} />);
+		expect(screen.getByText("Waiting for a free build slot")).toBeTruthy();
+		expect(screen.getByText(/2 sites ahead of yours/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{ ahead: 0 }} />);
+		expect(screen.getByText(/Yours is next/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{}} />);
+		expect(screen.getByText(/Every build slot is in use/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{ gaveUp: true }} />);
+		expect(screen.getByText("Every build slot is busy")).toBeTruthy();
+
+		const url = "https://4321-project-token.example.test/";
+		rerender(
+			<PreviewPanel
+				url={url}
+				cmsReady
+				buildComplete
+				reopenState="waking"
+				slotWait={{ ahead: 1 }}
+			/>,
+		);
+		expect(screen.getByRole("status").textContent).toContain("Waiting for a free build slot");
+		expect(screen.getByRole("status").textContent).toContain("1 site ahead of yours");
+		rerender(<PreviewPanel url={url} cmsReady buildComplete reopenState="waking" />);
+		expect(screen.getByRole("status").textContent).toContain("Opening your site");
+		rerender(
+			<PreviewPanel
+				url={url}
+				cmsReady
+				buildComplete
+				reopenState="failed"
+				slotWait={{ gaveUp: true }}
+			/>,
+		);
+		expect(screen.getByRole("alert").textContent).toContain("Every build slot is busy");
+		expect(screen.getByRole("alert").textContent).not.toContain("Couldn't restore");
+	});
+
 	it("keeps the saved preview visible while its editor wakes", async () => {
 		const user = userEvent.setup();
 		const url = "https://4321-project-token.example.test/";

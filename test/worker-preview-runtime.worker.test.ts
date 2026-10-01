@@ -34,7 +34,10 @@ describe("Worker Preview runtime", () => {
 			const refreshPreviewSnapshots = vi.fn(async () => undefined);
 			const broadcast = vi.fn();
 			internals.execRecoveryCommand = commands;
-			internals.sandboxOps = () => ({});
+			internals.sandboxOps = () => ({
+				ensureRunning: async () => ({ ok: true }),
+				cancelStart: async () => {},
+			});
 			internals.getApiToken = () => "test-token";
 			internals.connectMcp = async () => {
 				expect(broadcast).toHaveBeenCalledWith('{"type":"reload"}');

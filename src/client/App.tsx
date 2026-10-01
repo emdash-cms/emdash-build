@@ -639,6 +639,7 @@ function AppInner({
 	const [initialGeneration, setInitialGeneration] = useState<InitialGeneration>();
 	const [buildDurationMs, setBuildDurationMs] = useState<number>();
 	const [previewRestarting, setPreviewRestarting] = useState(false);
+	const [slotWait, setSlotWait] = useState<BuilderState["sandboxWait"]>();
 	const [reopenState, setReopenState] = useState<
 		"waking" | "ready" | "failed" | "unknown" | "needsChat" | undefined
 	>(resuming && session.previewUrl ? "waking" : undefined);
@@ -849,6 +850,7 @@ function AppInner({
 					: undefined,
 			);
 			setPreviewRestarting(state.previewRestarting ?? false);
+			setSlotWait(state.sandboxWait);
 			if (state.previewRestarting) {
 				resumeSawServerWake.current = true;
 				if (resumeOutcomeUnknown.current) setReopenState("waking");
@@ -1813,6 +1815,7 @@ function AppInner({
 											onPreviewPathChange={reportPreviewPath}
 											onRefreshRoute={refreshPreviewRoute}
 											onCheckRouteSnapshot={checkPreviewRoute}
+											slotWait={slotWait}
 										/>
 									</div>
 

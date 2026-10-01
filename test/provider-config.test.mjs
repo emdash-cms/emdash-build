@@ -77,6 +77,16 @@ describe("provider configuration", () => {
 			tag: "v4",
 			new_sqlite_classes: ["SiteService"],
 		});
+		// The app-owned container cap matches the platform cap it will replace.
+		expect(wrangler.migrations.at(-1)).toEqual({
+			tag: "v5",
+			new_sqlite_classes: ["SandboxCapacity"],
+		});
+		expect(wrangler.durable_objects.bindings).toContainEqual({
+			name: "SandboxCapacity",
+			class_name: "SandboxCapacity",
+		});
+		expect(wrangler.vars.SANDBOX_MAX_CONCURRENT).toBe("5");
 		expect(wrangler.secrets.required).toEqual([
 			"UNSPLASH_ACCESS_KEY",
 			"WFP_API_TOKEN",
@@ -140,6 +150,21 @@ describe("provider configuration", () => {
 		expect(wrangler.vars).not.toHaveProperty("IDENTITY_AUDIENCE");
 	});
 
+	it("migrates the same classes in every config version, so an upgrade applies none twice or never", () => {
+		const { siteMediaBucketName: _, ...versionTwo } = { ...config, version: 2 };
+		for (const rendered of [config, versionTwo].map((value) =>
+			renderStudioWrangler(validateProviderConfig(value)),
+		)) {
+			expect(rendered.migrations.map((migration) => migration.tag)).toEqual([
+				"v1",
+				"v2",
+				"v3",
+				"v4",
+				"v5",
+			]);
+		}
+	});
+
 	it("keeps provider config v2 Site-service-unconfigured for compatibility", () => {
 		const legacy = validateProviderConfig({
 			...config,
@@ -154,7 +179,8 @@ describe("provider configuration", () => {
 			name: "SiteService",
 			class_name: "SiteService",
 		});
-		expect(wrangler.migrations).not.toContainEqual({
+		// The class is still migrated, unbound, so a later move to version 3 needs no earlier tag.
+		expect(wrangler.migrations).toContainEqual({
 			tag: "v4",
 			new_sqlite_classes: ["SiteService"],
 		});

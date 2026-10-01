@@ -85,6 +85,7 @@ export function PreviewPanel({
 	onPreviewPathChange,
 	onRefreshRoute,
 	onCheckRouteSnapshot,
+	slotWait,
 }: {
 	url?: string;
 	liveUrl?: string;
@@ -104,6 +105,8 @@ export function PreviewPanel({
 	onRefreshRoute?: (path: string) => Promise<{ refreshed: boolean }>;
 	/** Whether a draft route's server snapshot is current, stale, or absent. */
 	onCheckRouteSnapshot?: (path: string) => Promise<"current" | "stale" | "missing">;
+	/** Set while every build slot is taken: the sites ahead of this one, or that it gave up waiting. */
+	slotWait?: { ahead?: number; gaveUp?: boolean };
 }) {
 	const [tab, setTab] = useState<Tab>("preview");
 	const [target, setTarget] = useState<"draft" | "live">("draft");
@@ -480,6 +483,16 @@ export function PreviewPanel({
 									? "Live site"
 									: sitePath;
 	const toggleView = compact ? onCollapse : onToggleExpanded;
+	const ahead = slotWait?.ahead;
+	const slotsBusy = Boolean(slotWait?.gaveUp);
+	const queueText =
+		!slotWait || slotsBusy
+			? undefined
+			: ahead === undefined
+				? "Every build slot is in use."
+				: ahead === 0
+					? "Yours is next."
+					: `${ahead} ${ahead === 1 ? "site" : "sites"} ahead of yours.`;
 	const toggleViewLabel = compact ? "Close preview" : expanded ? "Restore chat" : "Expand preview";
 
 	return (
@@ -675,24 +688,32 @@ export function PreviewPanel({
 									<h2 className="mt-4 text-base font-semibold text-text-primary">
 										{fallback === "needsChat"
 											? "Continue in chat"
-											: fallback === "failed"
-												? "Couldn't restore this saved site"
-												: fallback === "error"
-													? "Preview couldn't load"
-													: fallback === "unknown"
-														? "Still reconnecting"
-														: "Opening your site"}
+											: fallback === "failed" && slotsBusy
+												? "Every build slot is busy"
+												: fallback === "failed"
+													? "Couldn't restore this saved site"
+													: fallback === "error"
+														? "Preview couldn't load"
+														: fallback === "unknown"
+															? "Still reconnecting"
+															: queueText
+																? "Waiting for a free build slot"
+																: "Opening your site"}
 									</h2>
 									<p className="mt-1 max-w-xs text-sm text-text-secondary">
 										{fallback === "needsChat"
 											? "The site build isn't finished. Answer any questions or resume the build in chat."
-											: fallback === "failed"
-												? "The editor couldn't be restored. Try again or check Logs for details."
-												: fallback === "error"
-													? "The site isn't responding yet. Try reloading this page."
-													: fallback === "unknown"
-														? "The connection dropped while your site was waking. It may still be restoring."
-														: "Waking the editor and restoring your saved site. This can take a moment."}
+											: fallback === "failed" && slotsBusy
+												? "Your site is safe. Try again in a few minutes."
+												: fallback === "failed"
+													? "The editor couldn't be restored. Try again or check Logs for details."
+													: fallback === "error"
+														? "The site isn't responding yet. Try reloading this page."
+														: fallback === "unknown"
+															? "The connection dropped while your site was waking. It may still be restoring."
+															: queueText
+																? `${queueText} Your saved site opens as soon as a slot is free.`
+																: "Waking the editor and restoring your saved site. This can take a moment."}
 									</p>
 									{fallback === "needsChat" ? null : fallback === "failed" ||
 									  fallback === "unknown" ||
@@ -727,9 +748,17 @@ export function PreviewPanel({
 							<span className="h-1.5 w-1.5 animate-[status-pulse_1.4s_ease-in-out_infinite] rounded-full bg-text-tertiary [animation-delay:0.4s]" />
 						</div>
 						<div className="text-center">
-							<p className="text-sm font-medium text-text-secondary">Preparing your site</p>
+							<p className="text-sm font-medium text-text-secondary">
+								{slotsBusy
+									? "Every build slot is busy"
+									: queueText
+										? "Waiting for a free build slot"
+										: "Preparing your site"}
+							</p>
 							<p className="mt-1 text-xs text-text-tertiary">
-								The preview will appear here automatically.
+								{slotsBusy
+									? "Send a message to try again in a few minutes."
+									: `${queueText ? `${queueText} ` : ""}The preview will appear here automatically.`}
 							</p>
 						</div>
 					</div>

@@ -52,6 +52,10 @@
 				"name": "SiteService",
 				"class_name": "SiteService",
 			},
+			{
+				"name": "SandboxCapacity",
+				"class_name": "SandboxCapacity",
+			},
 		],
 	},
 	"migrations": [
@@ -70,6 +74,10 @@
 		{
 			"tag": "v4",
 			"new_sqlite_classes": ["SiteService"],
+		},
+		{
+			"tag": "v5",
+			"new_sqlite_classes": ["SandboxCapacity"],
 		},
 	],
 	"ai": {
@@ -139,6 +147,7 @@
 		"PREVIEW_HOSTNAME": "build.emdashcms.com",
 		"ENABLE_PUBLIC_PUBLISHING": "false",
 		"ENABLE_CMS_SCRIPTS": "true",
+		"SANDBOX_MAX_CONCURRENT": "100",
 		"SITES_HOSTNAME": "build.emdashcms.com",
 		"BRANDED_SITES_HOSTNAME": "em-da.sh",
 		"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
@@ -191,6 +200,10 @@
 					"name": "SiteService",
 					"class_name": "SiteService",
 				},
+				{
+					"name": "SandboxCapacity",
+					"class_name": "SandboxCapacity",
+				},
 			],
 		},
 		"ai": {
@@ -242,6 +255,7 @@
 			"ENABLE_PUBLIC_PUBLISHING": "false",
 			"ENABLE_CMS_SCRIPTS": "true",
 			"SANDBOX_PREVIEW_MODE": "quick-tunnel",
+			"SANDBOX_MAX_CONCURRENT": "10",
 			"SITES_HOSTNAME": "build.emdashcms.com",
 			"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
 			"WFP_ACCOUNT_ID": "1f74638c495bc9f0330ce5c8e64c1b6b",

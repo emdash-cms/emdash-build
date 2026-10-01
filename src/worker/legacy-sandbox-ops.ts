@@ -55,6 +55,13 @@ export function legacySandboxOps(
 	}
 
 	const ops: SandboxOps = {
+		async ensureRunning() {
+			// The first command starts the container, within the platform's max_instances.
+			return { ok: true };
+		},
+
+		async cancelStart() {},
+
 		async exec(command, { concurrent, ...execOptions }: SandboxExecOptions = {}) {
 			// Looked up each time: a restarted container does not keep its sessions.
 			const runner = concurrent ? await session(SIDE_SESSION_ID) : sandbox;

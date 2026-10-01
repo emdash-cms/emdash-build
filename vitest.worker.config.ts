@@ -17,6 +17,7 @@ export default defineConfig({
 					BuilderAgent: { className: "BuilderAgent", useSQLite: true },
 					ProviderControlPlane: { className: "ProviderControlPlane", useSQLite: true },
 					SiteService: { className: "SiteService", useSQLite: true },
+					SandboxCapacity: { className: "SandboxCapacity", useSQLite: true },
 				},
 				workerLoaders: { LOADER: {} },
 				bindings: {

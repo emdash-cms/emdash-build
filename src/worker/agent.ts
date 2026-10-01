@@ -266,6 +266,8 @@ const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
 const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
+/** How long opening a site waits in the queue for a sandbox slot before giving up. */
+const SANDBOX_WAIT_MAX_MS = 10 * 60_000;
 const PRODUCTION_SNAPSHOT_PORT = 4322;
 const SNAPSHOT_PREPARATION_TIMEOUT_MS = 6 * 60_000;
 type PublishRunPhase =
@@ -576,6 +578,27 @@ export interface BuilderState extends BuilderReadinessState {
 	appHost?: string;
 	/** Next-step prompts for the composer, from a small model after the latest successful build. */
 	suggestions?: Suggestion[];
+	/**
+	 * Every sandbox slot is taken: the site waits behind `ahead` others (unknown
+	 * when the platform is full), or `gaveUp` waiting until it is retried.
+	 */
+	sandboxWait?: { ahead?: number; gaveUp?: boolean };
+}
+
+/** Resolve after `ms`, or reject with the abort reason as soon as `signal` aborts. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(signal.reason);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal!.reason);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 /** True for hosts that resolve to the local machine (dev servers). */
@@ -1320,7 +1343,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private buildActivityChain: Promise<void> = Promise.resolve();
 
 	private hasProgressInState(): boolean {
-		return Boolean(this.state.status || this.state.previewRestarting || this.state.turnActive);
+		return Boolean(
+			this.state.status ||
+			this.state.previewRestarting ||
+			this.state.turnActive ||
+			this.isWaitingForSandbox(),
+		);
+	}
+
+	private isWaitingForSandbox(): boolean {
+		return Boolean(this.state.sandboxWait && !this.state.sandboxWait.gaveUp);
 	}
 
 	override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
@@ -1790,7 +1822,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!stale && Boolean(this.state.turnActive) === active) return;
 		this.setState({
 			...this.state,
-			...(stale && { status: "", previewRestarting: false }),
+			...(stale && {
+				status: "",
+				previewRestarting: false,
+				...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
+			}),
 			turnActive: active,
 		});
 	}
@@ -3250,6 +3286,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async doRecoverSite(hostname: string): Promise<SiteRecoveryResult> {
+		const started = await this.waitForSandbox();
+		if (!started.ok) return { ready: false, error: started.error };
 		let sandbox = this.sandboxOps();
 
 		// Probe the listening socket, not `/`. A warm Astro process can spend
@@ -3349,6 +3387,59 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (await this.connectMcp(exposed.url, apiToken)) this.markMilestone("agentToolsReady");
 		}
 		return { ready: true, previewUrl: exposed.url };
+	}
+
+	/**
+	 * Get the site a running container. When every slot in the deployment is
+	 * taken the Sandbox reports the site's place in the queue: show it and ask
+	 * again until a slot frees up or `SANDBOX_WAIT_MAX_MS` passes.
+	 */
+	private async waitForSandbox(
+		signal?: AbortSignal,
+	): Promise<{ ok: true } | { ok: false; error: string }> {
+		const deadline = Date.now() + SANDBOX_WAIT_MAX_MS;
+		const status = this.state.status ?? "";
+		let waited = false;
+		let started = false;
+		let gaveUp = false;
+		try {
+			for (;;) {
+				signal?.throwIfAborted();
+				const start = await this.sandboxOps().ensureRunning();
+				if (start.ok) {
+					started = true;
+					return { ok: true };
+				}
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) {
+					gaveUp = true;
+					return {
+						ok: false,
+						error: "Every build slot is still busy. Try again in a few minutes.",
+					};
+				}
+				waited = true;
+				const ahead = start.position === undefined ? undefined : Math.max(0, start.position - 1);
+				if (this.state.sandboxWait?.ahead !== ahead || !this.state.sandboxWait) {
+					this.setState({ ...this.state, sandboxWait: { ahead } });
+				}
+				this.sendStatus(
+					ahead
+						? `Waiting for a free build slot (${ahead} ahead)...`
+						: "Waiting for a free build slot...",
+				);
+				await abortableDelay(Math.min(start.retryAfterMs, remaining), signal);
+			}
+		} finally {
+			// A place left in the queue would hold up the sites behind it.
+			if (!started)
+				await this.sandboxOps()
+					.cancelStart()
+					.catch(() => undefined);
+			if (gaveUp) this.setState({ ...this.state, sandboxWait: { gaveUp: true } });
+			else if (this.state.sandboxWait) this.setState({ ...this.state, sandboxWait: undefined });
+			if (waited) this.sendStatus(status);
+		}
 	}
 
 	/** Wake and restore an established site as soon as its sidebar route opens. */
@@ -4232,8 +4323,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 		const sandbox = this.sandboxOps();
 		const templateDir = BUILDER_TEMPLATE_DIR;
+		let containerReady = false;
 
 		try {
+			const started = await this.waitForSandbox(signal);
+			if (!started.ok) throw new Error(started.error);
+			containerReady = true;
 			this.markMilestone("containerStarting");
 			// Prepared templates include their dependency trees in the image. Retain a
 			// network fallback so older images and local development remain recoverable.
@@ -4342,7 +4437,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return { ready: true, previewUrl: exposed.url };
 		} catch (err) {
 			if (signal?.aborted) {
-				if (!this.state.siteReady) await this.stopDevServer();
+				// No container means no dev server, and nothing to run commands in.
+				if (!this.state.siteReady && containerReady) await this.stopDevServer();
 				this.sendStatus("");
 				return { ready: false, stopped: true };
 			}
@@ -6939,7 +7035,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	override async onStart(): Promise<void> {
 		if (!this.stateWrittenHere && this.hasProgressInState()) {
 			// A recovered turn marks itself active again when it resumes.
-			this.setState({ ...this.state, status: "", previewRestarting: false, turnActive: false });
+			this.setState({
+				...this.state,
+				status: "",
+				previewRestarting: false,
+				turnActive: false,
+				...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
+			});
 		}
 		if (this.state.initialGeneration?.status === "stopping") {
 			this.setInitialGenerationStatus("stopped", this.state.initialGeneration.terminalMessageId);
