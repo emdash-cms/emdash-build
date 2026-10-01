@@ -627,6 +627,39 @@ describe("Sandbox lifetime", () => {
 		});
 	});
 
+	it("keeps a container that failed to stop, and its slot, until the alarm tries again", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			const agent = builderAgent({ busy: false });
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", agent.binding);
+			container.destroy = async () => {
+				throw new Error("destroy failed");
+			};
+
+			vi.setSystemTime(base + 10 * 60_000);
+			// The platform clears an alarm as it fires it.
+			await state.storage.deleteAlarm();
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				await instance.alarm();
+			} finally {
+				warn.mockRestore();
+			}
+
+			expect(container.state.running).toBe(true);
+			expect(agent.markSandboxStopped).not.toHaveBeenCalled();
+			expect(await state.storage.getAlarm()).not.toBeNull();
+			await expect(instance.ensureRunning()).resolves.toEqual({ ok: true });
+		});
+		const stats = await runInDurableObject(capacityStub(), (capacity) => capacity.stats());
+		expect(stats.active).toBe(1);
+	});
+
 	it("asks BuilderAgent before stopping a container it never saw used", async () => {
 		await runInDurableObject(stub(), async (instance, state) => {
 			// A container left running by the 0.12 SDK: no activity was ever recorded.

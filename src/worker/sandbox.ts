@@ -339,6 +339,11 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		this.stopping = stopping;
 		try {
 			await stopping;
+		} catch (error) {
+			// Still running, with its slot: the next alarm tries again, rather than
+			// the platform's few alarm retries.
+			console.warn("[Sandbox] could not stop the idle container:", error);
+			if (!this.deleted) await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
 		} finally {
 			if (this.stopping === stopping) this.stopping = undefined;
 		}
@@ -381,7 +386,8 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 	}
 
 	async ensureRunning(): Promise<SandboxStart> {
-		await this.stopping;
+		// A stop that failed leaves the container running; the next alarm tries again.
+		await this.stopping?.catch(() => undefined);
 		const start = await this.runtime().ensureRunning();
 		if (start.ok) {
 			this.touch();

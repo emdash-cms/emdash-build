@@ -238,6 +238,33 @@ describe("starting the container", { timeout: 30_000 }, () => {
 		expect(capacity.release).toHaveBeenCalledWith("project-1");
 	});
 
+	it("keeps the slot of a container that failed to stop, so the stop is tried again", async () => {
+		const { container, capacity, runtime } = await running();
+		container.destroy = async () => {
+			throw new Error("destroy failed");
+		};
+
+		await expect(runtime.stop()).rejects.toThrow("destroy failed");
+		expect(container.running).toBe(true);
+		expect(capacity.release).not.toHaveBeenCalled();
+	});
+
+	it("answers calls made while the container stops as not running, so callers restore it", async () => {
+		const { container, runtime } = await running();
+		let destroyed!: () => void;
+		const destroy = container.destroy.bind(container);
+		container.destroy = () =>
+			new Promise<void>((resolve) => {
+				destroyed = () => void destroy().then(resolve);
+			});
+
+		const stopping = runtime.stop();
+		await expect(runtime.exec("true")).rejects.toThrow(NOT_RUNNING);
+		await expect(runtime.readFile("/home/user/site/package.json")).rejects.toThrow(NOT_RUNNING);
+		destroyed();
+		await stopping;
+	});
+
 	it("refuses commands until the container runs, instead of starting an empty one", async () => {
 		const { container, runtime } = setup();
 		await expect(runtime.exec("true")).rejects.toThrow(NOT_RUNNING);

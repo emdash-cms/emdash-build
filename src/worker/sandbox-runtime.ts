@@ -243,6 +243,7 @@ function killer(process: ExecProcess) {
 
 export class SandboxRuntime implements ContainerOps {
 	private starting?: Promise<SandboxStart>;
+	private stopping = false;
 
 	constructor(private readonly deps: SandboxRuntimeDeps) {}
 
@@ -255,7 +256,8 @@ export class SandboxRuntime implements ContainerOps {
 	}
 
 	private requireRunning(): ContainerLike {
-		if (!this.container.running) throw new Error(NOT_RUNNING);
+		// A container being stopped is as good as stopped: callers restore the site.
+		if (!this.container.running || this.stopping) throw new Error(NOT_RUNNING);
 		return this.container;
 	}
 
@@ -334,7 +336,19 @@ export class SandboxRuntime implements ContainerOps {
 
 	/** Stop the container and give its slot back. */
 	async stop(): Promise<void> {
-		if (this.container.running) await this.container.destroy().catch(() => undefined);
+		this.stopping = true;
+		try {
+			if (this.container.running) {
+				try {
+					await this.container.destroy();
+				} catch (error) {
+					// Still running, it keeps its slot, and the caller tries again.
+					if (this.container.running) throw error;
+				}
+			}
+		} finally {
+			this.stopping = false;
+		}
 		await this.deps.capacity.release(this.deps.holder()).catch(() => undefined);
 	}
 
