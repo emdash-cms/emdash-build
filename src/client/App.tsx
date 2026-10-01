@@ -67,6 +67,7 @@ import {
 } from "./recent-projects.js";
 import { initialGenerationForDisplay, isInitialGenerationActive } from "./initial-generation.js";
 import { useProjectListRefresh } from "./use-project-refresh.js";
+import { useSandboxHeartbeat } from "./sandbox-heartbeat.js";
 import { toasts } from "./toasts.js";
 import {
 	messageDeliveryStatus,
@@ -1158,6 +1159,7 @@ function AppInner({
 		resumeRequested.current = true;
 		retryRecovery();
 	}, [resuming, retryRecovery]);
+	useSandboxHeartbeat(agent);
 	// Coming back to a tab whose idle editor was stopped resumes it.
 	useEffect(() => {
 		const resumeWhenSeen = () => {

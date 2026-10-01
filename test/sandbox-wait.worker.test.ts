@@ -373,3 +373,27 @@ describe("the tools' view of the Sandbox", () => {
 		});
 	});
 });
+
+describe("the owner's heartbeat", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("keeps the Sandbox's container from its idle stop once the site exists", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000040");
+		await runInDurableObject(agent, async (instance) => {
+			const touch = vi.fn(async () => undefined);
+			Reflect.set(Reflect.get(instance, "env") as object, "Sandbox", {
+				getByName: () => ({ touch }),
+			});
+			const harness = instance as unknown as { keepSandboxAwake(): Promise<void> };
+
+			await harness.keepSandboxAwake();
+			expect(touch).not.toHaveBeenCalled();
+
+			instance.setState({ ...instance.state, siteReady: true });
+			await harness.keepSandboxAwake();
+			expect(touch).toHaveBeenCalledOnce();
+		});
+	});
+});

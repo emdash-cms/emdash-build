@@ -3566,6 +3566,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
+	/** The owner's builder tab is in use: keep the container from its idle stop. */
+	async keepSandboxAwake(): Promise<void> {
+		if (!this.state.siteReady || this.isDeletionPending()) return;
+		await this.env.Sandbox.getByName(this.name).touch();
+	}
+
 	/** Wake and restore an established site as soon as its sidebar route opens. */
 	async resumePreview(appHost?: string): Promise<SiteRecoveryResult> {
 		if (this.isDeletionPending()) return { ready: false, error: "This site was deleted." };
@@ -7530,6 +7536,15 @@ callable({
 })(BuilderAgent.prototype.resumePreview, {
 	kind: "method",
 	name: "resumePreview",
+	static: false,
+	private: false,
+} as ClassMethodDecoratorContext);
+
+callable({
+	description: "Keep the site's container from its idle stop while the owner uses the builder.",
+})(BuilderAgent.prototype.keepSandboxAwake, {
+	kind: "method",
+	name: "keepSandboxAwake",
 	static: false,
 	private: false,
 } as ClassMethodDecoratorContext);
