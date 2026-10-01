@@ -16,7 +16,12 @@ import {
 } from "./preview-tokens.js";
 import { CAPACITY_LEASE_TTL_MS } from "./sandbox-capacity.js";
 import type { SandboxExecOptions, SandboxOps, SandboxStart } from "./sandbox-ops.js";
-import { SAFETY_INACTIVITY_MS, SandboxRuntime, type ContainerLike } from "./sandbox-runtime.js";
+import {
+	CONTAINER_ANSWER_MS,
+	SAFETY_INACTIVITY_MS,
+	SandboxRuntime,
+	type ContainerLike,
+} from "./sandbox-runtime.js";
 
 export type { PreviewRefreshResult, PreviewSnapshotState } from "./preview-snapshots.js";
 
@@ -141,6 +146,8 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 	private stopping?: Promise<void>;
 	/** How long an alarm waits for BuilderAgent to agree to an idle stop. */
 	private prepareStopTimeoutMs = 60_000;
+	/** How long this object waits on a container call before going on without it. */
+	private containerAnswerMs = CONTAINER_ANSWER_MS;
 	private nameStored = false;
 	/** The site was deleted; an alarm already running must not take its slot back. */
 	private deleted = false;
@@ -163,8 +170,12 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			// A new version of this object finds its container still running with the
 			// old version's timeout, which a restart does not keep.
 			const container = this.container();
+			// Unbounded, a container that does not answer would reset this object on every request.
 			if (container?.running) {
-				await container.setInactivityTimeout(SAFETY_INACTIVITY_MS).catch(() => undefined);
+				await this.answered(
+					"set the container's inactivity timeout",
+					container.setInactivityTimeout(SAFETY_INACTIVITY_MS),
+				);
 				await this.armAlarm();
 			}
 		});
@@ -310,8 +321,21 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 				return;
 			}
 		}
-		await container.setInactivityTimeout(SAFETY_INACTIVITY_MS);
+		await this.answered(
+			"renew the container's inactivity timeout",
+			container.setInactivityTimeout(SAFETY_INACTIVITY_MS),
+		);
 		if (!this.deleted) await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+	}
+
+	/** Wait on a container call, but go on, with a warning, if it fails or does not answer. */
+	private async answered(what: string, call: Promise<unknown>): Promise<void> {
+		const settled = await settleWithin(call, this.containerAnswerMs);
+		if (settled.status === "fulfilled") return;
+		console.warn(
+			`[Sandbox] could not ${what}:`,
+			settled.status === "rejected" ? settled.reason : "the container did not answer",
+		);
 	}
 
 	/** Renew the running container's slot, or take it again, past the cap if need be, if it lapsed. */
@@ -389,7 +413,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		this.deleted = true;
 		const container = this.container();
 		this.closeSockets();
-		if (container?.running) await container.destroy().catch(() => undefined);
+		if (container?.running) await this.answered("destroy the container", container.destroy());
 		await this.releaseSlot();
 		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();

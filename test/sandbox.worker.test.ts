@@ -743,6 +743,77 @@ describe("Sandbox lifetime", () => {
 		});
 	});
 
+	it("keeps its alarm going when the container's call fails or stops answering", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			Reflect.set(instance, "containerAnswerMs", 50);
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				for (const misbehave of [
+					() => Promise.reject(new Error("internal error")),
+					// Local workerd does this for a container that died unnoticed.
+					() => new Promise<void>(() => {}),
+				]) {
+					container.setInactivityTimeout = misbehave;
+					// The platform clears an alarm as it fires it.
+					await state.storage.deleteAlarm();
+					await instance.alarm();
+					expect(await state.storage.getAlarm()).not.toBeNull();
+				}
+			} finally {
+				warn.mockRestore();
+			}
+		});
+	});
+
+	it("wakes and arms its alarm when the container it finds running does not answer", async () => {
+		// Its own name: a wake-up that never finishes holds this object's input gate.
+		await runInDurableObject(
+			stub("66666666-6666-4666-8666-666666666666"),
+			async (instance, state) => {
+				const container = fakeContainer();
+				container.state.running = true;
+				container.setInactivityTimeout = () => new Promise<void>(() => {});
+				// The object as a new version wakes, finding its container running.
+				Object.defineProperty(state, "container", { value: container, configurable: true });
+				const Woken = instance.constructor as new (
+					ctx: DurableObjectState,
+					env: unknown,
+				) => Sandbox;
+				const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+				try {
+					const woken = new Woken(state, Reflect.get(instance, "env"));
+					// Read after the wake-up's first storage read, so the test's bound applies.
+					Reflect.set(woken, "containerAnswerMs", 50);
+					// Ten times the bound; the alarm is the wake-up's last step.
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					expect(await state.storage.getAlarm()).not.toBeNull();
+				} finally {
+					warn.mockRestore();
+					Reflect.deleteProperty(state, "container");
+				}
+			},
+		);
+	});
+
+	it("deletes a site whose container does not answer", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			Reflect.set(instance, "containerAnswerMs", 50);
+			container.destroy = () => new Promise<void>(() => {});
+
+			await instance.deleteProjectData();
+
+			expect(await state.storage.getAlarm()).toBeNull();
+		});
+		const stats = await runInDurableObject(capacityStub(), (capacity) => capacity.stats());
+		expect(stats.active).toBe(0);
+	});
+
 	it("deletes the container, its slot and everything stored", async () => {
 		await runInDurableObject(stub(), async (instance, state) => {
 			const container = fakeContainer();

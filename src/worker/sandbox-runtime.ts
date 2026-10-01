@@ -42,6 +42,11 @@ export const BASE_ENV: Readonly<Record<string, string>> = {
 };
 /** A backstop only: the Sandbox's idle policy stops the container long before this. */
 export const SAFETY_INACTIVITY_MS = 15 * 60_000;
+/**
+ * How long a container call that answers at once may take. A container that
+ * died without the platform noticing can leave every call waiting for good.
+ */
+export const CONTAINER_ANSWER_MS = 15_000;
 const READY_TIMEOUT_MS = 30_000;
 /** Every command runs under GNU timeout, which passes Stop on to the command's children. */
 const UNTIMED_COMMAND_SECONDS = 24 * 60 * 60;
