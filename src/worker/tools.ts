@@ -17,12 +17,11 @@ import {
 	type MutationScope,
 } from "./build-convergence.js";
 import { auditPublicSite } from "./public-site-audit.js";
-import { isSandboxRuntimeReplacement } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-import type { SandboxOps } from "./sandbox-ops.js";
+import { isSandboxNotRunning, type SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -221,7 +220,7 @@ async function readOneTextFile(
 		return { path: path.path, success: true, content, bytes };
 	} catch (error) {
 		await reader?.cancel().catch(() => {});
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			path: path.path,
 			success: false,
@@ -323,7 +322,7 @@ const PROTECTED_FILE_NOTICE = "emdash-build-guard: ";
  * Wrap a shell command (run from the site root) so protected site files
  * survive it: copy them aside first, then restore any the command changed
  * or deleted and report each on stderr. The command's exit status is kept.
- * Runs in a subshell so `exit` never ends the sandbox's shared session.
+ * Runs in a subshell, so the guard's own `exit` ends only the guard.
  *
  * This catches accidental edits, not a determined model: it shares the
  * command's permissions, and background processes can outlive it. The
@@ -762,7 +761,7 @@ export async function refreshLiveTypes(
 			redirect: "manual",
 		});
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -790,7 +789,7 @@ export async function refreshLiveTypes(
 		try {
 			detail = await readResponseTextBounded(response, 1000);
 		} catch (error) {
-			if (isSandboxRuntimeReplacement(error)) throw error;
+			if (isSandboxNotRunning(error)) throw error;
 			detail = error instanceof Error ? error.message : String(error);
 		}
 		return {
@@ -804,7 +803,7 @@ export async function refreshLiveTypes(
 	try {
 		types = await readResponseTextBounded(response, TYPEGEN_MAX_BYTES);
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -865,7 +864,7 @@ async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string |
 		const digest = result.stdout.trim();
 		return result.success && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return undefined;
 	}
 }
@@ -873,7 +872,6 @@ async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string |
 async function auditSandboxPublicSite(sandbox: SandboxOps): Promise<PublicSiteAuditResult> {
 	const fetchPage = (path: string) => {
 		const url = new URL(path, "http://localhost:4321");
-		// Only serializable init: the request owns its container-start and request timeouts.
 		return sandbox.fetchPort(4321, url.toString(), {
 			headers: { Accept: "text/html" },
 			redirect: "manual",
@@ -1925,10 +1923,8 @@ export function createTools(
 					};
 				}
 				return trackedMutation(async () => {
-					// The SDK request timeout does not reliably kill a child process. A
-					// hung curl then owns the default command session and every later exec
-					// queues behind it. Enforce the deadline inside the container and leave
-					// a small outer margin for the termination result to cross RPC.
+					// The model's deadline is enforced inside the container, with a small
+					// outer margin for the termination result to cross RPC.
 					const boundedCommand =
 						`timeout --signal=TERM --kill-after=2s 12s ` + `bash -lc ${shellQuote(command)}`;
 					const result = await currentSandbox().exec(guardProtectedFiles(boundedCommand), {

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
@@ -150,11 +151,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(checkpointSite).toHaveBeenCalledOnce();
 	});
 
-	it("retries live typegen with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries live typegen once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const types = 'declare module "emdash" { interface EmDashCollections {} }';
 		const oldSandbox = { fetchPort: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
@@ -215,11 +213,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(result.stderr).toContain("Unable to render RichText because it is undefined!");
 	});
 
-	it("retries a safe read with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries a safe read once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const oldSandbox = { readFile: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
 			readFile: vi.fn(async () => ({ success: true, content: "recovered" })),

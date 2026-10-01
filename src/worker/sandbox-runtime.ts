@@ -5,12 +5,13 @@
  * Results keep the shapes `SandboxOps` promises.
  */
 import type { CapacityGrant } from "./sandbox-capacity.js";
-import type {
-	SandboxExecOptions,
-	SandboxExecResult,
-	SandboxFileEntry,
-	SandboxOps,
-	SandboxStart,
+import {
+	NOT_RUNNING,
+	type SandboxExecOptions,
+	type SandboxExecResult,
+	type SandboxFileEntry,
+	type SandboxOps,
+	type SandboxStart,
 } from "./sandbox-ops.js";
 import {
 	FOLLOW_PROCESS,
@@ -48,8 +49,6 @@ const UNTIMED_COMMAND_SECONDS = 24 * 60 * 60;
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
 const PLATFORM_RETRY_MS = 15_000;
 const TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
-
-export const NOT_RUNNING = "SANDBOX_NOT_RUNNING: The site's container is not running.";
 
 export type ContainerLike = Pick<
 	Container,
@@ -153,6 +152,11 @@ export class SandboxRuntime implements ContainerOps {
 	private requireRunning(): ContainerLike {
 		if (!this.container.running) throw new Error(NOT_RUNNING);
 		return this.container;
+	}
+
+	/** A start is under way: its slot is taken, though the container may not run yet. */
+	get startInFlight(): boolean {
+		return this.starting !== undefined;
 	}
 
 	ensureRunning(): Promise<SandboxStart> {

@@ -30,22 +30,3 @@ export function previewTokenFromUrl(
 		return undefined;
 	}
 }
-
-/** Errors that mean the Sandbox DO was reset while its container was waking. */
-export function isSandboxWakeReset(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error);
-	return /blockConcurrencyWhile\(\).*waited for too long|durable object.*(?:reset|canceled)|object reset/i.test(
-		message,
-	);
-}
-
-export function isSandboxRuntimeReplacement(error: unknown): boolean {
-	if (!error || typeof error !== "object") return false;
-	const { code, context } = error as { code?: unknown; context?: unknown };
-	return (
-		code === "OPERATION_INTERRUPTED" &&
-		Boolean(context) &&
-		typeof context === "object" &&
-		(context as { reason?: unknown }).reason === "runtime_replaced"
-	);
-}

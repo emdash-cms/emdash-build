@@ -86,6 +86,7 @@ export function PreviewPanel({
 	onRefreshRoute,
 	onCheckRouteSnapshot,
 	slotWait,
+	paused = false,
 }: {
 	url?: string;
 	liveUrl?: string;
@@ -107,6 +108,8 @@ export function PreviewPanel({
 	onCheckRouteSnapshot?: (path: string) => Promise<"current" | "stale" | "missing">;
 	/** Set while every build slot is taken: the sites ahead of this one, or that it gave up waiting. */
 	slotWait?: { ahead?: number; gaveUp?: boolean };
+	/** The idle editor was stopped; `onRetryRecovery` resumes it. */
+	paused?: boolean;
 }) {
 	const [tab, setTab] = useState<Tab>("preview");
 	const [target, setTarget] = useState<"draft" | "live">("draft");
@@ -219,8 +222,17 @@ export function PreviewPanel({
 	// The iframe's src is owned imperatively: in-page navigation must never
 	// be overwritten by a React re-render, and reload must keep the route.
 	const frameKey = frameBase ? `${tab}:${frameBase}` : "";
+	// The draft site and Admin both need the editor's container; the live site does not.
+	const pausedFrame = paused && (tab === "admin" || target === "draft");
+	const pausedFrameRef = useRef(pausedFrame);
+	pausedFrameRef.current = pausedFrame;
+	const unloadedForPause = useRef(false);
 	useEffect(() => {
 		if (!frameKey || !frameBase) return;
+		if (pausedFrameRef.current) {
+			unloadedForPause.current = true;
+			return;
+		}
 		loadFrame(
 			tab === "preview"
 				? new URL(sitePathRef.current, frameBase).href
@@ -228,6 +240,20 @@ export function PreviewPanel({
 		);
 		// Only a frame target change (tab, draft/live, project) reloads here.
 	}, [frameKey]);
+
+	// A paused editor has no dev server: unload its frame so the HMR client stops
+	// polling, and load the route again once the editor resumes.
+	useEffect(() => {
+		const iframe = iframeRef.current;
+		if (pausedFrame) {
+			if (iframe && !unloadedForPause.current) iframe.src = "about:blank";
+			unloadedForPause.current = true;
+			return;
+		}
+		if (!unloadedForPause.current) return;
+		unloadedForPause.current = false;
+		if (currentHrefRef.current) loadFrame(currentHrefRef.current);
+	}, [pausedFrame, loadFrame]);
 
 	// Agent mutations broadcast a reload; coalesce bursts from consecutive
 	// tools. They change the draft only, so Admin and live-site views are left alone.
@@ -440,24 +466,31 @@ export function PreviewPanel({
 		target === "draft" &&
 		Boolean(frameBase) &&
 		(buildComplete || reopenState !== undefined);
-	const fallback = !draftFallback
-		? undefined
-		: reopenState === "failed" || reopenState === "unknown" || reopenState === "needsChat"
-			? reopenState
-			: frameStatus === "ready"
+	const fallback =
+		pausedFrame && frameBase
+			? "paused"
+			: !draftFallback
 				? undefined
-				: reopenState === "waking"
-					? "waking"
-					: frameStatus === "error"
-						? "error"
-						: "loading";
+				: reopenState === "failed" || reopenState === "unknown" || reopenState === "needsChat"
+					? reopenState
+					: frameStatus === "ready"
+						? undefined
+						: reopenState === "waking"
+							? "waking"
+							: frameStatus === "error"
+								? "error"
+								: "loading";
 	const savedPreview = draftFallback && reopenState === "waking" && frameStatus === "ready";
 	const editorWaking =
 		(previewRestarting || reopenState === "waking" || reopenState === "unknown") &&
 		target === "draft" &&
 		Boolean(url);
 	const previewBlocked =
-		editorWaking || fallback === "failed" || fallback === "error" || fallback === "needsChat";
+		editorWaking ||
+		fallback === "failed" ||
+		fallback === "error" ||
+		fallback === "needsChat" ||
+		fallback === "paused";
 	const adminAvailable =
 		cmsReady &&
 		!previewRestarting &&
@@ -465,7 +498,8 @@ export function PreviewPanel({
 		reopenState !== "unknown" &&
 		reopenState !== "failed" &&
 		reopenState !== "needsChat" &&
-		fallback !== "error";
+		fallback !== "error" &&
+		fallback !== "paused";
 	const addressLabel =
 		reopenState === "unknown" && target === "draft"
 			? "Reconnecting…"
@@ -473,15 +507,17 @@ export function PreviewPanel({
 				? "Waking editor…"
 				: fallback === "needsChat"
 					? "Site not ready"
-					: fallback === "failed" || fallback === "error"
-						? "Preview unavailable"
-						: !frameBase
-							? "Preparing preview…"
-							: tab === "admin"
-								? "Admin"
-								: livePathHidden
-									? "Live site"
-									: sitePath;
+					: fallback === "paused"
+						? "Preview paused"
+						: fallback === "failed" || fallback === "error"
+							? "Preview unavailable"
+							: !frameBase
+								? "Preparing preview…"
+								: tab === "admin"
+									? "Admin"
+									: livePathHidden
+										? "Live site"
+										: sitePath;
 	const toggleView = compact ? onCollapse : onToggleExpanded;
 	const ahead = slotWait?.ahead;
 	const slotsBusy = Boolean(slotWait?.gaveUp);
@@ -688,42 +724,51 @@ export function PreviewPanel({
 									<h2 className="mt-4 text-base font-semibold text-text-primary">
 										{fallback === "needsChat"
 											? "Continue in chat"
-											: fallback === "failed" && slotsBusy
-												? "Every build slot is busy"
-												: fallback === "failed"
-													? "Couldn't restore this saved site"
-													: fallback === "error"
-														? "Preview couldn't load"
-														: fallback === "unknown"
-															? "Still reconnecting"
-															: queueText
-																? "Waiting for a free build slot"
-																: "Opening your site"}
+											: fallback === "paused"
+												? "Preview paused"
+												: fallback === "failed" && slotsBusy
+													? "Every build slot is busy"
+													: fallback === "failed"
+														? "Couldn't restore this saved site"
+														: fallback === "error"
+															? "Preview couldn't load"
+															: fallback === "unknown"
+																? "Still reconnecting"
+																: queueText
+																	? "Waiting for a free build slot"
+																	: "Opening your site"}
 									</h2>
 									<p className="mt-1 max-w-xs text-sm text-text-secondary">
 										{fallback === "needsChat"
 											? "The site build isn't finished. Answer any questions or resume the build in chat."
-											: fallback === "failed" && slotsBusy
-												? "Your site is safe. Try again in a few minutes."
-												: fallback === "failed"
-													? "The editor couldn't be restored. Try again or check Logs for details."
-													: fallback === "error"
-														? "The site isn't responding yet. Try reloading this page."
-														: fallback === "unknown"
-															? "The connection dropped while your site was waking. It may still be restoring."
-															: queueText
-																? `${queueText} Your saved site opens as soon as a slot is free.`
-																: "Waking the editor and restoring your saved site. This can take a moment."}
+											: fallback === "paused"
+												? "The editor stopped after a while without activity. Your site is saved."
+												: fallback === "failed" && slotsBusy
+													? "Your site is safe. Try again in a few minutes."
+													: fallback === "failed"
+														? "The editor couldn't be restored. Try again or check Logs for details."
+														: fallback === "error"
+															? "The site isn't responding yet. Try reloading this page."
+															: fallback === "unknown"
+																? "The connection dropped while your site was waking. It may still be restoring."
+																: queueText
+																	? `${queueText} Your saved site opens as soon as a slot is free.`
+																	: "Waking the editor and restoring your saved site. This can take a moment."}
 									</p>
 									{fallback === "needsChat" ? null : fallback === "failed" ||
 									  fallback === "unknown" ||
-									  fallback === "error" ? (
+									  fallback === "error" ||
+									  fallback === "paused" ? (
 										<button
 											type="button"
 											onClick={fallback === "error" ? reloadFrame : onRetryRecovery}
 											className="mt-5 min-h-9 rounded-lg bg-accent px-4 text-sm font-medium text-white hover:bg-accent-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
 										>
-											{fallback === "error" ? "Reload preview" : "Retry"}
+											{fallback === "error"
+												? "Reload preview"
+												: fallback === "paused"
+													? "Resume"
+													: "Retry"}
 										</button>
 									) : (
 										<div className="mt-5 flex gap-1.5" aria-hidden="true">

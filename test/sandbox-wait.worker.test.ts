@@ -1,7 +1,7 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuilderAgent, BuilderState } from "../src/worker/agent.js";
-import type { SandboxStart } from "../src/worker/sandbox-ops.js";
+import { NOT_RUNNING, type SandboxOps, type SandboxStart } from "../src/worker/sandbox-ops.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
 
@@ -112,6 +112,183 @@ describe("waiting for a sandbox slot", () => {
 			await expect(waiting).rejects.toThrow();
 			expect(cancelStart).toHaveBeenCalledOnce();
 			expect(harness.state.sandboxWait).toBeUndefined();
+		});
+	});
+});
+
+describe("stopping an idle container", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	type StopHarness = {
+		prepareSandboxStop: (idleForMs?: number) => Promise<{ busy: boolean }>;
+		markSandboxStopped: () => Promise<void>;
+		backupSite: (options?: unknown) => Promise<string | undefined>;
+		beginOwnerActivity: (id: string, kind: string) => void;
+		finishOwnerActivity: (id: string) => void;
+		waitForSandbox: () => Promise<{ ok: boolean }>;
+		sandboxOps: () => {
+			ensureRunning: () => Promise<SandboxStart>;
+			cancelStart: () => Promise<void>;
+		};
+		state: BuilderState;
+	};
+
+	it("keeps it while work is under way, and otherwise saves the site first", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			const backupSite = vi.fn(async (_options?: unknown) => undefined as string | undefined);
+			harness.backupSite = backupSite;
+
+			harness.beginOwnerActivity("chat:1", "chat");
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			expect(backupSite).not.toHaveBeenCalled();
+			harness.finishOwnerActivity("chat:1");
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			expect(backupSite).toHaveBeenCalledWith({ quiet: true, skipIfUnchanged: true });
+			// The Sandbox may still find the owner back, so only its stop pauses the preview.
+			expect(harness.state.sandboxPaused).toBeUndefined();
+			await harness.markSandboxStopped();
+			expect(harness.state.sandboxPaused).toBe(true);
+
+			// Starting again clears the pause.
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => ({ ok: true }),
+				cancelStart: async () => {},
+			});
+			await harness.waitForSandbox();
+			expect(harness.state.sandboxPaused).toBeUndefined();
+		});
+	});
+
+	it("holds it while the save fails, for at most an hour", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000005");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			harness.backupSite = async () => "The latest session checkpoint could not be saved.";
+
+			await expect(harness.prepareSandboxStop(30 * 60_000)).resolves.toEqual({ busy: true });
+			await expect(harness.prepareSandboxStop(61 * 60_000)).resolves.toEqual({ busy: false });
+
+			// A save skipped during the failure cooldown is no save either.
+			harness.backupSite = async () => undefined;
+			instance.setState({ ...instance.state, persistenceError: "Not saved." });
+			await expect(harness.prepareSandboxStop(30 * 60_000)).resolves.toEqual({ busy: true });
+		});
+	});
+
+	it("keeps a container through a long turn, and makes the next turn recover after a stop", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000008");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness & {
+				sql: <T>(strings: TemplateStringsArray, ...values: unknown[]) => T[];
+				provisionPromise: Promise<unknown> | null;
+				settledProvision: Promise<unknown> | null;
+			};
+			harness.backupSite = async () => undefined;
+			// This instance is still running a turn that started over an hour ago.
+			harness.beginOwnerActivity("chat:long", "chat");
+			harness.sql`UPDATE owner_activity SET started_at = ${Date.now() - 2 * 60 * 60_000}`;
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			harness.finishOwnerActivity("chat:long");
+
+			// A provision that finished before the questions were answered.
+			const provision = Promise.resolve({ ready: true });
+			harness.provisionPromise = provision;
+			harness.settledProvision = provision;
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			await harness.markSandboxStopped();
+			expect(harness.provisionPromise).toBeNull();
+		});
+	});
+
+	it("ignores work rows left from long ago, and pauses only a site that exists", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000006");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as StopHarness & {
+				sql: <T>(strings: TemplateStringsArray, ...values: unknown[]) => T[];
+				ensureOwnerActivityTable: () => void;
+			};
+			harness.ensureOwnerActivityTable();
+			harness.sql`INSERT INTO owner_activity (id, kind, started_at) VALUES ('chat:hung', 'chat', ${Date.now() - 2 * 60 * 60_000})`;
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			await harness.markSandboxStopped();
+			expect(harness.state.sandboxPaused).toBeUndefined();
+		});
+	});
+});
+
+describe("tool calls that find the container stopped", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("restore the site, repeat a read, and report a write that may need redoing", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000007");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const notRunning = () => Promise.reject(new Error(NOT_RUNNING));
+			const writeFile = vi.fn(async (_path: string, _content: string) => ({ success: true }));
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => (running ? { success: true, content: "restored" } : notRunning()),
+				writeFile: async (...args: [string, string]) =>
+					running ? writeFile(...args) : notRunning(),
+			});
+			const recoverSite = vi.fn(async () => {
+				running = true;
+				return { ready: true };
+			});
+			harness.recoverSite = recoverSite;
+
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "restored",
+			});
+			expect(recoverSite).toHaveBeenCalledOnce();
+
+			running = false;
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("restored from its last checkpoint");
+			// The write is not repeated on its own: earlier steps of the tool may be gone.
+			expect(writeFile).not.toHaveBeenCalled();
+		});
+	});
+});
+
+describe("the tools' view of the Sandbox", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("calls the Sandbox's own stub, which has no apply, bind or call", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000030");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as { toolSandboxOps(): SandboxOps };
+
+			// An RPC stub answers every property with a remote method, apply included.
+			const exposed = await harness
+				.toolSandboxOps()
+				.exposePort(4321, { hostname: "localhost:5173", token: "tok" });
+
+			expect(exposed.url).toBe(
+				"http://4321-99999999-9999-4999-8999-000000000030-tok.localhost:5173/",
+			);
 		});
 	});
 });

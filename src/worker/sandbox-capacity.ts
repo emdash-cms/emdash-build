@@ -85,6 +85,11 @@ export class SandboxCapacity extends DurableObject<Env> {
 		this.sql.exec("DELETE FROM waiters WHERE holder = ?", holder);
 	}
 
+	/** Give up a slot, keeping any place the holder has in the queue. */
+	releaseLease(holder: string): void {
+		this.sql.exec("DELETE FROM leases WHERE holder = ?", holder);
+	}
+
 	stats(): { limit: number; active: number; waiting: number } {
 		this.reap(Date.now());
 		return { limit: this.limit(), active: this.count("leases"), waiting: this.count("waiters") };

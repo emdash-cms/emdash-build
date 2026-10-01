@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CapacityGrant } from "../src/worker/sandbox-capacity.js";
+import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import {
 	BASE_ENV,
-	NOT_RUNNING,
 	SAFETY_INACTIVITY_MS,
 	SandboxRuntime,
 	type FilesLike,

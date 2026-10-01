@@ -22,7 +22,6 @@ import {
 	type ConnectionContext,
 	type WSMessage,
 } from "agents";
-import { getSandbox, streamFile } from "@cloudflare/sandbox";
 import { artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
 import {
 	isAdminPreviewPath,
@@ -72,12 +71,7 @@ import {
 } from "./readiness.js";
 import { equalTokenDigest } from "./project-auth.js";
 import type { ClientRecoveryState } from "../shared/client-recovery.js";
-import {
-	isSandboxRuntimeReplacement,
-	isSandboxWakeReset,
-	previewTokenForRoute,
-	previewTokenFromUrl,
-} from "./recovery.js";
+import { previewTokenForRoute, previewTokenFromUrl } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 import {
 	createAskQuestionsTool,
@@ -199,8 +193,7 @@ import {
 	type ValidatedBlocksField,
 } from "./block-renderer-validation.js";
 
-import { legacySandboxOps } from "./legacy-sandbox-ops.js";
-import { DEV_SERVER_PROCESS_PREFIX, type SandboxOps } from "./sandbox-ops.js";
+import { DEV_SERVER_PROCESS_PREFIX, isSandboxNotRunning, type SandboxOps } from "./sandbox-ops.js";
 
 interface PublicationEnv {
 	WFP_RELEASES?: R2Bucket;
@@ -583,6 +576,19 @@ export interface BuilderState extends BuilderReadinessState {
 	 * when the platform is full), or `gaveUp` waiting until it is retried.
 	 */
 	sandboxWait?: { ahead?: number; gaveUp?: boolean };
+	/** The idle container was stopped; the saved site starts again when it is opened or used. */
+	sandboxPaused?: boolean;
+}
+
+/** Container calls that change nothing, so they can be made again after a restore. */
+const SANDBOX_READS = new Set(["readFile", "readFileStream", "listFiles"]);
+const SANDBOX_RESTORED =
+	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
+
+/** A Workers RPC failure that the platform says may succeed if repeated. */
+function isRetryableObjectError(error: unknown): boolean {
+	const flags = error as { retryable?: unknown; overloaded?: unknown } | null;
+	return Boolean(flags && flags.retryable === true && flags.overloaded !== true);
 }
 
 /** Resolve after `ms`, or reject with the abort reason as soon as `signal` aborts. */
@@ -1337,6 +1343,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * work is live; only work begun here can.
 	 */
 	private liveBuildWork = new Map<string, { kind: string; startedAt: number }>();
+	/** Every kind of owner work this instance is running; it cannot outlive the instance. */
+	private readonly liveOwnerWork = new Set<string>();
 	/** What this instance last told the owner's catalogue about building. */
 	private reportedBuilding = false;
 	private lastBuildReportAt = 0;
@@ -1359,8 +1367,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const invalid = this.closeInvalidAccountConnections();
 		super.broadcast(message, [...new Set([...(without ?? []), ...invalid])]);
 	}
-
-	private sandbox: SandboxOps | null = null;
 
 	/** Bounded in-memory console history, for reload/late-connect rehydration. */
 	private consoleBuffer: string[] = [];
@@ -1513,6 +1519,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * before provision is durable in this.state.
 	 */
 	private provisionPromise: Promise<ProvisionResult> | null = null;
+	/** The provision that last finished, so a stopped container can make the next turn recover. */
+	private settledProvision: Promise<ProvisionResult> | null = null;
 	private activeProvisionPromise: Promise<ProvisionResult> | null = null;
 	private provisionController: AbortController | null = null;
 
@@ -1698,6 +1706,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private beginOwnerActivity(id: string, kind: string) {
+		this.liveOwnerWork.add(id);
 		this.ensureOwnerActivityTable();
 		this.sql`INSERT OR IGNORE INTO owner_activity (id, kind, started_at)
 			VALUES (${id}, ${kind}, ${Date.now()})`;
@@ -1715,6 +1724,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private finishOwnerActivity(id: string) {
+		this.liveOwnerWork.delete(id);
 		this.ensureOwnerActivityTable();
 		this.sql`DELETE FROM owner_activity WHERE id = ${id}`;
 		if (id.startsWith("chat:")) this.syncTurnActive();
@@ -1845,6 +1855,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private hasOwnerActivity(): boolean {
 		this.ensureOwnerActivityTable();
 		return this.sql<{ id: string }>`SELECT id FROM owner_activity LIMIT 1`.length > 0;
+	}
+
+	/** Work started within the longest any work should take; older rows are hung or left over. */
+	private hasRecentOwnerActivity(): boolean {
+		this.ensureOwnerActivityTable();
+		const since = Date.now() - BUILD_ACTIVITY_MAX_MS;
+		return (
+			this.sql<{ id: string }>`SELECT id FROM owner_activity WHERE started_at > ${since} LIMIT 1`
+				.length > 0
+		);
 	}
 
 	private hasOwnerActivityKind(kind: string): boolean {
@@ -2399,49 +2419,80 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return { success: true };
 	}
 
+	/** The project's Sandbox. A stub is cheap, and a fresh one outlives the object restarting. */
 	private sandboxOps(): SandboxOps {
-		if (!this.sandbox) {
-			const quickTunnel = this.usesQuickTunnelPreview();
-			this.sandbox = legacySandboxOps(
-				getSandbox(this.env.Sandbox, this.name, { sleepAfter: quickTunnel ? "30m" : "5m" }),
-				{ streamFile, quickTunnel, log: (line) => this.sendConsole(line) },
-			);
-		}
-		return this.sandbox;
+		return this.env.Sandbox.getByName(this.name) as unknown as SandboxOps;
 	}
 
+	/**
+	 * The Sandbox as the model's tools reach it. A call that found the
+	 * container stopped ran nothing, so the site is restored from its last
+	 * checkpoint. A read is then made once more; anything else fails with a
+	 * message saying so, because earlier writes of the same tool, or changes
+	 * since the checkpoint, may be gone. Recovery itself uses `sandboxOps`.
+	 */
+	private toolSandboxOps(): SandboxOps {
+		const sandbox = this.sandboxOps();
+		// Methods are called as properties of the stub: an RPC stub answers every
+		// property, apply and call included, with a remote method.
+		const call = (target: SandboxOps, property: PropertyKey, args: unknown[]) =>
+			(target as unknown as Record<PropertyKey, (...a: unknown[]) => Promise<unknown>>)[property]!(
+				...args,
+			);
+		return new Proxy(sandbox, {
+			get: (target, property) => {
+				// Not a promise: awaiting the proxy must not call a remote then().
+				if (property === "then") return undefined;
+				const method = Reflect.get(target, property) as unknown;
+				if (typeof method !== "function") return method;
+				return async (...args: unknown[]) => {
+					try {
+						return await call(target, property, args);
+					} catch (error) {
+						if (!isSandboxNotRunning(error)) throw error;
+						this.sendConsole("The site's container had stopped; restoring it...");
+						const recovered = await this.recoverSite(this.recoveryHostname(), true);
+						if (!recovered.ready) throw error;
+						if (!SANDBOX_READS.has(String(property))) throw new Error(SANDBOX_RESTORED);
+						return call(this.sandboxOps(), property, args);
+					}
+				};
+			},
+		});
+	}
+
+	/** Where recovery exposes the preview: the local app host in development. */
+	private recoveryHostname(): string {
+		const appHost = this.state.appHost;
+		return appHost && isLocalHostname(appHost) ? appHost : this.env.PREVIEW_HOSTNAME;
+	}
+
+	/** A read that is safe to repeat, retried once when the Sandbox object restarts under it. */
 	private async runSandboxRead<T>(
 		operation: (sandbox: SandboxOps) => Promise<T>,
 		signal?: AbortSignal,
 	): Promise<T> {
 		try {
-			return await operation(this.sandboxOps());
+			return await operation(this.toolSandboxOps());
 		} catch (error) {
-			if (!isSandboxRuntimeReplacement(error)) throw error;
-			this.sendConsole("Sandbox runtime changed; retrying the read...");
-			this.sandbox = null;
+			if (!isRetryableObjectError(error)) throw error;
 			await new Promise((resolve) => setTimeout(resolve, 750));
 			signal?.throwIfAborted();
-			return operation(this.sandboxOps());
+			return operation(this.toolSandboxOps());
 		}
 	}
 
-	/** Retry the first harmless command when the Sandbox DO is reset while waking. */
+	/** A probe that is safe to repeat, retried while the Sandbox object restarts under it. */
 	private async execRecoveryCommand(command: string, timeout: number) {
-		let lastError: unknown;
-		for (let attempt = 1; attempt <= 3; attempt++) {
+		for (let attempt = 1; ; attempt++) {
 			try {
 				return await this.sandboxOps().exec(command, { timeout });
 			} catch (error) {
-				lastError = error;
-				if (!isSandboxWakeReset(error) || attempt === 3) throw error;
-				this.sendConsole(`Sandbox wake was reset; retrying (${attempt}/3)...`);
-				this.sandbox = null;
-				this.devServerProcessId = undefined;
+				if (!isRetryableObjectError(error) || attempt === 3) throw error;
+				this.sendConsole(`The Sandbox restarted; retrying (${attempt}/3)...`);
 				await new Promise((resolve) => setTimeout(resolve, attempt * 750));
 			}
 		}
-		throw lastError;
 	}
 
 	/**
@@ -3187,12 +3238,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.sendConsole(`Warning: dev server restart lost its transport: ${message}`);
-			this.sandbox = null;
 			this.devServerProcessId = undefined;
-			const appHost = this.state.appHost;
-			const hostname = appHost && isLocalHostname(appHost) ? appHost : this.env.PREVIEW_HOSTNAME;
 			try {
-				const recovered = await this.recoverSite(hostname, true);
+				const recovered = await this.recoverSite(this.recoveryHostname(), true);
 				if (recovered.ready) {
 					this.setState({
 						...this.state,
@@ -3408,6 +3456,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				const start = await this.sandboxOps().ensureRunning();
 				if (start.ok) {
 					started = true;
+					if (this.state.sandboxPaused) this.setState({ ...this.state, sandboxPaused: undefined });
 					return { ok: true };
 				}
 				const remaining = deadline - Date.now();
@@ -3439,6 +3488,40 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (gaveUp) this.setState({ ...this.state, sandboxWait: { gaveUp: true } });
 			else if (this.state.sandboxWait) this.setState({ ...this.state, sandboxWait: undefined });
 			if (waited) this.sendStatus(status);
+		}
+	}
+
+	/**
+	 * The Sandbox asks before it stops an idle container. Work under way keeps
+	 * it running; otherwise the latest changes are saved first, so the next
+	 * start restores them. A save that keeps failing stops holding the
+	 * container after an hour: an idle container must not run forever.
+	 */
+	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
+		// Work this instance runs counts however long it takes (the Sandbox stops a
+		// container idle for two hours regardless); rows left by an earlier instance
+		// count while young enough to be a turn that chat recovery resumes.
+		if (this.liveOwnerWork.size > 0 || this.hasRecentOwnerActivity() || this.recoveryPromise) {
+			return { busy: true };
+		}
+		if (this.state.siteReady && !this.isDeletionPending()) {
+			// A save skipped during the failure cooldown is no save.
+			const failed =
+				(await this.backupSite({ quiet: true, skipIfUnchanged: true })) ||
+				this.state.persistenceError;
+			if (failed && idleForMs < 60 * 60_000) return { busy: true };
+		}
+		return { busy: false };
+	}
+
+	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
+	async markSandboxStopped(): Promise<void> {
+		// A finished provision no longer means a warm container: the next turn must recover.
+		if (this.provisionPromise && this.provisionPromise === this.settledProvision) {
+			this.provisionPromise = null;
+		}
+		if (this.state.siteReady && !this.state.sandboxPaused) {
+			this.setState({ ...this.state, sandboxPaused: true });
 		}
 	}
 
@@ -3545,12 +3628,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				// tool/turn boundary, then commit only the stable staging tree.
 				let staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
 					timeout: 120000,
+					background: true,
 				});
 				if (!staged.success) {
 					this.sendConsole("Session snapshot staging was interrupted; retrying once...");
 					await new Promise((resolve) => setTimeout(resolve, 250));
 					staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
 						timeout: 120000,
+						background: true,
 					});
 				}
 				if (!staged.success) {
@@ -3563,14 +3648,22 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					name: ARTIFACTS_GIT_USER,
 					email: ARTIFACTS_GIT_EMAIL,
 				});
-				let committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+				let committed = await sandbox.exec(commit, {
+					cwd: SNAPSHOT_PATH,
+					timeout: 60_000,
+					background: true,
+				});
 				if (!committed.success) {
 					// A damaged snapshot repository costs only one full upload to rebuild.
 					this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
 					await sandbox
-						.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000 })
+						.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000, background: true })
 						.catch(() => undefined);
-					committed = await sandbox.exec(commit, { cwd: SNAPSHOT_PATH, timeout: 60_000 });
+					committed = await sandbox.exec(commit, {
+						cwd: SNAPSHOT_PATH,
+						timeout: 60_000,
+						background: true,
+					});
 				}
 				if (!committed.success) {
 					throw new Error(committed.stderr || committed.stdout || "session snapshot commit failed");
@@ -3609,7 +3702,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					timeoutSeconds: SNAPSHOT_PUSH_TIMEOUT_SECONDS,
 				});
 				// Not the staging copy: the next checkpoint may be rebuilding it.
-				const options = { cwd: "/tmp", timeout: 65_000, env: artifactsGitEnv(token) };
+				const options = {
+					cwd: "/tmp",
+					timeout: 65_000,
+					env: artifactsGitEnv(token),
+					background: true,
+				};
 				let result = await this.execSnapshotPush(push, options);
 				if (!result.success && isTransientSnapshotPushFailure(result)) {
 					this.sendConsole("Session snapshot upload was interrupted; retrying once...");
@@ -3649,12 +3747,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return run;
 	}
 
-	/** Uploads run beside other commands: one can take seconds, and must not hold up the model's. */
+	/** Uploads run as their own process, beside the model's commands. */
 	private execSnapshotPush(
 		command: string,
-		options: { cwd: string; timeout: number; env: Record<string, string> },
+		options: { cwd: string; timeout: number; env: Record<string, string>; background: boolean },
 	) {
-		return this.sandboxOps().exec(command, { ...options, concurrent: true });
+		return this.sandboxOps().exec(command, options);
 	}
 
 	private recordBackupFailure(err: unknown): string {
@@ -6673,6 +6771,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					})
 					.finally(() => {
 						if (this.provisionController === controller) this.provisionController = null;
+						this.settledProvision = pending;
 					});
 			}
 			const isUserTurn = this.messages[this.messages.length - 1]?.role === "user";
@@ -6812,7 +6911,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const convergence = new BuildConvergence(buildAbortSignal);
 			if (options?.requestId) this.activeBuildConvergences.set(options.requestId, convergence);
 			const sandboxTools = createTools(
-				() => this.sandboxOps(),
+				() => this.toolSandboxOps(),
 				{
 					reloadPreview: () =>
 						timeSync(metrics, "previewRefresh", () =>

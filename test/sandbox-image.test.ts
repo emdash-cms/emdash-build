@@ -16,29 +16,27 @@ function copiesFromImages(): Map<string, { image: string; tag: string; target: s
 }
 
 describe("sandbox image", () => {
-	it("runs the Sandbox server from the same release as the installed SDK", () => {
-		expect(copiesFromImages().get("/container-server/sandbox")).toEqual({
-			image: "docker.io/cloudflare/sandbox",
-			tag: pkg.dependencies["@cloudflare/sandbox"],
-			target: "/sandbox",
-		});
-	});
-
-	it("already carries what the 1.0 SDK needs, so its first deploy can reach this image", () => {
+	it("ships the file helper and cloudflared that SDK 1.0 needs, and no 0.12 server", () => {
 		const copies = copiesFromImages();
-		// Files, DirectoryBackup and S3Mount run this helper, which must match the 1.0 package.
+		// Files, DirectoryBackup and S3Mount run this helper, which must match the package.
 		expect(copies.get("/usr/local/bin/sandbox-shim")).toEqual({
 			image: "docker.io/cloudflare/sandbox",
-			tag: "1.0.0",
+			tag: pkg.dependencies["@cloudflare/sandbox"],
 			target: "/usr/local/bin/sandbox-shim",
 		});
-		// The 1.0 image no longer ships cloudflared.
 		expect(copies.get("/usr/local/bin/cloudflared")).toMatchObject({
 			image: "docker.io/cloudflare/cloudflared",
 			target: "/usr/local/bin/cloudflared",
 		});
-		// Background processes need an init to reap orphans once `/sandbox` is gone.
+		expect(copies.has("/container-server/sandbox")).toBe(false);
+	});
+
+	it("keeps the container up under an init that reaps background processes", () => {
+		// The Durable Object runs every command itself; the main process only has to live.
+		expect(dockerfile).toMatch(/^ENTRYPOINT \["\/usr\/bin\/tini", "--"\]$/m);
+		expect(dockerfile).toMatch(/^CMD \["sleep", "infinity"\]$/m);
 		expect(dockerfile).toMatch(/^\s+tini \\$/m);
+		expect(dockerfile).not.toMatch(/^EXPOSE /m);
 	});
 
 	it("pins the sandbox user to the uid that exec and Files run as", () => {

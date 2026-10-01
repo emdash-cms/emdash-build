@@ -136,16 +136,20 @@ replayed with the same key so the control plane reconciles remote identity.
 ## Capacity and abuse
 
 - Guest identities are limited to ten projects in the reference app.
-- Keep Sandbox `max_instances` aligned with the account's deliberate capacity.
-  Production allows 100 concurrent sandboxes (4 vCPU and 12 GiB each), about a
-  quarter of the default account limit of 1,500 vCPU. Past the cap, a new
-  container waits for the SDK's retries (about two minutes) and then fails, so
-  watch for `ContainerUnavailableError` and AI Gateway 429s before raising it.
-  `SANDBOX_MAX_CONCURRENT` holds the same number for the app-owned cap
-  (`SandboxCapacity`) that replaces `max_instances` with Sandbox SDK 1.0; past
-  it, a site shows its place in the queue and starts when a slot frees up.
+- Keep `SANDBOX_MAX_CONCURRENT` aligned with the account's deliberate
+  capacity. Production allows 100 concurrent sandboxes (4 vCPU and 12 GiB
+  each), about a quarter of the default account limit of 1,500 vCPU; Worker
+  Previews keep the platform's `max_instances` of 10 on the default scheduling
+  policy. Past the cap a site waits in `SandboxCapacity`'s first-come queue
+  and shows its place; it gives up after ten minutes. Watch AI Gateway 429s
+  before raising the cap. `SandboxCapacity.stats()` reports the limit, active
+  leases and waiters.
 - Add provider rate limiting/Turnstile before opening an unrestricted public demo.
-- Expire idle Sandbox compute while retaining source in Artifacts.
+- Idle Sandbox compute stops after 10 minutes without owner activity (30 in
+  quick-tunnel mode) while source stays in Artifacts. BuilderAgent saves the
+  site before the stop and keeps a container running while a turn, provision,
+  restore or publish is under way; a save that keeps failing holds it for at
+  most an hour.
 - Commit recovery snapshots from a stable staging copy after initial setup,
   each successful mutating tool and each completed turn; never run Git against
   the live Vite/SQLite tree. A follow-up turn can reuse its last successful
@@ -156,13 +160,13 @@ replayed with the same key so the control plane reconciles remote identity.
 - Established projects fail closed when no snapshot can be restored. Never
   replace an owned project with a clean template as a recovery fallback.
 - Never retry provisioning or publication without a bound attempt count.
-- Dev-server start/restart uses a direct TCP probe and fails within 45 seconds;
-  it must never inherit the SDK's two-minute wait boundary.
-- The client masks the exposed-port disconnect while Astro restarts. If the
-  Sandbox transport changes, BuilderAgent discards stale handles, reacquires
-  the stable sandbox id and reloads only after recovery succeeds.
-- Opening an existing sidebar project proactively wakes the Sandbox and
-  reactivates port forwarding. Vite HMR uses the public preview host, and the
+- Dev-server start/restart uses a direct TCP probe and fails within 45 seconds.
+- The client masks the preview disconnect while Astro restarts. A container
+  call that finds the container stopped throws `SANDBOX_NOT_RUNNING` before
+  running anything; recovery restores the site, and the model's tools then
+  repeat a read or report that recent changes may need redoing.
+- Opening an existing sidebar project proactively starts the Sandbox and
+  restores the site if its container was stopped. Vite HMR uses the public preview host, and the
   Worker must preserve WebSocket upgrade responses from `routePreviewRequest`.
 - Serialize per-site MCP calls through the Astro dev runner and reload the
   preview only for mutating CMS tools. Parallel MCP bursts otherwise queue
@@ -192,3 +196,34 @@ For every release exercise:
 
 Do not use a narrow unit suite as evidence for the browser, Sandbox or WfP
 boundaries.
+
+## Switching to Sandbox SDK 1.0
+
+The first deploy with the SDK 1.0 Sandbox cannot be rolled back: once it is
+live, the 0.12 code can no longer start containers, even after `wrangler
+rollback`. Users see every sandbox stop once; their sites restore from
+Artifacts on the next open.
+
+1. Deploy the commits before the switch first and let them run: the image
+   already carries `sandbox-shim` and tini, previews already route through
+   `routePreviewRequest`, and `SandboxCapacity` already exists.
+   There is no rollback, only forward fixes: keep the rehearsed staging
+   deployment around to try a fix before shipping it.
+2. Rehearse on a staging Worker with its own Worker and container application
+   names: a new project through every readiness milestone, an idle stop and
+   resume (paused preview, Resume, and returning to the tab), a restart, a
+   publish, a quick-tunnel Worker Preview, a full queue
+   (`SANDBOX_MAX_CONCURRENT=1` with two projects), and an idle project with
+   its CMS connection open, which must still stop after ten minutes.
+3. In a quiet window, let running turns finish: changes made after a site's
+   last checkpoint are lost when its old container stops. Then
+   `wrangler versions upload`, then
+   `wrangler versions deploy <id>@100% -y`. Durable Object-managed containers
+   cannot be deployed gradually. If wrangler reports that it could not finish
+   applying the container application settings, run the same deploy again.
+4. Watch `[Sandbox]` warnings and start failures for the first hour. The
+   platform's error when the account runs out of containers is undocumented:
+   `SandboxRuntime` waits on the 0.12 messages and rethrows anything else.
+5. Once the old containers have stopped, delete the old default-policy
+   application (`wrangler containers list`, then `wrangler containers delete
+   <id>`); it bills for its containers until then.

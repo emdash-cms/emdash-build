@@ -10,6 +10,6 @@ minimumReleaseAgeExclude:
   - ai@6.0.270
   - "@cloudflare/vite-plugin@1.60.0"
   - "@cloudflare/workers-types@5.20260924.1"
-  - "@cloudflare/sandbox@0.12.10"
+  - "@cloudflare/sandbox@1.0.0"
   - miniflare@5.20260923.0-alpha
   - wrangler@4.139.0
