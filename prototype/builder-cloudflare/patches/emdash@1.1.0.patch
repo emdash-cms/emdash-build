@@ -1,0 +1,13 @@
+diff --git a/dist/portable-text-BnRuiR1-.mjs b/dist/portable-text-BnRuiR1-.mjs
+index 2dff9e2..e66c41b 100644
+--- a/dist/portable-text-BnRuiR1-.mjs
++++ b/dist/portable-text-BnRuiR1-.mjs
+@@ -298,7 +298,7 @@ function convertDataForRead(data, fields, raw = false) {
+ function convertDataForWrite(data, fields) {
+ 	const result = { ...data };
+ 	for (const field of fields) if (field.type === "portableText" && typeof result[field.slug] === "string") result[field.slug] = markdownToPortableText(result[field.slug]);
+-	else if (field.type === "blocks") result[field.slug] = convertNestedBlockPortableText(result[field.slug], field, "write");
++	else if (field.type === "blocks" && Array.isArray(result[field.slug])) result[field.slug] = convertNestedBlockPortableText(result[field.slug], field, "write");
+ 	return result;
+ }
+ 
