@@ -1,17 +1,26 @@
 /**
- * Hosts whose catalogues the model remembers. Asked for photos it could not
- * search for, it wrote Unsplash URLs from memory with alt text for the photo
- * it expected; some showed another subject, others no longer existed. Images
- * anywhere else are the user's own, wherever they live, and are not checked.
+ * Hosts whose image URLs the model writes without having seen the image: stock
+ * catalogues it remembers, random-photo services, and placeholder generators.
+ * Asked for photos it could not search for, it wrote Unsplash URLs from memory
+ * with alt text for the photo it expected; some showed another subject, others
+ * no longer existed. Images anywhere else are the user's own, wherever they
+ * live, and are not checked.
  */
-const STOCK_PHOTO_HOSTS = new Set([
+const GUESSED_IMAGE_HOSTS = new Set([
 	"images.unsplash.com",
 	"plus.unsplash.com",
+	"unsplash.com",
+	"source.unsplash.com",
 	"images.pexels.com",
 	"cdn.pixabay.com",
+	"picsum.photos",
+	"loremflickr.com",
+	"placehold.co",
+	"via.placeholder.com",
+	"dummyimage.com",
 ]);
 
-/** Stock photos a turn may upload: ones a photo search returned or the user wrote. */
+/** Photos on those hosts a turn may upload: ones a photo search returned or the user wrote. */
 export class ImageSources {
 	private readonly searched = new Set<string>();
 	private readonly userTexts: string[];
@@ -38,11 +47,13 @@ export class ImageSources {
 	}
 }
 
-/** A stock photo's host and path; the query only sizes or crops it. */
+/** The host and path of a photo on those hosts; the query only sizes or crops it. */
 function stockPhoto(url: string | URL): string | undefined {
 	try {
 		const { hostname, pathname } = typeof url === "string" ? new URL(url) : url;
-		return STOCK_PHOTO_HOSTS.has(hostname) ? `${hostname}${pathname}`.toLowerCase() : undefined;
+		// `images.unsplash.com.` names the same host.
+		const host = hostname.replace(/\.$/, "");
+		return GUESSED_IMAGE_HOSTS.has(host) ? `${host}${pathname}`.toLowerCase() : undefined;
 	} catch {
 		return undefined;
 	}
