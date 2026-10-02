@@ -11,10 +11,16 @@ describe("image sources", () => {
 		expect(sources.allows("not a url")).toBe(false);
 	});
 
-	it("checks only stock photo hosts, whose catalogues the model remembers", () => {
+	it("checks only hosts whose image URLs the model writes unseen", () => {
 		const sources = new ImageSources();
 
 		expect(sources.allows("https://images.pexels.com/photos/1/pexels-photo-1.jpeg")).toBe(false);
+		// A random photo for any subject, a download link for a remembered id, a grey box.
+		expect(sources.allows("https://picsum.photos/seed/iceland/1200/800")).toBe(false);
+		expect(sources.allows("https://loremflickr.com/1200/800/iceland")).toBe(false);
+		expect(sources.allows("https://unsplash.com/photos/abc123/download")).toBe(false);
+		expect(sources.allows("https://placehold.co/600x400")).toBe(false);
+		expect(sources.allows("https://IMAGES.unsplash.com.:443/photo-x")).toBe(false);
 		// The user's own images: a site they named, a share link the model rewrote.
 		expect(sources.allows("https://mybakery.com/wp-content/uploads/hero.jpg")).toBe(true);
 		expect(sources.allows("https://drive.google.com/uc?export=download&id=abc")).toBe(true);
