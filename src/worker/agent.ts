@@ -105,6 +105,7 @@ import {
 import { AccountAuthStore, type IdentityBindings } from "./account-auth.js";
 import { readVerifiedAgentAuth, type VerifiedAgentAuth } from "./agent-authorization.js";
 import { BUILD_ACTIVITY_TTL_MS, type ProjectCatalogItem } from "./project-catalog-contract.js";
+import { imageSourcesFrom, type ImageSources } from "./image-sources.js";
 import { suggestNextSteps, suggestionContext, type Suggestion } from "./suggestions.js";
 import {
 	INITIAL_SCAFFOLD_PATHS,
@@ -5272,6 +5273,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		metrics: TurnMetrics;
 		abortSignal: AbortSignal;
 		toolNames: readonly string[];
+		imageSources: ImageSources;
 	}): Promise<ToolSet> {
 		const executor = await this.createCmsScriptExecutor();
 		if (!executor) return {};
@@ -5299,6 +5301,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								checkpoint: () => deferred.checkpoint(),
 								abortSignal: run.signal,
 								unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
+								imageSources: turn.imageSources,
 								apiToken: this.getApiToken(),
 								cmsBaseUrl: this.state.previewUrl,
 							}),
@@ -7387,6 +7390,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				: runawayController.signal;
 			const convergence = new BuildConvergence(buildAbortSignal);
 			if (options?.requestId) this.activeBuildConvergences.set(options.requestId, convergence);
+			const imageSources = imageSourcesFrom(this.messages);
 			const sandboxTools = createTools(
 				() => this.toolSandboxOps(buildAbortSignal),
 				{
@@ -7421,6 +7425,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					convergence,
 					abortSignal: buildAbortSignal,
 					unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
+					imageSources,
 					apiToken: this.getApiToken(),
 					cmsBaseUrl: this.state.previewUrl,
 					previewImagesEnabled: true,
@@ -7445,6 +7450,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						metrics,
 						abortSignal: buildAbortSignal,
 						toolNames: Object.keys(directTools),
+						imageSources,
 					})),
 				},
 				() => this.restoreUnreported,
