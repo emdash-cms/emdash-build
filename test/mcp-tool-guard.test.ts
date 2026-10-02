@@ -128,7 +128,14 @@ describe("MCP tool adaptation", () => {
 	});
 
 	it("makes paginated MCP cursors explicit nullable values", () => {
-		for (const toolName of ["content_list", "search", "media_list"]) {
+		// Left optional, the model invents cursors such as ":x" for byline_list.
+		for (const toolName of [
+			"content_list",
+			"search",
+			"media_list",
+			"byline_list",
+			"taxonomy_list_terms",
+		]) {
 			const adapted = adaptMcpToolSchema(toolName, cursorSchema) as any;
 			expect(adapted.required).toContain("cursor");
 			expect(adapted.properties.cursor).toMatchObject({

@@ -7,7 +7,6 @@ function isObject(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const PAGINATED_CURSOR_TOOLS = new Set(["content_list", "search", "media_list"]);
 const CONTENT_ORDER_ALIASES: Record<string, string> = {
 	created_at: "createdAt",
 	updated_at: "updatedAt",
@@ -28,7 +27,8 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): JSON
 	const adapted = structuredClone(inputSchema) as JsonObject;
 	const properties = adapted.properties;
 	if (!isObject(properties)) return inputSchema as JSONSchema7;
-	if (PAGINATED_CURSOR_TOOLS.has(toolName) && isObject(properties.cursor)) {
+	// Every listing's cursor: left optional, the model invents one, such as ":x".
+	if (isObject(properties.cursor)) {
 		const stringCursor: JsonObject = { ...properties.cursor, type: "string" };
 		delete stringCursor.anyOf;
 		delete stringCursor.description;
