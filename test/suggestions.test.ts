@@ -18,7 +18,32 @@ const session = {
 };
 
 describe("next-step suggestions", () => {
-	it("asks the small model for JSON and keeps up to four clean, distinct suggestions", async () => {
+	it("asks for the owner's likely next requests, not only unfinished work", async () => {
+		let request: any;
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			request = input;
+			return { response: { suggestions: [] } };
+		});
+		await suggestNextSteps({ run }, "Brief", session);
+
+		// After a finished build, "only unfinished work" left the model nothing to suggest.
+		expect(request.messages[0]?.content).toContain("most likely to ask");
+		expect(request.messages[0]?.content).toContain("Return exactly 3 suggestions");
+		expect(request.messages[0]?.content).not.toContain("unfinished");
+	});
+
+	it("warns when the model's reply has no usable suggestion", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const run = vi.fn(async () => ({ response: { suggestions: [] } }));
+			expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([]);
+			expect(warn).toHaveBeenCalledWith("[suggestions] the model suggested nothing usable");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("asks the small model for JSON and keeps up to three clean, distinct suggestions", async () => {
 		const run = vi.fn(async () => ({
 			response: {
 				suggestions: [
@@ -47,7 +72,6 @@ describe("next-step suggestions", () => {
 			},
 			suggestion("Build the archive page"),
 			suggestion("Create the author byline"),
-			suggestion("Improve the recipe layout"),
 		]);
 		expect(run).toHaveBeenCalledWith(
 			SUGGESTIONS_MODEL,
