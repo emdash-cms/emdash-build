@@ -21,6 +21,7 @@ import {
 	prepareBuildStep,
 	releaseStepPreviewImages,
 } from "../src/worker/build-convergence.js";
+import { ImageSources } from "../src/worker/image-sources.js";
 import { capturedPreviewShotId } from "../src/worker/readiness.js";
 import {
 	createTools,
@@ -1279,6 +1280,106 @@ describe("photo search", () => {
 	});
 });
 
+describe("image uploads", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	const uploadOf = (tools: ReturnType<typeof createTools>) =>
+		tools.upload_media.execute as (input: { images: Array<{ url: string }> }) => Promise<unknown>;
+
+	function serveImages(searchResults: string[] = []) {
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+			if (String(url).startsWith("https://api.unsplash.com/")) {
+				return Response.json({
+					results: searchResults.map((raw, index) => ({
+						id: `photo-${index}`,
+						description: "Basalt coast",
+						alt_description: null,
+						urls: { raw, regular: raw, small: raw },
+						user: { name: "A photographer", username: "photographer" },
+						links: { html: "https://unsplash.com/photos/x" },
+					})),
+				});
+			}
+			if (init?.method === "POST") return Response.json({ item: { id: "media-1" } });
+			return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		return fetchMock;
+	}
+
+	it("uploads only images the user gave, and never fetches one written from memory", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(["https://example.com/hero.jpg"]),
+		});
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://example.com/hero.jpg" },
+					{ url: "https://images.unsplash.com/photo-1530789253388-582c481c54b0?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			success: true,
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{ success: false, error: expect.stringContaining("images the user supplied") },
+			],
+		});
+		expect(fetchMock.mock.calls.some(([url]) => String(url).includes("photo-153078"))).toBe(false);
+		// Not a failed upload to retry: the model has to find a real image first.
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("accepts a photo this turn's search returned, at any size", async () => {
+		serveImages(["https://images.unsplash.com/photo-found?ixid=abc"]);
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			unsplashAccessKey: "unsplash-key",
+			imageSources: new ImageSources(),
+		});
+		const search = (tools as Record<string, { execute?: unknown }>).search_unsplash!
+			.execute as (input: { query: string; count: number }) => Promise<unknown>;
+
+		await search({ query: "iceland coast", count: 1 });
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://images.unsplash.com/photo-found?w=2200&fit=crop" },
+					{ url: "https://images.unsplash.com/photo-guessed?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{ success: false, error: expect.stringContaining("Search for photos") },
+			],
+		});
+	});
+
+	it("uploads nothing when the turn names no image sources", async () => {
+		const fetchMock = serveImages();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+		});
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://example.com/hero.jpg" }] }),
+		).resolves.toMatchObject({ success: false, uploaded: 0 });
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
 describe("stopped media batch", () => {
 	afterEach(() => vi.unstubAllGlobals());
 
@@ -1306,6 +1407,9 @@ describe("stopped media batch", () => {
 			apiToken: "test-token",
 			cmsBaseUrl: "https://site.example/",
 			abortSignal: controller.signal,
+			imageSources: new ImageSources(
+				["one", "two", "three"].map((name) => `https://images.example/${name}`),
+			),
 		});
 		const upload = tools.upload_media.execute as (input: {
 			images: Array<{ url: string }>;
@@ -1341,6 +1445,10 @@ describe("stopped media batch", () => {
 			apiToken: "test-token",
 			cmsBaseUrl: "https://site.example/",
 			convergence,
+			imageSources: new ImageSources([
+				"https://images.example/missing",
+				"https://images.example/replacement",
+			]),
 		});
 		const upload = tools.upload_media.execute as (input: {
 			images: Array<{ url: string; filename: string; alt: string }>;
