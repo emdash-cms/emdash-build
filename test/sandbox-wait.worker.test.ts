@@ -378,6 +378,105 @@ describe("tool calls that find the container stopped", () => {
 			expect(written).toEqual([]);
 		});
 	});
+
+	it("report a restore from the checkpoint to a call that waited on it", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000a");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; restored?: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// The tool's earlier write was never saved, so the restore took it away.
+			harness.recoveryPromise = Promise.resolve({ ready: true, restored: true });
+
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("restored from its last checkpoint");
+			expect(written).toEqual([]);
+			harness.recoveryPromise = null;
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).resolves.toEqual({ success: true });
+		});
+	});
+
+	it("report once a restore during a build that no call waited on", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000b");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				doRecoverSite: () => Promise<{ ready: boolean; restored?: boolean }>;
+				recoverSite: (hostname: string) => Promise<{ ready: boolean }>;
+				activeBuildConvergences: Map<string, unknown>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => ({ success: true, content: "restored" }),
+			});
+			harness.doRecoverSite = async () => ({ ready: true, restored: true });
+			const read = () => harness.toolSandboxOps().readFile("/home/user/site/a.astro");
+
+			// Before a build, as when the project is opened: nothing the model made is lost.
+			await harness.recoverSite("localhost:5173");
+			await expect(read()).resolves.toMatchObject({ success: true });
+
+			// The preview's Resume restored the site while the model was building.
+			harness.activeBuildConvergences.set("request", {});
+			await harness.recoverSite("localhost:5173");
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			await expect(read()).resolves.toMatchObject({ success: true });
+		});
+	});
+
+	it("say when a recovery brought the site back from its checkpoint", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000c");
+		await runInDurableObject(agent, async (instance) => {
+			let sitePresent = false;
+			const harness = instance as unknown as {
+				doRecoverSite: (hostname: string) => Promise<{ ready: boolean; restored?: boolean }>;
+			};
+			Object.assign(harness, {
+				waitForSandbox: async () => ({ ok: true }),
+				// No dev server answers, and the site is gone or still there.
+				execRecoveryCommand: async (command: string) => ({
+					success: command.includes("package.json") && sitePresent,
+				}),
+				sandboxOps: () => ({
+					exec: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+				}),
+				getArtifactsRepoForRead: async () => ({
+					remote: "https://artifacts.example/site.git",
+					token: "token",
+				}),
+				restoreDependencies: async () => 0,
+				exposePreview: async () => ({ url: "http://4321-site-tok.localhost:5173/" }),
+				startDevServer: async () => {},
+				refreshPreviewSnapshots: async () => true,
+				getApiToken: () => undefined,
+			});
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
+				ready: true,
+				restored: true,
+			});
+			sitePresent = true;
+			const restarted = await harness.doRecoverSite("localhost:5173");
+			expect(restarted.ready).toBe(true);
+			expect(restarted.restored).toBeUndefined();
+		});
+	});
 });
 
 describe("installing dependencies", () => {

@@ -442,6 +442,8 @@ interface SiteRecoveryResult {
 	ready: boolean;
 	previewUrl?: string;
 	error?: string;
+	/** The site came back from its last checkpoint, so changes since then may be gone. */
+	restored?: boolean;
 }
 
 interface ProvisionResult extends SiteRecoveryResult {
@@ -1589,6 +1591,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
+	/** A restore during a build that none of the model's container calls has reported yet. */
+	private restoreUnreported = false;
 	/** An idle-stop check under way, which later asks share. */
 	private stopCheck?: Promise<{ busy: boolean }>;
 	private recoveryReconnectMcp = false;
@@ -2508,6 +2512,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						const recovered = await restore.catch((): SiteRecoveryResult => ({ ready: false }));
 						// A failed one can leave a running container with no site, or part of one.
 						if (!recovered.ready) throw new Error(recovered.error ?? SANDBOX_NOT_RESTORED);
+						// This call's tool may have written before it, as for the call that found the stop.
+						if (recovered.restored) {
+							this.restoreUnreported = false;
+							throw new Error(SANDBOX_RESTORED);
+						}
+					}
+					// One no call waited on, such as the preview's Resume, is told to the next call.
+					if (this.restoreUnreported) {
+						this.restoreUnreported = false;
+						throw new Error(SANDBOX_RESTORED);
 					}
 					try {
 						return await call(target, property, args);
@@ -2516,6 +2530,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						this.sendConsole("The site's container had stopped; restoring it...");
 						const recovered = await this.recoverSite(this.recoveryHostname(), true);
 						if (!recovered.ready) throw error;
+						this.restoreUnreported = false;
 						throw new Error(SANDBOX_RESTORED);
 					}
 				};
@@ -3393,12 +3408,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private recoverSite(hostname: string, reconnectMcp = false): Promise<SiteRecoveryResult> {
 		if (reconnectMcp) this.recoveryReconnectMcp = true;
 		if (this.recoveryPromise) return this.recoveryPromise;
-		const pending = this.doRecoverSite(hostname).finally(() => {
-			if (this.recoveryPromise === pending) {
-				this.recoveryPromise = null;
-				this.recoveryReconnectMcp = false;
-			}
-		});
+		const pending = this.doRecoverSite(hostname)
+			.then((result) => {
+				// Mid-build, what the model changed since the last saved checkpoint may be gone.
+				if (result.restored && this.activeBuildConvergences.size > 0) {
+					this.restoreUnreported = true;
+				}
+				return result;
+			})
+			.finally(() => {
+				if (this.recoveryPromise === pending) {
+					this.recoveryPromise = null;
+					this.recoveryReconnectMcp = false;
+				}
+			});
 		this.recoveryPromise = pending;
 		return pending;
 	}
@@ -3504,7 +3527,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this.markMilestone("cmsReady");
 			if (await this.connectMcp(exposed.url, apiToken)) this.markMilestone("agentToolsReady");
 		}
-		return { ready: true, previewUrl: exposed.url };
+		return { ready: true, previewUrl: exposed.url, ...(hasSite.success ? {} : { restored: true }) };
 	}
 
 	/**
