@@ -16,6 +16,7 @@ import {
 	type BuildObservation,
 	type MutationScope,
 } from "./build-convergence.js";
+import { ImageSources, searchedPhotoUrls } from "./image-sources.js";
 import { auditPublicSite } from "./public-site-audit.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 
@@ -748,6 +749,8 @@ interface ToolOptions {
 	/** Cancellation for the build turn, including queued sandbox operations. */
 	abortSignal?: AbortSignal;
 	unsplashAccessKey?: string;
+	/** Image URLs this turn may upload; none when absent. */
+	imageSources?: ImageSources;
 	/** Full-scope API token for the site's EmDash instance (Worker-side only) */
 	apiToken?: string;
 	/** Public preview URL of the site (ends with `/`), used to reach the CMS API */
@@ -1169,9 +1172,14 @@ export function createMediaTools(options: {
 	checkpoint: () => Promise<void>;
 	abortSignal?: AbortSignal;
 	unsplashAccessKey?: string;
+	/** Searches add to it; uploads take only what it holds. */
+	imageSources: ImageSources;
 	apiToken?: string;
 	cmsBaseUrl?: string;
 }) {
+	const unsourcedImage = options.unsplashAccessKey
+		? "Not a URL from search_unsplash or the user. Search for photos instead of writing photo URLs from memory: those show the wrong subject or no longer exist."
+		: "Not a URL the user gave. There is no photo search in this session, so use only images the user supplied, or design without photography.";
 	const tools = {
 		search_unsplash: tool({
 			description:
@@ -1214,6 +1222,7 @@ export function createMediaTools(options: {
 					photographer: p.user.name,
 					photographerUrl: `https://unsplash.com/@${p.user.username}`,
 				}));
+				for (const url of searchedPhotoUrls({ photos })) options.imageSources.add(url);
 				return { success: true as const, query, count: photos.length, photos };
 			},
 		}),
@@ -1226,7 +1235,8 @@ export function createMediaTools(options: {
 				"URLs: each result includes a `fieldValue` " +
 				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
 				"field when calling content_create/content_update. Results come back in input order and " +
-				"echo each `url` so you can match them to the right entry.",
+				"echo each `url` so you can match them to the right entry. Only images that search_unsplash " +
+				"returned or the user gave can be uploaded; never write an image URL from memory.",
 			inputSchema: z.object({
 				images: z
 					.array(
@@ -1265,6 +1275,9 @@ export function createMediaTools(options: {
 								if (options.abortSignal?.aborted) {
 									return { url: img.url, success: false as const, error: "Upload stopped." };
 								}
+								if (!options.imageSources.has(img.url)) {
+									return { url: img.url, success: false as const, error: unsourcedImage };
+								}
 								const result = await uploadOneMedia(
 									img.url,
 									img.filename,
@@ -1283,7 +1296,8 @@ export function createMediaTools(options: {
 								const failureKey = `media\0${identity}`;
 								if (result.success) {
 									options.mutations.resolveUnresolvedFailure(failureKey);
-								} else {
+								} else if (options.imageSources.has(image.url)) {
+									// A refused URL is not an upload to retry: the model must find a real image first.
 									options.mutations.recordUnresolvedFailure({
 										key: failureKey,
 										toolName: "upload_media",
@@ -2270,6 +2284,7 @@ export function createTools(
 			checkpoint: callbacks.checkpointSite,
 			abortSignal: options.abortSignal,
 			unsplashAccessKey: options.unsplashAccessKey,
+			imageSources: options.imageSources ?? new ImageSources(),
 			apiToken: options.apiToken,
 			cmsBaseUrl: options.cmsBaseUrl,
 		}),
