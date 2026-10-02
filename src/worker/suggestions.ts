@@ -228,14 +228,15 @@ export function suggestionContext(
 	].join("\n");
 }
 
+/** The usable suggestions, and how many the model offered before filtering. */
 function parseSuggestions(
 	output: unknown,
 	availableCapabilities: ReadonlySet<string>,
-): Suggestion[] {
+): { suggestions: Suggestion[]; offered: number } {
 	let response = (output as { response?: unknown } | null)?.response ?? output;
 	if (typeof response === "string") response = JSON.parse(response);
 	const items = (response as { suggestions?: unknown } | null)?.suggestions;
-	if (!Array.isArray(items)) return [];
+	if (!Array.isArray(items)) return { suggestions: [], offered: 0 };
 	const seen = new Set<string>();
 	const suggestions: Suggestion[] = [];
 	for (const item of items) {
@@ -273,7 +274,7 @@ function parseSuggestions(
 		suggestions.push({ label, prompt });
 		if (suggestions.length === MAX_SUGGESTIONS) break;
 	}
-	return suggestions;
+	return { suggestions, offered: items.length };
 }
 
 /** Ask the small model for next-step prompts. Never throws; returns [] on any failure. */
@@ -295,8 +296,10 @@ export async function suggestNextSteps(
 			max_tokens: 500,
 			temperature: 0.2,
 		});
-		const suggestions = parseSuggestions(output, new Set(capabilityIds));
-		if (suggestions.length === 0) console.warn("[suggestions] the model suggested nothing usable");
+		const { suggestions, offered } = parseSuggestions(output, new Set(capabilityIds));
+		if (suggestions.length === 0) {
+			console.warn(`[suggestions] no usable suggestion; the model offered ${offered}`);
+		}
 		return suggestions;
 	} catch (error) {
 		console.warn("[suggestions] could not suggest next steps:", error);
