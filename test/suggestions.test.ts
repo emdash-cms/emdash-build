@@ -32,12 +32,19 @@ describe("next-step suggestions", () => {
 		expect(request.messages[0]?.content).not.toContain("unfinished");
 	});
 
-	it("warns when the model's reply has no usable suggestion", async () => {
+	it("warns when the model's reply has no usable suggestion, saying how many it offered", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		try {
-			const run = vi.fn(async () => ({ response: { suggestions: [] } }));
-			expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([]);
-			expect(warn).toHaveBeenCalledWith("[suggestions] the model suggested nothing usable");
+			const empty = vi.fn(async () => ({ response: { suggestions: [] } }));
+			const filtered = vi.fn(async () => ({
+				response: { suggestions: [modelSuggestion("Set up Stripe checkout")] },
+			}));
+			expect(await suggestNextSteps({ run: empty }, "Brief", session)).toEqual([]);
+			expect(await suggestNextSteps({ run: filtered }, "Brief", session)).toEqual([]);
+			expect(warn.mock.calls).toEqual([
+				["[suggestions] no usable suggestion; the model offered 0"],
+				["[suggestions] no usable suggestion; the model offered 1"],
+			]);
 		} finally {
 			warn.mockRestore();
 		}
