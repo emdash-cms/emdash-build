@@ -324,7 +324,9 @@ export class CmsScriptRun {
 				const failed = isObject(output) && output.success === false;
 				const data = failed ? output : resultForProgram(output);
 				// A partial result stays usable by the program but fails the run.
-				const error = failed ? String(output.error ?? "failed") : partialFailure(output);
+				const error = failed
+					? String(output.error ?? partialFailure(output) ?? "failed")
+					: partialFailure(output);
 				this.record(name, error, data, started);
 				if (failed) throw new CmsCallFailure(`${name} failed: ${error}`);
 				return data;
