@@ -315,6 +315,39 @@ describe("tool calls that find the container stopped", () => {
 			expect(writeFile).not.toHaveBeenCalled();
 		});
 	});
+
+	it("wait for a restore under way instead of running on the half-restored site", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000008");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			let finishRestore!: () => void;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// Another tool's call found the container stopped; its restore is still cloning.
+			harness.recoveryPromise = new Promise((resolve) => {
+				finishRestore = () => resolve({ ready: true });
+			});
+
+			const write = harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(written).toEqual([]);
+			finishRestore();
+
+			await expect(write).resolves.toEqual({ success: true });
+			expect(written).toEqual(["/home/user/site/b.astro"]);
+		});
+	});
 });
 
 describe("installing dependencies", () => {

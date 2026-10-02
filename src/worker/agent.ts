@@ -2500,6 +2500,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				const method = Reflect.get(target, property) as unknown;
 				if (typeof method !== "function") return method;
 				return async (...args: unknown[]) => {
+					// Another call's restore may still be cloning onto the new container's empty disk.
+					if (this.recoveryPromise) await this.recoveryPromise.catch(() => undefined);
 					try {
 						return await call(target, property, args);
 					} catch (error) {
