@@ -2591,7 +2591,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const result = await sandbox.refreshPreview(path);
 			// A route that renders but is uncacheable (negotiated Vary) is served live.
 			if (result.success || result.rendered) return true;
-			this.sendConsole(`Warning: preview snapshot returned HTTP ${result.status ?? "unknown"}.`);
+			this.sendConsole(
+				result.error
+					? `Warning: preview snapshot failed: ${result.error}`
+					: `Warning: preview snapshot returned HTTP ${result.status ?? "unknown"}.`,
+			);
 		} catch (error) {
 			this.sendConsole(
 				`Warning: preview snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
