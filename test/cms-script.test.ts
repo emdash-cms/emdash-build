@@ -271,6 +271,35 @@ describe("CMS programs", () => {
 		]);
 	});
 
+	it("says why every image of a failed upload failed", async () => {
+		const run = new CmsScriptRun({ toolCallId: "call-3e" });
+		const upload = {
+			inputSchema: jsonSchema({ type: "object" }),
+			execute: async () => ({
+				success: false,
+				changed: false,
+				count: 1,
+				uploaded: 0,
+				results: [{ url: "https://img/a", success: false, error: "Not a stock photo" }],
+			}),
+		};
+		const executor = new ScriptedExecutor(async (cms) => {
+			await cms.upload_media!({ images: [{}] });
+		});
+
+		const outcome = await run.execute(executor, "code", {
+			upload_media: run.bind("upload_media", upload as never),
+		});
+
+		expect(cmsScriptOutput(outcome, run, false).log).toEqual([
+			{
+				tool: "upload_media",
+				ok: false,
+				error: "1 of 1 images failed: https://img/a (Not a stock photo)",
+			},
+		]);
+	});
+
 	it("keeps failed entries when the log is cut", async () => {
 		const set = tools();
 		const run = new CmsScriptRun({ toolCallId: "call-3d" });
