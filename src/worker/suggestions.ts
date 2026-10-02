@@ -125,12 +125,16 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\b(?:payments?|checkout|stripe|paypal)\b/i,
 	/\b(?:bookings?|reservations?)\b/i,
 	/\b(?:user accounts?|authentication|sign[ -]?in|log[ -]?in|registration)\b/i,
+	// The build prompt forbids inventing them.
+	/\b(?:testimonials?|reviews?)\b/i,
 ];
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
 	{
 		capability: "media_search",
-		pattern: /\bunsplash\b|\b(?:find|search|source)\b.{0,40}\b(?:photos?|images?|photography)\b/i,
+		// Without a search, the only images left are ones the user already gave.
+		pattern:
+			/\bunsplash\b|\b(?:find|search|source|add|more|new|replace|swap)\b.{0,40}\b(?:photos?|images?|photography|imagery)\b/i,
 	},
 ];
 

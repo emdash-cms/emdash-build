@@ -220,6 +220,52 @@ describe("next-step suggestions", () => {
 		).toEqual([]);
 	});
 
+	it("drops testimonials and reviews, which need the owner's real words", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add more testimonials", undefined, ["cms_content"]),
+					modelSuggestion("Add a reviews section"),
+					modelSuggestion("Add more projects", undefined, ["cms_content"]),
+				],
+			},
+		}));
+
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("Add more projects"),
+		]);
+	});
+
+	it("drops photo work a session without photo search cannot do", async () => {
+		const offered = {
+			response: {
+				suggestions: [
+					modelSuggestion("Add a photo gallery", undefined, ["edit_site", "media_upload"]),
+					modelSuggestion("Replace the hero image"),
+					modelSuggestion("Tighten the gallery captions"),
+				],
+			},
+		};
+		const toolNames = ["write_file", "search_unsplash", "upload_media"];
+
+		expect(
+			await suggestNextSteps({ run: vi.fn(async () => offered) }, "Brief", {
+				toolNames,
+				canSearchUnsplash: false,
+			}),
+		).toEqual([suggestion("Tighten the gallery captions")]);
+		expect(
+			await suggestNextSteps({ run: vi.fn(async () => offered) }, "Brief", {
+				toolNames,
+				canSearchUnsplash: true,
+			}),
+		).toEqual([
+			suggestion("Add a photo gallery"),
+			suggestion("Replace the hero image"),
+			suggestion("Tighten the gallery captions"),
+		]);
+	});
+
 	it("gives the model the brief and the latest reply as plain text only", () => {
 		const messages = [
 			{ role: "user", parts: [{ type: "text", text: "A food blog called Salt & Smoke" }] },
