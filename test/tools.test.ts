@@ -1366,6 +1366,27 @@ describe("image uploads", () => {
 		});
 	});
 
+	it("opens no mutation for a call whose every image is refused", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const checkpointSite = vi.fn(async () => {});
+		const tools = createTools({} as never, { ...toolCallbacks(), checkpointSite } as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+		const revision = convergence.currentRevision();
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://images.unsplash.com/photo-guessed" }] }),
+		).resolves.toMatchObject({ success: false, changed: false, uploaded: 0 });
+		// The site did not change, so its validation and preview evidence still hold.
+		expect(convergence.currentRevision()).toBe(revision);
+		expect(checkpointSite).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("refuses stock photos without a source when the turn names none", async () => {
 		const fetchMock = serveImages();
 		const tools = createTools({} as never, toolCallbacks() as never, {

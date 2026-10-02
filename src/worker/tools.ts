@@ -1264,6 +1264,20 @@ export function createMediaTools(options: {
 						error: "Media upload is unavailable (no CMS token/URL).",
 					};
 				}
+				// Nothing to upload: leave the site's validation and preview evidence standing.
+				if (!images.some((img) => options.imageSources.allows(img.url))) {
+					return {
+						success: false as const,
+						changed: false as const,
+						count: images.length,
+						uploaded: 0,
+						results: images.map((img) => ({
+							url: img.url,
+							success: false as const,
+							error: unsourcedImage,
+						})),
+					};
+				}
 				return options.mutations.runMutation(
 					async () => {
 						// Bounded concurrency (not unbounded Promise.all): each upload
