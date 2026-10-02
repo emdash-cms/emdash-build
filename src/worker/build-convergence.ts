@@ -671,7 +671,8 @@ function withForcedRepairNote(
 ): ModelMessage[] {
 	// Keys end with what failed: a collection, locale and entry, or an image.
 	const subject = failure.key.split("\0").slice(1).filter(Boolean).join(" / ");
-	const text = `Retry this failed ${failure.toolName} call${subject ? ` for ${subject}` : ""} now: ${failure.error.slice(0, 200)}`;
+	// "Repair", not "retry": a content_update of a missing entry is repaired with content_create.
+	const text = `Repair this failure now with ${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
 	return [...messages, { role: "user", content: [{ type: "text", text }] }];
 }
 

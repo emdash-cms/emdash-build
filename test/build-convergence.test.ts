@@ -534,7 +534,7 @@ describe("build loop convergence", () => {
 		// Both failed the same way: without the entry, a retry of either looks like the repair.
 		expect(allowedTools).toEqual({ toolNames: ["content_create"], mode: "required" });
 		const note = JSON.stringify(messages.at(-1));
-		expect(note).toContain("posts / rye");
+		expect(note).toContain("Repair this failure now with content_create, for posts / rye");
 		expect(note).toContain("body: required");
 		expect(note).not.toContain("sourdough");
 	});
