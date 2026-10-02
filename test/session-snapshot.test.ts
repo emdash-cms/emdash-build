@@ -349,6 +349,24 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		expect(readFileSync(join(restored, "src/pages/page-1.astro"), "utf8")).toBe("page 1");
 	});
 
+	it("leaves no site behind from a clone stopped part way", () => {
+		checkpoint("first");
+		const restored = join(root, "restored");
+		// The clone writes its files, then is stopped at its deadline before it can tidy up.
+		write(
+			join(root, "bin/timeout"),
+			'#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done\nshift\n"$@"\nexit 124\n',
+		);
+
+		const status = spawnSync("bash", ["-c", snapshotCloneCommand(`file://${remote}`, restored)], {
+			env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+		}).status;
+
+		// A partial site would pass for a real one and be saved over the checkpoint.
+		expect(status).not.toBe(0);
+		expect(existsSync(restored)).toBe(false);
+	});
+
 	it("leaves the shell session's environment as it found it", () => {
 		run(snapshotStagingCommand(site, snapshot));
 		// The sandbox's default session keeps exported variables for later commands,
