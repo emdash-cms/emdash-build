@@ -600,6 +600,33 @@ describe("Sandbox lifetime", () => {
 		expect(stats.active).toBe(0);
 	});
 
+	it("keeps its alarm and the safety timeout when the slot cannot be renewed", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			const container = fakeContainer();
+			install(instance, container);
+			await instance.ensureRunning();
+			const instanceEnv = Reflect.get(instance, "env") as Record<string, unknown>;
+			const real = instanceEnv.SandboxCapacity;
+			const overloaded = async () => {
+				throw new Error("SandboxCapacity is overloaded");
+			};
+			instanceEnv.SandboxCapacity = {
+				getByName: () => ({ renew: overloaded, reclaim: overloaded }),
+			};
+			container.state.inactivityMs = 0;
+			await state.storage.deleteAlarm();
+			try {
+				await instance.alarm();
+			} finally {
+				instanceEnv.SandboxCapacity = real;
+			}
+
+			// The next alarm renews the slot again; without one, nothing would stop the container.
+			expect(await state.storage.getAlarm()).not.toBeNull();
+			expect(container.state.inactivityMs).toBeGreaterThan(0);
+		});
+	});
+
 	it("leaves a site deleted while BuilderAgent was asked to stop it alone", async () => {
 		await runInDurableObject(stub(), async (instance, state) => {
 			vi.useFakeTimers({ toFake: ["Date"] });

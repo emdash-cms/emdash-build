@@ -339,11 +339,19 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		);
 	}
 
-	/** Renew the running container's slot, or take it again, past the cap if need be, if it lapsed. */
+	/**
+	 * Renew the running container's slot, or take it again, past the cap if need
+	 * be, if it lapsed. A failure only warns: the alarm must still re-arm, or
+	 * nothing would renew the slot again or stop the container with a save.
+	 */
 	private async keepSlot(name: string): Promise<void> {
 		const capacity = this.env.SandboxCapacity.getByName("global");
-		if (!(await capacity.renew(name, CAPACITY_LEASE_TTL_MS))) {
-			await capacity.reclaim(name, CAPACITY_LEASE_TTL_MS);
+		try {
+			if (!(await capacity.renew(name, CAPACITY_LEASE_TTL_MS))) {
+				await capacity.reclaim(name, CAPACITY_LEASE_TTL_MS);
+			}
+		} catch (error) {
+			console.warn("[Sandbox] could not renew the container's slot:", error);
 		}
 	}
 
