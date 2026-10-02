@@ -152,7 +152,7 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 	let remote: string;
 
 	const identity = { name: "EmDash Build", email: "agent@emdash.build" };
-	// GNU timeout is in the container but not on every test host.
+	// GNU timeout and util-linux flock are in the container but not on every test host.
 	const run = (command: string) =>
 		execFileSync("bash", ["-c", command], {
 			encoding: "utf8",
@@ -185,7 +185,12 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 			join(root, "bin/timeout"),
 			'#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done\nshift\nexec "$@"\n',
 		);
-		sh(`chmod +x '${join(root, "bin/timeout")}'`);
+		// flock on a descriptor the shell holds: the lock lasts until the shell lets it go.
+		write(
+			join(root, "bin/flock"),
+			'#!/usr/bin/perl\nuse Fcntl qw(:flock);\nopen(my $fh, ">>&=", $ARGV[-1]) or die "flock: $!\\n";\nflock($fh, LOCK_EX) or die "flock: $!\\n";\n',
+		);
+		sh(`chmod +x '${join(root, "bin/timeout")}' '${join(root, "bin/flock")}'`);
 	});
 
 	afterEach(() => {
@@ -279,6 +284,26 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		// A root commit: the new remote gets one snapshot, not the unsent chain.
 		expect(sh(`git -C '${remote}' rev-list --count main`).trim()).toBe("1");
 		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(next.commit);
+	});
+
+	it("waits for an upload already under way, so a late one cannot land over a newer one", async () => {
+		checkpoint("first");
+		const finished = join(root, "earlier-upload-finished");
+		// An upload started before the builder restarted is still running.
+		const earlier = spawn("perl", [
+			"-e",
+			'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "uploading\\n"; sleep 6; open(my $m, ">", $ARGV[1]) or die; close $m',
+			join(gitDir, "push.lock"),
+			finished,
+		]);
+		await new Promise((resolve) => earlier.stdout.once("data", resolve));
+		write(join(site, "src/pages/page-1.astro"), "edit");
+		run(snapshotStagingCommand(site, snapshot));
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "second", ...identity }));
+
+		run(snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 }));
+
+		expect(existsSync(finished)).toBe(true);
 	});
 
 	it("clears a lock a killed upload left on its own ref", () => {

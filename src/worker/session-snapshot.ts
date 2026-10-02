@@ -165,6 +165,8 @@ export function snapshotCommitCommand(options: {
  * local, which keeps the next push incremental; older snapshots are pruned.
  * `--no-thin` keeps each pack self-contained. The Sandbox RPC timeout does not
  * kill a stalled git child, so the push is bounded inside the container.
+ * Uploads take turns in the container, so one a restarted builder left running
+ * cannot land over a newer snapshot pushed after it.
  */
 export function snapshotPushCommand(options: {
 	gitDir: string;
@@ -173,6 +175,9 @@ export function snapshotPushCommand(options: {
 }): string {
 	const steps = [
 		`export GIT_DIR=${shellQuote(options.gitDir)}`,
+		// Held until this shell exits, or is killed.
+		'exec 9>>"$GIT_DIR/push.lock"',
+		"flock 9",
 		'cd "$GIT_DIR"',
 		"commit=$(git rev-parse refs/heads/snapshot)",
 		// A failed upload ends the chain: the next checkpoint is a root commit, so an
