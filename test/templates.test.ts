@@ -67,6 +67,10 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain(
 			"Without `search_unsplash` or user images, design without photography",
 		);
+		// A required image field left a photo portfolio with no projects at all.
+		expect(prompt).toContain(
+			"keep image fields optional and still create every entry the site needs",
+		);
 		expect(prompt).toContain("do not describe the images as stock, sample, or placeholders");
 		expect(prompt).toContain("never put scaffolding language");
 		expect(prompt).not.toContain("strong, editable first version");
