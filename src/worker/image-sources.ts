@@ -1,32 +1,48 @@
 /**
- * Image URLs a turn may upload: ones the user wrote and ones a photo search
- * returned. Asked for photos it could not search for, the model wrote
- * Unsplash URLs from memory with alt text for the photo it expected; some
- * showed another subject, others no longer existed.
+ * Hosts whose catalogues the model remembers. Asked for photos it could not
+ * search for, it wrote Unsplash URLs from memory with alt text for the photo
+ * it expected; some showed another subject, others no longer existed. Images
+ * anywhere else are the user's own, wherever they live, and are not checked.
  */
+const STOCK_PHOTO_HOSTS = new Set([
+	"images.unsplash.com",
+	"plus.unsplash.com",
+	"images.pexels.com",
+	"cdn.pixabay.com",
+]);
+
+/** Stock photos a turn may upload: ones a photo search returned or the user wrote. */
 export class ImageSources {
-	private readonly keys = new Set<string>();
+	private readonly searched = new Set<string>();
+	private readonly userTexts: string[];
 
-	constructor(urls: Iterable<string> = []) {
-		for (const url of urls) this.add(url);
+	constructor(userTexts: readonly string[] = []) {
+		this.userTexts = userTexts.map((text) => text.toLowerCase());
 	}
 
-	add(url: string): void {
-		const key = imageKey(url);
-		if (key) this.keys.add(key);
+	recordSearchResult(url: string): void {
+		const photo = stockPhoto(url);
+		if (photo) this.searched.add(photo);
 	}
 
-	has(url: string): boolean {
-		const key = imageKey(url);
-		return key !== undefined && this.keys.has(key);
+	allows(url: string): boolean {
+		let parsed: URL;
+		try {
+			parsed = new URL(url);
+		} catch {
+			return false;
+		}
+		const photo = stockPhoto(parsed);
+		if (!photo) return true;
+		return this.searched.has(photo) || this.userTexts.some((text) => text.includes(photo));
 	}
 }
 
-/** The query only sizes or crops the image, so the same photo matches at any size. */
-function imageKey(url: string): string | undefined {
+/** A stock photo's host and path; the query only sizes or crops it. */
+function stockPhoto(url: string | URL): string | undefined {
 	try {
-		const { origin, pathname } = new URL(url);
-		return `${origin}${pathname}`;
+		const { hostname, pathname } = typeof url === "string" ? new URL(url) : url;
+		return STOCK_PHOTO_HOSTS.has(hostname) ? `${hostname}${pathname}`.toLowerCase() : undefined;
 	} catch {
 		return undefined;
 	}
@@ -37,8 +53,6 @@ interface MessageLike {
 	parts?: readonly { type: string; text?: string; output?: unknown }[];
 }
 
-const URL_IN_TEXT = /https?:\/\/[^\s<>"'`)\]]+/g;
-
 /** Photos returned by `search_unsplash`, as its result lists them. */
 export function searchedPhotoUrls(output: unknown): string[] {
 	const photos = (output as { photos?: unknown } | null)?.photos;
@@ -48,17 +62,18 @@ export function searchedPhotoUrls(output: unknown): string[] {
 
 /** Sources from earlier turns: the user's messages and past photo searches, not the builder's own words. */
 export function imageSourcesFrom(messages: readonly MessageLike[]): ImageSources {
-	const sources = new ImageSources();
+	const userTexts: string[] = [];
+	const searched: string[] = [];
 	for (const message of messages) {
 		for (const part of message.parts ?? []) {
 			if (message.role === "user" && part.type === "text" && typeof part.text === "string") {
-				for (const [url] of part.text.matchAll(URL_IN_TEXT)) {
-					sources.add(url.replace(/[.,;:!?]+$/, ""));
-				}
+				userTexts.push(part.text);
 			} else if (part.type === "tool-search_unsplash") {
-				for (const url of searchedPhotoUrls(part.output)) sources.add(url);
+				searched.push(...searchedPhotoUrls(part.output));
 			}
 		}
 	}
+	const sources = new ImageSources(userTexts);
+	for (const url of searched) sources.recordSearchResult(url);
 	return sources;
 }

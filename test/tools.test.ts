@@ -1307,14 +1307,14 @@ describe("image uploads", () => {
 		return fetchMock;
 	}
 
-	it("uploads only images the user gave, and never fetches one written from memory", async () => {
+	it("refuses a stock photo written from memory, and never fetches it", async () => {
 		const fetchMock = serveImages();
 		const convergence = new BuildConvergence();
 		const tools = createTools({} as never, toolCallbacks() as never, {
 			apiToken: "test-token",
 			cmsBaseUrl: "https://site.example/",
 			convergence,
-			imageSources: new ImageSources(["https://example.com/hero.jpg"]),
+			imageSources: new ImageSources(),
 		});
 
 		await expect(
@@ -1366,7 +1366,7 @@ describe("image uploads", () => {
 		});
 	});
 
-	it("uploads nothing when the turn names no image sources", async () => {
+	it("refuses stock photos without a source when the turn names none", async () => {
 		const fetchMock = serveImages();
 		const tools = createTools({} as never, toolCallbacks() as never, {
 			apiToken: "test-token",
@@ -1374,7 +1374,7 @@ describe("image uploads", () => {
 		});
 
 		await expect(
-			uploadOf(tools)({ images: [{ url: "https://example.com/hero.jpg" }] }),
+			uploadOf(tools)({ images: [{ url: "https://images.pexels.com/photos/1/photo.jpeg" }] }),
 		).resolves.toMatchObject({ success: false, uploaded: 0 });
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
@@ -1407,9 +1407,6 @@ describe("stopped media batch", () => {
 			apiToken: "test-token",
 			cmsBaseUrl: "https://site.example/",
 			abortSignal: controller.signal,
-			imageSources: new ImageSources(
-				["one", "two", "three"].map((name) => `https://images.example/${name}`),
-			),
 		});
 		const upload = tools.upload_media.execute as (input: {
 			images: Array<{ url: string }>;
@@ -1445,10 +1442,6 @@ describe("stopped media batch", () => {
 			apiToken: "test-token",
 			cmsBaseUrl: "https://site.example/",
 			convergence,
-			imageSources: new ImageSources([
-				"https://images.example/missing",
-				"https://images.example/replacement",
-			]),
 		});
 		const upload = tools.upload_media.execute as (input: {
 			images: Array<{ url: string; filename: string; alt: string }>;
