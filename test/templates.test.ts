@@ -141,6 +141,11 @@ describe("builder template prototype", () => {
 		});
 		expect(prompt).toContain("editing an existing EmDash CMS site");
 		expect(prompt).toContain("Old tool output was omitted");
+		// Edit turns add pages and collections too: a team page without photos needs its members.
+		expect(prompt).toContain("never write a photo URL from memory");
+		expect(prompt).toContain(
+			"keep new image fields optional and still create the entries the request needs",
+		);
 		expect(prompt).toContain("Preserve every surviving block's `_key`, `_type`, and `_version`");
 		expect(prompt).toContain("read `.agents/skills/blocks-schema-evolution/SKILL.md`");
 		expect(prompt).toContain("An older recovered project may lack");
