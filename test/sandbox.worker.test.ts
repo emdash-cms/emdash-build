@@ -126,6 +126,23 @@ describe("Sandbox preview routing", () => {
 		});
 	});
 
+	it("says the preview is paused when the container stops during a request", async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			const container = fakeContainer(async () => {
+				container.state.running = false;
+				throw new Error("Network connection lost.");
+			});
+			container.state.running = true;
+			install(instance, container);
+			await instance.exposePort(4321, { hostname: "build.emdashcms.com", token: "tok" });
+
+			const response = await instance.fetch(preview("/_astro/app.js"));
+
+			expect(response.status).toBe(503);
+			expect(response.headers.get("X-EmDash-Sandbox")).toBe("stopped");
+		});
+	});
+
 	it("relays a binary WebSocket frame as the bytes sent", async () => {
 		const [containerEnd, containerSide] = Object.values(new WebSocketPair()) as [
 			WebSocket,

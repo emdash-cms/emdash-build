@@ -606,6 +606,10 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			);
 		} catch (error) {
 			if (isNotListening(error)) return paused("The preview is starting. Try again shortly.");
+			// It stopped during the request.
+			if (!this.container()?.running) {
+				return paused("The preview is paused. Open the project to wake it.");
+			}
 			throw error;
 		}
 	}
