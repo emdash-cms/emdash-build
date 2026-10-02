@@ -1598,6 +1598,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** The background preview render after mutations, and whether another is due. */
 	private previewRefreshRunning?: Promise<void>;
 	private previewRenderInFlight?: Promise<void>;
+	/** A render one CMS call already waited out; later calls go ahead beside it. */
+	private previewRenderOutwaited?: Promise<void>;
 	private previewRefreshQueued?: { initialBuild: boolean };
 	/** How long a CMS call waits for a background render before going ahead. */
 	private previewRenderWaitMs = 5_000;
@@ -2645,15 +2647,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/**
 	 * The dev server stalls under concurrent renders and CMS requests, so a CMS
 	 * call lets the render in flight finish first: only that one, for a bounded
-	 * time, and not past a Stop, so a wedged render cannot hold every call.
+	 * time, and not past a Stop. Once a call has waited a render out, later
+	 * calls go ahead, so a wedged render cannot hold every call.
 	 */
 	private async previewRendersIdle(signal?: AbortSignal): Promise<void> {
 		const render = this.previewRenderInFlight;
-		if (!render || signal?.aborted) return;
+		if (!render || render === this.previewRenderOutwaited || signal?.aborted) return;
 		const stopped = new Promise<void>((resolve) =>
 			signal?.addEventListener("abort", () => resolve(), { once: true }),
 		);
-		await Promise.race([settleWithin(render, this.previewRenderWaitMs), stopped]);
+		const settled = await Promise.race([settleWithin(render, this.previewRenderWaitMs), stopped]);
+		if (settled?.status === "timeout") this.previewRenderOutwaited = render;
 	}
 
 	/**
