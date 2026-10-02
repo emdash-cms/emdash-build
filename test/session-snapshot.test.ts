@@ -303,6 +303,27 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		expect(sh(`git -C '${restored}' rev-list --count HEAD`).trim()).toBe("1");
 	});
 
+	it("falls back to a full clone when the shallow one fails, not when it runs out of time", () => {
+		checkpoint("first");
+		const restored = join(root, "restored");
+		const shallowClone = (exitCode: number) =>
+			write(join(root, "bin/timeout"), `#!/bin/bash\nexit ${exitCode}\n`);
+		const restore = () =>
+			spawnSync("bash", ["-c", snapshotCloneCommand(`file://${remote}`, restored)], {
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			}).status;
+
+		// A full clone downloads more than the one that just ran out of time.
+		shallowClone(124);
+		expect(restore()).not.toBe(0);
+		expect(existsSync(restored)).toBe(false);
+
+		// A server that cannot serve a shallow clone still gets a full one.
+		shallowClone(128);
+		expect(restore()).toBe(0);
+		expect(readFileSync(join(restored, "src/pages/page-1.astro"), "utf8")).toBe("page 1");
+	});
+
 	it("leaves the shell session's environment as it found it", () => {
 		run(snapshotStagingCommand(site, snapshot));
 		// The sandbox's default session keeps exported variables for later commands,

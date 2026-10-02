@@ -192,13 +192,16 @@ export function snapshotPushCommand(options: {
 /**
  * Clone the latest checkpoint into the site directory without the history
  * before it, which only the checkpoints use; a server that cannot serve a
- * shallow clone gets a full one.
+ * shallow clone gets a full one. The shallow clone gets most of the restore's
+ * two minutes: one that ran out of time (124, or 137 once killed) falls back
+ * to nothing, since a full clone downloads more.
  */
 export function snapshotCloneCommand(remote: string, sitePath: string): string {
 	const site = shellQuote(sitePath);
+	const source = shellQuote(remote);
 	return (
-		// The shallow attempt gets half the time, so a stalled one leaves the fallback some.
-		`rm -rf ${site} && { timeout --signal=TERM --kill-after=2s 50s git clone -q --depth 1 ${shellQuote(remote)} ${site} || ` +
-		`{ rm -rf ${site} && git clone -q ${shellQuote(remote)} ${site}; }; }`
+		`rm -rf ${site} && ( timeout --signal=TERM --kill-after=2s 100s git clone -q --depth 1 ${source} ${site}; ` +
+		`shallow=$?; [ $shallow -eq 0 ] || { [ $shallow -ne 124 ] && [ $shallow -ne 137 ] && ` +
+		`rm -rf ${site} && git clone -q ${source} ${site}; } )`
 	);
 }
