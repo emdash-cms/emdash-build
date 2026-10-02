@@ -220,50 +220,50 @@ describe("next-step suggestions", () => {
 		).toEqual([]);
 	});
 
-	it("drops testimonials and reviews, which need the owner's real words", async () => {
+	it("drops invented social proof but keeps a review site's own reviews", async () => {
 		const run = vi.fn(async () => ({
 			response: {
 				suggestions: [
 					modelSuggestion("Add more testimonials", undefined, ["cms_content"]),
-					modelSuggestion("Add a reviews section"),
+					modelSuggestion("Add customer reviews", undefined, ["cms_content"]),
+					modelSuggestion("Build the reviews archive"),
 					modelSuggestion("Add more projects", undefined, ["cms_content"]),
 				],
 			},
 		}));
 
 		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("Build the reviews archive"),
 			suggestion("Add more projects"),
 		]);
 	});
 
-	it("drops photo work a session without photo search cannot do", async () => {
-		const offered = {
-			response: {
-				suggestions: [
-					modelSuggestion("Add a photo gallery", undefined, ["edit_site", "media_upload"]),
-					modelSuggestion("Replace the hero image"),
-					modelSuggestion("Tighten the gallery captions"),
-				],
-			},
-		};
+	it("drops getting new photos without photo search, but not editing the ones there", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const newPhotos = [
+			"Add a photo gallery",
+			"Replace the hero image",
+			"Add more location-based photos",
+		];
+		const imageEdits = [
+			"Add a lightbox to project images",
+			"Add captions to gallery photos",
+			"Show more images per row",
+		];
 		const toolNames = ["write_file", "search_unsplash", "upload_media"];
+		const keyless = { toolNames, canSearchUnsplash: false };
+		const keyed = { toolNames, canSearchUnsplash: true };
 
-		expect(
-			await suggestNextSteps({ run: vi.fn(async () => offered) }, "Brief", {
-				toolNames,
-				canSearchUnsplash: false,
-			}),
-		).toEqual([suggestion("Tighten the gallery captions")]);
-		expect(
-			await suggestNextSteps({ run: vi.fn(async () => offered) }, "Brief", {
-				toolNames,
-				canSearchUnsplash: true,
-			}),
-		).toEqual([
-			suggestion("Add a photo gallery"),
-			suggestion("Replace the hero image"),
-			suggestion("Tighten the gallery captions"),
-		]);
+		expect(await suggestNextSteps({ run: reply(newPhotos) }, "Brief", keyless)).toEqual([]);
+		expect(await suggestNextSteps({ run: reply(newPhotos) }, "Brief", keyed)).toEqual(
+			newPhotos.map((label) => suggestion(label)),
+		);
+		expect(await suggestNextSteps({ run: reply(imageEdits) }, "Brief", keyless)).toEqual(
+			imageEdits.map((label) => suggestion(label)),
+		);
 	});
 
 	it("gives the model the brief and the latest reply as plain text only", () => {

@@ -125,16 +125,17 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\b(?:payments?|checkout|stripe|paypal)\b/i,
 	/\b(?:bookings?|reservations?)\b/i,
 	/\b(?:user accounts?|authentication|sign[ -]?in|log[ -]?in|registration)\b/i,
-	// The build prompt forbids inventing them.
-	/\b(?:testimonials?|reviews?)\b/i,
+	// Invented social proof, which the build prompt forbids; a review site's own reviews are content.
+	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+ratings?\b/i,
 ];
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
 	{
 		capability: "media_search",
-		// Without a search, the only images left are ones the user already gave.
+		// Getting new photos; without a search, the only images left are ones the user already
+		// gave. A preposition before the photo word makes it an edit: "a lightbox to project images".
 		pattern:
-			/\bunsplash\b|\b(?:find|search|source|add|more|new|replace|swap)\b.{0,40}\b(?:photos?|images?|photography|imagery)\b/i,
+			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|photography|imagery)\b/i,
 	},
 ];
 
