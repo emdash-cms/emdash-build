@@ -829,7 +829,7 @@ const schemaSlug = z
 	.min(1)
 	.max(63)
 	.regex(/^[a-z][a-z0-9_]*$/);
-// Mirrors EmDash 0.40's RESERVED_FIELD_SLUGS for collection-plan preflight.
+// Mirrors EmDash 1.1's RESERVED_FIELD_SLUGS for collection-plan preflight.
 // Core remains authoritative; this prevents an otherwise-valid batch from
 // partially mutating before schema_create_field reports the reserved name.
 const RESERVED_COLLECTION_FIELD_SLUGS = new Set([
@@ -858,6 +858,19 @@ const collectionFieldSlug = schemaSlug
 	.describe(
 		"Field slug. Do not declare built-in entry fields: id, slug, status, timestamps, terms, or bylines.",
 	);
+// Mirrors EmDash 1.1's RESERVED_COLLECTION_SLUGS, names its own routes shadow, so a
+// plan cannot create its earlier collections and then fail on this one.
+const RESERVED_COLLECTION_SLUGS = new Set([
+	"content",
+	"media",
+	"users",
+	"revisions",
+	"taxonomies",
+	"options",
+	"audit_logs",
+	"reorder",
+	"relations",
+]);
 const stringOptions = z.array(z.string().min(1)).min(1);
 const mimeTypes = z.array(z.string().min(1)).min(1).max(64);
 const blockFieldBase = z.object({
@@ -997,11 +1010,14 @@ const blocksFieldSchema = z
 	.strict();
 
 const collectionPlanSchema = z.object({
-	slug: schemaSlug,
+	slug: schemaSlug.refine(
+		(slug) => !RESERVED_COLLECTION_SLUGS.has(slug),
+		`Collection slugs cannot be ${[...RESERVED_COLLECTION_SLUGS].join(", ")}`,
+	),
 	label: z.string().min(1),
 	labelSingular: z.string().optional(),
 	description: z.string().optional(),
-	icon: z.string().optional(),
+	icon: z.string().trim().max(64).optional(),
 	supports: z
 		.array(z.enum(["drafts", "revisions", "preview", "scheduling", "search", "seo"]))
 		.optional(),
@@ -1010,11 +1026,19 @@ const collectionPlanSchema = z.object({
 	urlPattern: z
 		.string()
 		.regex(/^\/(?!\/)[^{}]*(?:\{(?:slug|id)\}[^{}]*)+$/)
+		// EmDash 1.1 refuses two in one segment, and only once it has created the collection.
+		.refine(
+			(pattern) =>
+				pattern
+					.split("/")
+					.every((segment) => (segment.match(/\{(?:slug|id)\}/g) ?? []).length <= 1),
+			"Use at most one placeholder per path segment, e.g. /journal/{slug}, not /journal/{slug}-{id}",
+		)
 		.optional()
 		.describe(
 			'Public URL of one entry, matching its Astro detail route, e.g. "/{slug}" for ' +
 				'pages or "/journal/{slug}". Menus and the sitemap link entries here; without ' +
-				"it they use /{collection}/{slug}. Placeholders: {slug}, {id}.",
+				"it they use /{collection}/{slug}. Placeholders: {slug}, {id}, at most one per path segment.",
 		),
 	fields: z
 		.array(z.union([ordinaryFieldSchema, blocksFieldSchema]))
