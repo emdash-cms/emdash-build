@@ -100,15 +100,18 @@ function buildSystemPrompt(capabilities: readonly SuggestionCapability[]): strin
 	const cannotPublish = capabilities.some((capability) => capability.id === "publish_site")
 		? ""
 		: " Publishing the site is not available in this session.";
+	const cannotFindPhotos = capabilities.some((capability) => capability.id === "media_search")
+		? ""
+		: " Photo search is not available in this session, so never suggest adding or replacing photos.";
 	// Asked only for unfinished work, the model found none after a complete build.
 	return `Suggest what the site owner is most likely to ask an AI website builder for next. The site uses Astro and EmDash CMS.
 
 Available session capabilities:
 ${available}
 
-Anything not listed is unavailable.${cannotPublish}
+Anything not listed is unavailable.${cannotPublish}${cannotFindPhotos}
 
-Return exactly ${MAX_SUGGESTIONS} suggestions, strongest first. Each must be a specific change to this site that the builder can make now with the listed capabilities, using only information already in the conversation: for example a new section or page the brief implies, more entries for a collection the site already has, or a concrete design or interaction refinement. Never suggest external services, email delivery, payments, bookings, user accounts, comments, or anything that needs the owner to supply facts, copy, prices, credentials, or images. Never suggest generic audits, vague polishing, or work the builder already did.
+Return exactly ${MAX_SUGGESTIONS} suggestions, strongest first. Each must be a specific change to this site that the builder can make now with the listed capabilities, using only information already in the conversation: for example a new section or page the brief implies, more entries for a collection the site already has, or a concrete design or interaction refinement. Never suggest external services, email delivery, payments, bookings, user accounts, comments, invented testimonials, reviews, or ratings, or anything that needs the owner to supply facts, copy, prices, credentials, or images. Never suggest generic audits, vague polishing, or work the builder already did.
 
 Each suggestion has:
 - label: an imperative of 2 to 5 words in sentence case, at most 32 characters, with no ending punctuation.
@@ -126,7 +129,7 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\b(?:bookings?|reservations?)\b/i,
 	/\b(?:user accounts?|authentication|sign[ -]?in|log[ -]?in|registration)\b/i,
 	// Invented social proof, which the build prompt forbids; a review site's own reviews are content.
-	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+ratings?\b/i,
+	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+ratings?\b|\b\d-star\b/i,
 ];
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
@@ -135,7 +138,7 @@ const ACTION_CAPABILITY_REQUIREMENTS = [
 		// Getting new photos; without a search, the only images left are ones the user already
 		// gave. A preposition before the photo word makes it an edit: "a lightbox to project images".
 		pattern:
-			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|photography|imagery)\b/i,
+			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b/i,
 	},
 ];
 

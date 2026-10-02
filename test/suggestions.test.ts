@@ -220,6 +220,41 @@ describe("next-step suggestions", () => {
 		).toEqual([]);
 	});
 
+	it("tells the model which work it may not suggest, so it need not be filtered out", async () => {
+		const requests: any[] = [];
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			requests.push(input);
+			return { response: { suggestions: [] } };
+		});
+		const toolNames = ["write_file", "search_unsplash", "upload_media"];
+		await suggestNextSteps({ run }, "Brief", { toolNames, canSearchUnsplash: false });
+		await suggestNextSteps({ run }, "Brief", { toolNames, canSearchUnsplash: true });
+
+		const [keyless, keyed] = requests.map((request) => request.messages[0].content as string);
+		expect(keyless).toContain("invented testimonials, reviews, or ratings");
+		expect(keyless).toContain("Photo search is not available in this session");
+		expect(keyed).not.toContain("Photo search is not available");
+	});
+
+	it("drops 5-star reviews, and headshots or pictures without photo search", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		expect(
+			await suggestNextSteps(
+				{ run: reply(["Show 5-star reviews", "Add staff headshots", "Add a picture gallery"]) },
+				"Brief",
+				keyless,
+			),
+		).toEqual([]);
+	});
+
 	it("drops invented social proof but keeps a review site's own reviews", async () => {
 		const run = vi.fn(async () => ({
 			response: {
