@@ -1032,7 +1032,15 @@ const schemaPlanInput = z
 						description: z.string().optional(),
 						icon: z.string().optional(),
 						category: z.string().optional(),
-						fields: z.array(blockFieldSchema),
+						// EmDash takes only absolute URLs in a url field, and the model fills
+						// its link fields with internal paths such as "/events": a string.
+						fields: z
+							.array(blockFieldSchema)
+							.transform((fields) =>
+								fields.map((field) =>
+									field.type === "url" ? { ...field, type: "string" as const } : field,
+								),
+							),
 					})
 					.strict(),
 			)
@@ -1123,10 +1131,16 @@ function comparableBlockField(field: unknown): unknown {
 	return canonicalContract(record);
 }
 
+/** A live block field as a plan would declare it now: plans make url fields strings. */
+function asPlanned(field: unknown): unknown {
+	const record = recordValue(field);
+	return comparableBlockField(record?.type === "url" ? { ...record, type: "string" } : field);
+}
+
 function inspectBlockType(
 	parsed: unknown,
 	plan?: BlockTypePlan,
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true; urlFields: string[] } | { ok: false; reason: string } {
 	const item = extractedBlockType(parsed);
 	if (!item) return { ok: false, reason: "the block type response was incomplete" };
 	const versions = item.versions as unknown[];
@@ -1141,7 +1155,7 @@ function inspectBlockType(
 	if (!Array.isArray(active.fields)) {
 		return { ok: false, reason: "its active fields are missing" };
 	}
-	if (!plan) return { ok: true };
+	if (!plan) return { ok: true, urlFields: [] };
 	if (item.slug !== plan.slug || item.label !== plan.label) {
 		return { ok: false, reason: "its slug or label differs from the plan" };
 	}
@@ -1151,12 +1165,16 @@ function inspectBlockType(
 		}
 	}
 	if (
-		JSON.stringify((active.fields as unknown[]).map(comparableBlockField)) !==
+		JSON.stringify((active.fields as unknown[]).map(asPlanned)) !==
 		JSON.stringify(plan.fields.map(comparableBlockField))
 	) {
 		return { ok: false, reason: "its active fields differ from the plan" };
 	}
-	return { ok: true };
+	const urlFields = (active.fields as unknown[])
+		.map(recordValue)
+		.filter((field) => field?.type === "url")
+		.map((field) => String(field?.slug));
+	return { ok: true, urlFields };
 }
 
 function collectionFieldMap(
@@ -5414,6 +5432,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							let createdBlockFields = 0;
 							let skippedBlockFields = 0;
 							let updatedUrlPatterns = 0;
+							const notes: string[] = [];
 							let mutationDispatched = false;
 							let ambiguousCommit = false;
 							let checkpointed = false;
@@ -5501,6 +5520,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									if (!inspected.ok) {
 										return fail(
 											`Block type ${blockType.slug} already exists but ${inspected.reason}. Use the renderer-aware block update workflow instead.`,
+										);
+									}
+									for (const slug of inspected.urlFields) {
+										notes.push(
+											`${blockType.slug}.${slug} is still a url field, which takes only absolute URLs. Store absolute URLs in it, or change it with schema_update_block_type to store a path such as "/events".`,
 										);
 									}
 									skippedBlockTypes += 1;
@@ -5732,6 +5756,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								success: true as const,
 								changed: confirmedChanged(),
 								...counters(),
+								...(notes.length > 0 ? { notes } : {}),
 								types,
 							};
 						},
