@@ -1,7 +1,7 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PORT_TOKENS_KEY } from "../src/worker/preview-tokens.js";
-import { sendableCloseCode, type Sandbox } from "../src/worker/sandbox.js";
+import { bridgeWebSocket, sendableCloseCode, type Sandbox } from "../src/worker/sandbox.js";
 import type { SandboxCapacity } from "../src/worker/sandbox-capacity.js";
 
 const testEnv = env as typeof env & {
@@ -124,6 +124,29 @@ describe("Sandbox preview routing", () => {
 			);
 			expect(forwarded?.headers.get("x-sandbox-preview-token")).toBeNull();
 		});
+	});
+
+	it("relays a binary WebSocket frame as the bytes sent", async () => {
+		const [containerEnd, containerSide] = Object.values(new WebSocketPair()) as [
+			WebSocket,
+			WebSocket,
+		];
+		containerSide.accept();
+		const browser = bridgeWebSocket(
+			new Response(null, { status: 101, webSocket: containerEnd }),
+		).webSocket!;
+		browser.accept();
+		const received = new Promise<unknown>((resolve) => {
+			browser.addEventListener("message", (event) => resolve(event.data), { once: true });
+			setTimeout(() => resolve("nothing arrived"), 1_000);
+		});
+
+		containerSide.send(new Uint8Array([1, 2, 3]));
+
+		const data = await received;
+		expect(data instanceof Blob ? await data.arrayBuffer() : data).toEqual(
+			new Uint8Array([1, 2, 3]).buffer,
+		);
 	});
 
 	it("never starts a stopped container for preview traffic, and says it is paused", async () => {

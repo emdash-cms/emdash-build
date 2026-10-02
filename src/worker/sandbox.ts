@@ -91,6 +91,9 @@ export function bridgeWebSocket(upstream: Response, sockets?: Set<WebSocket>): R
 	const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
 	remote.accept();
 	server.accept();
+	// A binary frame would arrive as a Blob, which send() does not take.
+	remote.binaryType = "arraybuffer";
+	server.binaryType = "arraybuffer";
 	sockets?.add(server);
 	const relay = (from: WebSocket, to: WebSocket) => {
 		from.addEventListener("message", (event) => {
