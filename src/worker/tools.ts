@@ -749,7 +749,7 @@ interface ToolOptions {
 	/** Cancellation for the build turn, including queued sandbox operations. */
 	abortSignal?: AbortSignal;
 	unsplashAccessKey?: string;
-	/** Stock photos this turn may upload; only searched ones when absent. */
+	/** Stock and random photos this turn may upload; only searched ones when absent. */
 	imageSources?: ImageSources;
 	/** Full-scope API token for the site's EmDash instance (Worker-side only) */
 	apiToken?: string;
@@ -1172,14 +1172,14 @@ export function createMediaTools(options: {
 	checkpoint: () => Promise<void>;
 	abortSignal?: AbortSignal;
 	unsplashAccessKey?: string;
-	/** Searches add to it; uploads take stock photos only from it. */
+	/** Searches add to it; uploads take stock and random photos only from it. */
 	imageSources: ImageSources;
 	apiToken?: string;
 	cmsBaseUrl?: string;
 }) {
 	const unsourcedImage = options.unsplashAccessKey
-		? "Not a photo search_unsplash returned or the user gave. Search for photos instead of writing stock photo URLs from memory: those show the wrong subject or no longer exist."
-		: "Not a stock photo the user gave. There is no photo search in this session, so use images the user supplied, or design without photography; never write a stock photo URL from memory.";
+		? "Not a photo search_unsplash returned or the user gave. Search for photos instead of writing photo URLs from memory: remembered and random-photo URLs show the wrong subject or no longer exist."
+		: "Not an image the user gave. There is no photo search in this session, so use images the user supplied, or design without photography; never write a photo URL from memory.";
 	const tools = {
 		search_unsplash: tool({
 			description:
@@ -1236,9 +1236,9 @@ export function createMediaTools(options: {
 				"URLs: each result includes a `fieldValue` " +
 				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
 				"field when calling content_create/content_update. Results come back in input order and " +
-				"echo each `url` so you can match them to the right entry. Stock photos (Unsplash, Pexels, " +
-				"Pixabay) upload only when search_unsplash returned them or the user gave them; never write " +
-				"a stock photo URL from memory.",
+				"echo each `url` so you can match them to the right entry. Stock, random and placeholder photo " +
+				"URLs (Unsplash, Pexels, Pixabay, Picsum, LoremFlickr, placeholder services) upload only when " +
+				"search_unsplash returned them or the user gave them; never write a photo URL from memory.",
 			inputSchema: z.object({
 				images: z
 					.array(
