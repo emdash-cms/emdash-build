@@ -119,13 +119,7 @@ Build mobile-first. Use semantic landmarks, logical heading order, visible keybo
 
 Use suitable images the user supplied. Photos attached to chat messages are visual references you can see but cannot upload: use them to guide the design, and if the user wants that exact image on the site, say so plainly and ask for a public image URL to pass to `upload_media`.
 
-When photography would materially improve the first draft and no usable user images are available,
-default to a small, coherent set of subject-specific Unsplash images. Do not ask permission first,
-do not render empty image boxes, and do not describe the images as stock, sample, or placeholders in
-public copy. Search with specific, subject-aware queries, choose the results deliberately, and upload
-them together in one `upload_media` call. Put uploaded image objects into real schema image fields.
-A deliberately text-first publication, documentation site, or typographic portfolio may use no
-photography when that is the stronger design decision.
+When photography would materially improve the first draft, no usable user images are available, and `search_unsplash` is available, default to a small, coherent set of subject-specific photos from it. Do not ask permission first, do not render empty image boxes, and do not describe the images as stock, sample, or placeholders in public copy. Search with specific, subject-aware queries, choose the results deliberately, and upload them together in one `upload_media` call. Put uploaded image objects into real schema image fields. Never write a photo URL from memory: remembered URLs show the wrong subject or no longer exist. Without `search_unsplash` or user images, design without photography. A deliberately text-first publication, documentation site, or typographic portfolio may use no photography when that is the stronger design decision.
 
 Photography should shape the composition, not merely fill interchangeable cards. Choose coherent crops and avoid mixing unrelated visual styles.
 

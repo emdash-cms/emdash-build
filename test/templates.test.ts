@@ -59,7 +59,13 @@ describe("builder template prototype", () => {
 		);
 		expect(prompt).toContain("smallest complete, navigable, editable version");
 		expect(prompt).toContain(
-			"default to a small, coherent set of subject-specific Unsplash images",
+			"and `search_unsplash` is available, default to a small, coherent set of subject-specific photos from it",
+		);
+		// Asked for Unsplash photos it could not search for, the model wrote URLs from memory.
+		expect(prompt).not.toContain("subject-specific Unsplash images");
+		expect(prompt).toContain("Never write a photo URL from memory");
+		expect(prompt).toContain(
+			"Without `search_unsplash` or user images, design without photography",
 		);
 		expect(prompt).toContain("do not describe the images as stock, sample, or placeholders");
 		expect(prompt).toContain("never put scaffolding language");
