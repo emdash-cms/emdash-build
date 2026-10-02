@@ -267,6 +267,40 @@ describe("stopping an idle container", () => {
 	});
 });
 
+interface RestoreHarness {
+	doRecoverSite: (hostname: string) => Promise<{ ready: boolean; restored?: boolean }>;
+	recoverSite: (hostname: string) => Promise<{ ready: boolean }>;
+	activeBuildConvergences: Map<string, unknown>;
+	toolSandboxOps: () => {
+		readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+	};
+}
+
+/** A container whose site is gone, or still there, for a recovery to bring back. */
+function restorableSite(instance: object, site: { present: boolean; installCode: number }) {
+	Object.assign(instance, {
+		waitForSandbox: async () => ({ ok: true }),
+		// No dev server answers.
+		execRecoveryCommand: async (command: string) => ({
+			success: command.includes("package.json") && site.present,
+		}),
+		sandboxOps: () => ({
+			exec: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+			readFile: async () => ({ success: true, content: "restored" }),
+		}),
+		getArtifactsRepoForRead: async () => ({
+			remote: "https://artifacts.example/site.git",
+			token: "token",
+		}),
+		restoreDependencies: async () => site.installCode,
+		exposePreview: async () => ({ url: "http://4321-site-tok.localhost:5173/" }),
+		startDevServer: async () => {},
+		refreshPreviewSnapshots: async () => true,
+		getApiToken: () => undefined,
+	});
+	return site;
+}
+
 describe("tool calls that find the container stopped", () => {
 	beforeEach(async () => {
 		await reset();
@@ -413,19 +447,8 @@ describe("tool calls that find the container stopped", () => {
 	it("report once a restore during a build that no call waited on", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000b");
 		await runInDurableObject(agent, async (instance) => {
-			const harness = instance as unknown as {
-				sandboxOps: () => unknown;
-				doRecoverSite: () => Promise<{ ready: boolean; restored?: boolean }>;
-				recoverSite: (hostname: string) => Promise<{ ready: boolean }>;
-				activeBuildConvergences: Map<string, unknown>;
-				toolSandboxOps: () => {
-					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
-				};
-			};
-			harness.sandboxOps = () => ({
-				readFile: async () => ({ success: true, content: "restored" }),
-			});
-			harness.doRecoverSite = async () => ({ ready: true, restored: true });
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
 			const read = () => harness.toolSandboxOps().readFile("/home/user/site/a.astro");
 
 			// Before a build, as when the project is opened: nothing the model made is lost.
@@ -440,38 +463,32 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("report a restore that replaced the site, though the rest of it failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000d");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 1 });
+			const harness = instance as unknown as RestoreHarness;
+			harness.activeBuildConvergences.set("request", {});
+
+			await expect(harness.recoverSite("localhost:5173")).resolves.toMatchObject({ ready: false });
+			// The container runs on, with the checkpoint's files in place of the model's.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
 	it("say when a recovery brought the site back from its checkpoint", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000c");
 		await runInDurableObject(agent, async (instance) => {
-			let sitePresent = false;
-			const harness = instance as unknown as {
-				doRecoverSite: (hostname: string) => Promise<{ ready: boolean; restored?: boolean }>;
-			};
-			Object.assign(harness, {
-				waitForSandbox: async () => ({ ok: true }),
-				// No dev server answers, and the site is gone or still there.
-				execRecoveryCommand: async (command: string) => ({
-					success: command.includes("package.json") && sitePresent,
-				}),
-				sandboxOps: () => ({
-					exec: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
-				}),
-				getArtifactsRepoForRead: async () => ({
-					remote: "https://artifacts.example/site.git",
-					token: "token",
-				}),
-				restoreDependencies: async () => 0,
-				exposePreview: async () => ({ url: "http://4321-site-tok.localhost:5173/" }),
-				startDevServer: async () => {},
-				refreshPreviewSnapshots: async () => true,
-				getApiToken: () => undefined,
-			});
+			const site = restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
 
 			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
 				ready: true,
 				restored: true,
 			});
-			sitePresent = true;
+			site.present = true;
 			const restarted = await harness.doRecoverSite("localhost:5173");
 			expect(restarted.ready).toBe(true);
 			expect(restarted.restored).toBeUndefined();

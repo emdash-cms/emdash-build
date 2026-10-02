@@ -3408,20 +3408,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private recoverSite(hostname: string, reconnectMcp = false): Promise<SiteRecoveryResult> {
 		if (reconnectMcp) this.recoveryReconnectMcp = true;
 		if (this.recoveryPromise) return this.recoveryPromise;
-		const pending = this.doRecoverSite(hostname)
-			.then((result) => {
-				// Mid-build, what the model changed since the last saved checkpoint may be gone.
-				if (result.restored && this.activeBuildConvergences.size > 0) {
-					this.restoreUnreported = true;
-				}
-				return result;
-			})
-			.finally(() => {
-				if (this.recoveryPromise === pending) {
-					this.recoveryPromise = null;
-					this.recoveryReconnectMcp = false;
-				}
-			});
+		const pending = this.doRecoverSite(hostname).finally(() => {
+			if (this.recoveryPromise === pending) {
+				this.recoveryPromise = null;
+				this.recoveryReconnectMcp = false;
+			}
+		});
 		this.recoveryPromise = pending;
 		return pending;
 	}
@@ -3503,6 +3495,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				);
 				return { ready: false, error: "The saved site snapshot could not be restored." };
 			}
+			// The site is its checkpoint now, whatever happens next: mid-build, what the
+			// model changed since that checkpoint may be gone.
+			if (this.activeBuildConvergences.size > 0) this.restoreUnreported = true;
 			const installCode = await this.restoreDependencies();
 			if (installCode !== 0) {
 				this.sendConsole(`pnpm install failed during restore (exit ${installCode})`);
