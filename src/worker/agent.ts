@@ -608,8 +608,6 @@ export interface BuilderState extends BuilderReadinessState {
 	sandboxPaused?: boolean;
 }
 
-/** Container calls that change nothing, so they can be made again after a restore. */
-const SANDBOX_READS = new Set(["readFile", "readFileStream", "listFiles"]);
 const SANDBOX_RESTORED =
 	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
 
@@ -2482,9 +2480,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/**
 	 * The Sandbox as the model's tools reach it. A call that found the
 	 * container stopped ran nothing, so the site is restored from its last
-	 * checkpoint. A read is then made once more; anything else fails with a
-	 * message saying so, because earlier writes of the same tool, or changes
-	 * since the checkpoint, may be gone. Recovery itself uses `sandboxOps`.
+	 * checkpoint and the call fails with a message saying so: changes since
+	 * that checkpoint, earlier writes of the same tool or of tools whose upload
+	 * had not finished, may be gone, and a read would not show it. Recovery
+	 * itself uses `sandboxOps`.
 	 */
 	private toolSandboxOps(): SandboxOps {
 		const sandbox = this.sandboxOps();
@@ -2508,8 +2507,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						this.sendConsole("The site's container had stopped; restoring it...");
 						const recovered = await this.recoverSite(this.recoveryHostname(), true);
 						if (!recovered.ready) throw error;
-						if (!SANDBOX_READS.has(String(property))) throw new Error(SANDBOX_RESTORED);
-						return call(this.sandboxOps(), property, args);
+						throw new Error(SANDBOX_RESTORED);
 					}
 				};
 			},

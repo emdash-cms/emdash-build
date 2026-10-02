@@ -272,7 +272,7 @@ describe("tool calls that find the container stopped", () => {
 		await reset();
 	});
 
-	it("restore the site, repeat a read, and report a write that may need redoing", async () => {
+	it("restore the site and report every call that may need redoing, a read included", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000007");
 		await runInDurableObject(agent, async (instance) => {
 			let running = false;
@@ -297,11 +297,15 @@ describe("tool calls that find the container stopped", () => {
 			});
 			harness.recoverSite = recoverSite;
 
+			// What it reads now may be older than changes the model was told were saved.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
 			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
 				success: true,
 				content: "restored",
 			});
-			expect(recoverSite).toHaveBeenCalledOnce();
 
 			running = false;
 			await expect(
