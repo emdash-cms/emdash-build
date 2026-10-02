@@ -1,5 +1,5 @@
 diff --git a/dist/block-values-H4E0XwE8.mjs b/dist/block-values-H4E0XwE8.mjs
-index b7dc399..5449e7a 100644
+index b7dc399..d7f4238 100644
 --- a/dist/block-values-H4E0XwE8.mjs
 +++ b/dist/block-values-H4E0XwE8.mjs
 @@ -102,14 +102,20 @@ function normalizeBlockArray(field, value, existingValue, types, options) {
@@ -18,9 +18,9 @@ index b7dc399..5449e7a 100644
 -		if (!isRecord(rawBlock)) validationError(blockPath, "must be an object");
 +		if (!isRecord(input)) validationError(blockPath, "must be an object");
 +		const stored = typeof input._key === "string" ? existing.get(input._key) : void 0;
-+		const rawBlock = input._type === void 0 && soleType !== void 0 ? {
++		const rawBlock = input._type === void 0 && soleType !== void 0 && (!stored || stored._type === soleType) ? {
 +			...input,
-+			_type: stored ? stored._type : soleType
++			_type: soleType
 +		} : input;
  		if (typeof rawBlock._type !== "string" || rawBlock._type.length === 0) validationError(`${blockPath}._type`, "must be a block type slug");
  		if (rawBlock._version !== void 0 && (typeof rawBlock._version !== "number" || !Number.isInteger(rawBlock._version) || rawBlock._version < 1)) validationError(`${blockPath}._version`, "must be a positive integer");
