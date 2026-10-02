@@ -253,11 +253,10 @@ export class CmsScriptRun {
 	mutations = 0;
 	failedMutations = 0;
 	refused = 0;
-	/** Changes still running when the program returned: it did not await them. */
+	/** Calls still running when the program returned: it did not await them. */
 	unawaited = 0;
 	/** Changes the program asked for after it returned, refused. */
 	lateCalls = 0;
-	private readonly inFlightChanges = new Set<Promise<unknown>>();
 	private readonly loggedRefusals = new Set<string>();
 	private searches = 0;
 	private images = 0;
@@ -316,7 +315,6 @@ export class CmsScriptRun {
 				});
 			})();
 			this.inFlight.add(call);
-			if (isCmsScriptMutation(name)) this.inFlightChanges.add(call);
 			try {
 				const output = await call;
 				const failed = isObject(output) && output.success === false;
@@ -333,7 +331,6 @@ export class CmsScriptRun {
 				throw error instanceof Error ? error : new Error(String(error));
 			} finally {
 				this.inFlight.delete(call);
-				this.inFlightChanges.delete(call);
 			}
 		};
 	}
@@ -433,7 +430,8 @@ export class CmsScriptRun {
 		);
 		try {
 			const outcome = await Promise.race([watchdog, stopped]);
-			if (!outcome.stop) this.unawaited = this.inFlightChanges.size;
+			// A read counts too: the change waiting on it can no longer be made.
+			if (!outcome.stop) this.unawaited = this.inFlight.size;
 			return outcome.error === "Execution timed out" ? { ...outcome, stop: "timeout" } : outcome;
 		} finally {
 			if (onAbort) this.signal.removeEventListener("abort", onAbort);
@@ -484,13 +482,13 @@ export function cmsScriptOutput(
 	};
 }
 
-/** Why a program that returned with changes still running, or asking for more, fails. */
+/** Why a program that returned with calls still running, or asking for more, fails. */
 function unfinishedCalls(run: CmsScriptRun): string | undefined {
-	const plural = (count: number) => `${count} cms change${count === 1 ? "" : "s"}`;
+	const plural = (count: number, kind: string) => `${count} cms ${kind}${count === 1 ? "" : "s"}`;
 	const parts = [
-		...(run.unawaited > 0 ? [`returned before ${plural(run.unawaited)} finished`] : []),
+		...(run.unawaited > 0 ? [`returned before ${plural(run.unawaited, "call")} finished`] : []),
 		...(run.lateCalls > 0
-			? [`made ${plural(run.lateCalls)} after it returned, which were refused`]
+			? [`made ${plural(run.lateCalls, "change")} after it returned, which were refused`]
 			: []),
 	];
 	if (parts.length === 0) return undefined;

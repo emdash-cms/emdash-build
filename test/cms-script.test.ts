@@ -488,12 +488,44 @@ describe("CMS programs", () => {
 		const output = cmsScriptOutput(outcome, run, true);
 
 		expect(output.success).toBe(false);
-		expect(output.error).toMatch(/returned before 2 cms changes finished/);
+		expect(output.error).toMatch(/returned before 2 cms calls finished/);
 		expect(output.error).toMatch(/made 2 cms changes after it returned, which were refused/);
 		expect(output.error).toMatch(/await/);
 	});
 
-	it("passes a program whose unawaited reads never mattered", async () => {
+	it("fails a program that returns while the reads its changes wait on are running", async () => {
+		const set = tools();
+		const slow = set.content_get;
+		set.content_get = {
+			...slow,
+			execute: async (input: Record<string, unknown>, options: { abortSignal?: AbortSignal }) => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				return slow.execute(input, options);
+			},
+		};
+		const run = new CmsScriptRun({ toolCallId: "call-read-first" });
+		const executor = new ScriptedExecutor(async (cms) => {
+			// An update needs the entry's _rev, so each unawaited callback reads first.
+			for (const id of ["a", "b"]) {
+				void (async () => {
+					const { _rev } = (await cms.content_get!({ id })) as { _rev: string };
+					// A Dynamic Worker hears back over RPC, after the result was built.
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					await cms.settings_update!({ title: `${id} ${_rev}` });
+				})().catch(() => undefined);
+			}
+			return { updated: 2 };
+		});
+
+		const outcome = await run.execute(executor, "code", bindAll(run, set));
+		await run.close();
+		const output = cmsScriptOutput(outcome, run, false);
+
+		expect(output.success).toBe(false);
+		expect(output.error).toMatch(/returned before 2 cms calls finished/);
+	});
+
+	it("names a read left running beside the change that failed", async () => {
 		const set = tools();
 		const slow = set.content_get;
 		set.content_get = {
@@ -517,8 +549,12 @@ describe("CMS programs", () => {
 		await run.close();
 		const output = cmsScriptOutput(outcome, run, false);
 
-		// The failed change fails it, not the read it left running.
-		expect(output.error).toBeUndefined();
+		// A read left running could have led to a change, so it fails the program too.
+		expect(output.success).toBe(false);
+		expect(output.error).toMatch(/returned before 1 cms call finished/);
+		expect(output.log).toEqual([
+			{ tool: "settings_update", ok: false, error: "[VALIDATION_ERROR] title" },
+		]);
 		expect(output.result).toBe("settings were refused");
 	});
 
