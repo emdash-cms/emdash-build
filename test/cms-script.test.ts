@@ -596,6 +596,27 @@ describe("CMS programs", () => {
 		]);
 	});
 
+	it("logs a repeated input that is not an object once, however often a program sends it", async () => {
+		const set = tools();
+		const run = new CmsScriptRun({ toolCallId: "call-refused-loop" });
+		const executor: Executor = {
+			execute: async (_code, providers) => {
+				const cms = (providers as ResolvedProvider[])[0]!.fns;
+				for (let index = 0; index < 1_000; index++) {
+					await cms.content_get!(null).catch(() => undefined);
+				}
+				return { result: "ok" };
+			},
+		};
+
+		await run.execute(executor, "code", {
+			content_get: run.bind("content_get", set.content_get as never),
+		});
+
+		expect(run.refused).toBe(1_000);
+		expect(run.log).toHaveLength(1);
+	});
+
 	it("fails a program that made no calls and returned nothing", async () => {
 		const run = new CmsScriptRun({ toolCallId: "call-noop" });
 		const executor: Executor = { execute: async () => ({ result: undefined }) };

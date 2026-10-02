@@ -286,7 +286,11 @@ export class CmsScriptRun {
 			if (input === null || typeof input !== "object" || Array.isArray(input)) {
 				const message = `${name}: the input must be an object`;
 				this.refused += 1;
-				this.log.push({ tool: name, ok: false, error: message });
+				// It has no reference, so a repeat would only grow the log.
+				if (!this.loggedRefusals.has(message)) {
+					this.loggedRefusals.add(message);
+					this.log.push({ tool: name, ok: false, error: message });
+				}
 				throw new Error(message);
 			}
 			this.signal.throwIfAborted();
