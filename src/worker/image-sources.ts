@@ -1,24 +1,23 @@
 /**
- * Hosts whose image URLs the model writes without having seen the image: stock
- * catalogues it remembers, random-photo services, and placeholder generators.
- * Asked for photos it could not search for, it wrote Unsplash URLs from memory
- * with alt text for the photo it expected; some showed another subject, others
- * no longer existed. Images anywhere else are the user's own, wherever they
- * live, and are not checked.
+ * Domains whose image URLs the model writes without having seen the image:
+ * stock catalogues it remembers, random-photo and random-face services, and
+ * placeholder generators. Asked for photos it could not search for, it wrote
+ * Unsplash URLs from memory with alt text for the photo it expected; some
+ * showed another subject, others no longer existed. Images anywhere else are
+ * the user's own, wherever they live, and are not checked.
  */
-const GUESSED_IMAGE_HOSTS = new Set([
-	"images.unsplash.com",
-	"plus.unsplash.com",
+const GUESSED_IMAGE_DOMAINS = [
 	"unsplash.com",
-	"source.unsplash.com",
-	"images.pexels.com",
-	"cdn.pixabay.com",
+	"pexels.com",
+	"pixabay.com",
 	"picsum.photos",
 	"loremflickr.com",
+	"pravatar.cc",
+	"randomuser.me",
 	"placehold.co",
-	"via.placeholder.com",
+	"placeholder.com",
 	"dummyimage.com",
-]);
+];
 
 /** Photos on those hosts a turn may upload: ones a photo search returned or the user wrote. */
 export class ImageSources {
@@ -53,7 +52,10 @@ function stockPhoto(url: string | URL): string | undefined {
 		const { hostname, pathname } = typeof url === "string" ? new URL(url) : url;
 		// `images.unsplash.com.` names the same host.
 		const host = hostname.replace(/\.$/, "");
-		return GUESSED_IMAGE_HOSTS.has(host) ? `${host}${pathname}`.toLowerCase() : undefined;
+		const guessed = GUESSED_IMAGE_DOMAINS.some(
+			(domain) => host === domain || host.endsWith(`.${domain}`),
+		);
+		return guessed ? `${host}${pathname}`.toLowerCase() : undefined;
 	} catch {
 		return undefined;
 	}
