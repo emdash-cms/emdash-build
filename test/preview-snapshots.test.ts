@@ -94,3 +94,32 @@ describe("preview snapshots of partial HTML", () => {
 		expect(response.status).toBe(503);
 	});
 });
+
+describe("preview renders", () => {
+	it("gives up on a render that never answers, so the route can render again", async () => {
+		const page = "<!doctype html><html><body><h1>Home</h1></body></html>";
+		const signals: AbortSignal[] = [];
+		const previews = new PreviewSnapshots({
+			sql: sql(),
+			waitUntil: () => {},
+			forwardLive: async () => html(page),
+			renderCanonical: (_path, signal) => {
+				signals.push(signal);
+				// The first never answers, even to the abort, as a wedged container would not.
+				return signals.length === 1 ? new Promise<Response>(() => {}) : Promise.resolve(html(page));
+			},
+			validatePortToken: async () => true,
+		});
+		Reflect.set(previews, "renderTimeoutMs", 20);
+
+		const stuck = await Promise.race([
+			previews.refreshPreview("/"),
+			new Promise((resolve) => setTimeout(() => resolve("still rendering"), 1_000)),
+		]);
+
+		expect(stuck).toMatchObject({ success: false, error: expect.stringMatching(/did not render/) });
+		expect(signals[0]?.aborted).toBe(true);
+		await expect(previews.refreshPreview("/")).resolves.toMatchObject({ success: true });
+		expect(previews.previewSnapshotState("/")).toBe("current");
+	});
+});

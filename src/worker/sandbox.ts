@@ -160,7 +160,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			sql: ctx.storage.sql,
 			waitUntil: (promise) => ctx.waitUntil(promise),
 			forwardLive: (request) => this.forwardLive(request),
-			renderCanonical: (cachePath) => this.renderCanonical(cachePath),
+			renderCanonical: (cachePath, signal) => this.renderCanonical(cachePath, signal),
 			validatePortToken: (port, token) => validatePortToken(ctx.storage, port, token),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
@@ -599,15 +599,15 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		}
 	}
 
-	private renderCanonical(cachePath: string): Promise<Response> {
+	private renderCanonical(cachePath: string, signal: AbortSignal): Promise<Response> {
 		const container = this.container();
 		// A stopped container serves the last good snapshot instead of waiting for a render.
 		if (!container?.running) return Promise.resolve(paused("The preview is paused."));
-		return container.getTcpPort(4321).fetch(
-			new Request(new URL(cachePath, "http://localhost:4321"), {
-				headers: { Accept: "text/html" },
-				redirect: "manual",
-			}),
-		);
+		// The signal goes in fetch's own options: workerd ignores a Request's signal there.
+		return container.getTcpPort(4321).fetch(new URL(cachePath, "http://localhost:4321"), {
+			headers: { Accept: "text/html" },
+			redirect: "manual",
+			signal,
+		});
 	}
 }
