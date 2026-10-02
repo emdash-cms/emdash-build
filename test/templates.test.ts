@@ -181,4 +181,13 @@ describe("builder template prototype", () => {
 		);
 		expect(config).toContain("service: passthroughImageService(),");
 	});
+
+	it("turns off EmDash's update check, which no site owner can act on", async () => {
+		const config = await readFile(
+			new URL("../prototype/builder-cloudflare/astro.config.mjs", import.meta.url),
+			"utf8",
+		);
+
+		expect(config).toContain("updateCheck: false,");
+	});
 });
