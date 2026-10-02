@@ -9,7 +9,7 @@ export interface Suggestion {
 	prompt: string;
 }
 
-const MAX_SUGGESTIONS = 4;
+const MAX_SUGGESTIONS = 3;
 const MAX_LABEL = 32;
 const MAX_PROMPT = 200;
 const RECENT_MESSAGES = 6;
@@ -100,19 +100,22 @@ function buildSystemPrompt(capabilities: readonly SuggestionCapability[]): strin
 	const cannotPublish = capabilities.some((capability) => capability.id === "publish_site")
 		? ""
 		: " Publishing the site is not available in this session.";
-	return `Rank the best next actions after an AI website builder finishes a change. The site uses Astro and EmDash CMS.
+	// Asked only for unfinished work, the model found none after a complete build.
+	return `Suggest what the site owner is most likely to ask an AI website builder for next. The site uses Astro and EmDash CMS.
 
 Available session capabilities:
 ${available}
 
-Anything not listed is unavailable.${cannotPublish} Only suggest an action when the conversation gives concrete evidence that it is both relevant and unfinished. It must be possible to complete now using only the listed capabilities and information already in the session. Do not suggest external services, email delivery, payments, bookings, user accounts, or comments. Do not ask the user to supply facts, copy, prices, credentials, or images. Do not suggest generic audits or vague polishing.
+Anything not listed is unavailable.${cannotPublish}
 
-Return one to ${MAX_SUGGESTIONS} suggestions, strongest first. Prefer fewer high-confidence actions over filling the list. Each suggestion has:
+Return exactly ${MAX_SUGGESTIONS} suggestions, strongest first. Each must be a specific change to this site that the builder can make now with the listed capabilities, using only information already in the conversation: for example a new section or page the brief implies, more entries for a collection the site already has, or a concrete design or interaction refinement. Never suggest external services, email delivery, payments, bookings, user accounts, comments, or anything that needs the owner to supply facts, copy, prices, credentials, or images. Never suggest generic audits, vague polishing, or work the builder already did.
+
+Each suggestion has:
 - label: an imperative of 2 to 5 words in sentence case, at most 32 characters, with no ending punctuation.
-- prompt: the specific request the user would send, one or two sentences, at most 200 characters.
+- prompt: the specific request the owner would send, one or two sentences, at most 200 characters.
 - capabilities: every capability ID needed to complete it.
 
-Do not suggest work that is already done. Respond with JSON only.`;
+Respond with JSON only.`;
 }
 
 const ALWAYS_UNSUPPORTED_ACTIONS = [
@@ -292,7 +295,9 @@ export async function suggestNextSteps(
 			max_tokens: 500,
 			temperature: 0.2,
 		});
-		return parseSuggestions(output, new Set(capabilityIds));
+		const suggestions = parseSuggestions(output, new Set(capabilityIds));
+		if (suggestions.length === 0) console.warn("[suggestions] the model suggested nothing usable");
+		return suggestions;
 	} catch (error) {
 		console.warn("[suggestions] could not suggest next steps:", error);
 		return [];
