@@ -348,6 +348,36 @@ describe("tool calls that find the container stopped", () => {
 			expect(written).toEqual(["/home/user/site/b.astro"]);
 		});
 	});
+
+	it("do not run a call on what a failed restore left", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000009");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; error?: string }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// Another call's restore got a container but could not clone the site onto it.
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "The saved site snapshot could not be restored.",
+			});
+
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("could not be restored");
+			expect(written).toEqual([]);
+		});
+	});
 });
 
 describe("installing dependencies", () => {

@@ -608,6 +608,8 @@ export interface BuilderState extends BuilderReadinessState {
 	sandboxPaused?: boolean;
 }
 
+const SANDBOX_NOT_RESTORED =
+	"The site's container had stopped and the site could not be restored from its last checkpoint.";
 const SANDBOX_RESTORED =
 	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
 
@@ -2501,7 +2503,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				if (typeof method !== "function") return method;
 				return async (...args: unknown[]) => {
 					// Another call's restore may still be cloning onto the new container's empty disk.
-					if (this.recoveryPromise) await this.recoveryPromise.catch(() => undefined);
+					const restore = this.recoveryPromise;
+					if (restore) {
+						const recovered = await restore.catch((): SiteRecoveryResult => ({ ready: false }));
+						// A failed one can leave a running container with no site, or part of one.
+						if (!recovered.ready) throw new Error(recovered.error ?? SANDBOX_NOT_RESTORED);
+					}
 					try {
 						return await call(target, property, args);
 					} catch (error) {
