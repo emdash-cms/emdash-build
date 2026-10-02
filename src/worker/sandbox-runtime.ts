@@ -58,6 +58,8 @@ export const CONTAINER_NOT_ANSWERING = "The container did not answer.";
 const READY_TIMEOUT_MS = 30_000;
 /** Every command runs under GNU timeout, which passes Stop on to the command's children. */
 const UNTIMED_COMMAND_SECONDS = 24 * 60 * 60;
+/** After its deadline, or a Stop, a command gets TERM, KILL 6 s later, and this long in all. */
+const KILL_BACKSTOP_SECONDS = 9;
 /** Command output crosses Workers RPC, whose messages are capped. */
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
 /**
@@ -448,12 +450,14 @@ export class SandboxRuntime implements ContainerOps {
 		// Stop may have come while the command was starting.
 		if (signal?.aborted) onAbort();
 		const backstop =
-			seconds !== undefined ? setTimeout(() => kill(9), (seconds + 9) * 1000) : undefined;
+			seconds !== undefined
+				? setTimeout(() => kill(9), (seconds + KILL_BACKSTOP_SECONDS) * 1000)
+				: undefined;
 		const markBytes = new TextEncoder().encode(mark);
 		const stdout = new OutputReader(process.stdout, markBytes);
 		const stderr = new OutputReader(process.stderr, markBytes);
 		try {
-			const exitCode = await process.exitCode;
+			const exitCode = await this.exitOf(process, seconds, signal);
 			// A command killed before its marks ends its streams instead, unless
 			// something it left running holds them.
 			await settleWithin(Promise.all([stdout.ended, stderr.ended]), OUTPUT_DRAIN_MAX_MS);
@@ -468,6 +472,34 @@ export class SandboxRuntime implements ContainerOps {
 			signal?.removeEventListener("abort", onAbort);
 			if (backstop) clearTimeout(backstop);
 		}
+	}
+
+	/**
+	 * A command's exit code. A container that stops answering never reports
+	 * it, and the signals that would end the command go through that container
+	 * too, so the wait gives up once the command should have been killed.
+	 */
+	private exitOf(
+		process: ExecProcess,
+		seconds: number | undefined,
+		signal?: AbortSignal,
+	): Promise<number> {
+		const answerMs = this.deps.answerTimeoutMs ?? CONTAINER_ANSWER_MS;
+		return new Promise<number>((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const giveUpAfter = (ms: number) => {
+				clearTimeout(timer);
+				timer = setTimeout(() => reject(new Error(CONTAINER_NOT_ANSWERING)), ms);
+			};
+			giveUpAfter(((seconds ?? UNTIMED_COMMAND_SECONDS) + KILL_BACKSTOP_SECONDS) * 1000 + answerMs);
+			const onAbort = () => giveUpAfter(KILL_BACKSTOP_SECONDS * 1000 + answerMs);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) onAbort();
+			process.exitCode.then(resolve, reject).finally(() => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+			});
+		});
 	}
 
 	/**

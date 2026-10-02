@@ -135,6 +135,23 @@ function setup(
 	return { container, capacity, runtime, fs, processRoot };
 }
 
+/** A command the container started and then stopped answering about: no exit, and signals go nowhere. */
+function wedgedProcess(): never {
+	return {
+		exitCode: new Promise<number>(() => {}),
+		kill() {},
+		stdout: null,
+		stderr: null,
+		stdin: null,
+		pid: 1,
+		isPty: false,
+		resize() {},
+	} as never;
+}
+
+/** Resolves after the pending promise reactions have run, on the real event loop. */
+const nextTurn = () => new Promise((resolve) => setImmediate(() => resolve("still waiting")));
+
 async function running(options?: Parameters<typeof setup>[0]) {
 	const context = setup(options);
 	await context.runtime.ensureRunning();
@@ -290,6 +307,42 @@ describe("a container that stops answering", { timeout: 30_000 }, () => {
 		);
 		await new Promise((resolve) => setTimeout(resolve, 1_200));
 		expect(existsSync(marker)).toBe(false);
+	});
+
+	it("fails a running command once it should have been killed and the container has not said so", async () => {
+		const { container, runtime } = await running({ answerTimeoutMs: 100 });
+		container.exec = async () => wedgedProcess();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		try {
+			const result = runtime.exec("sleep 60", { timeout: 1_000 }).then(
+				() => "returned",
+				(error: Error) => error.message,
+			);
+			// The deadline, the KILL backstop 9 s after it, then the usual bound.
+			await vi.advanceTimersByTimeAsync(1_000 + 9_000 + 100);
+			expect(await Promise.race([result, nextTurn()])).toBe(CONTAINER_NOT_ANSWERING);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("fails a stopped command once its KILL should have landed and the container has not said so", async () => {
+		const { container, runtime } = await running({ answerTimeoutMs: 100 });
+		container.exec = async () => wedgedProcess();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		try {
+			const controller = new AbortController();
+			const result = runtime.exec("sleep 60", { signal: controller.signal }).then(
+				() => "returned",
+				(error: Error) => error.message,
+			);
+			await vi.advanceTimersByTimeAsync(1_000);
+			controller.abort();
+			await vi.advanceTimersByTimeAsync(9_000 + 100);
+			expect(await Promise.race([result, nextTurn()])).toBe(CONTAINER_NOT_ANSWERING);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("fails to start or follow a background process the container does not start", async () => {
