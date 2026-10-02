@@ -175,8 +175,8 @@ export function snapshotPushCommand(options: {
 }): string {
 	const steps = [
 		`export GIT_DIR=${shellQuote(options.gitDir)}`,
-		// Held until this shell exits, or is killed.
-		'exec 9>>"$GIT_DIR/push.lock"',
+		// Beside the git directory, which a failed commit rebuilds; held until this shell exits.
+		'exec 9>>"$GIT_DIR.push.lock"',
 		"flock 9",
 		'cd "$GIT_DIR"',
 		"commit=$(git rev-parse refs/heads/snapshot)",

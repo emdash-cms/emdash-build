@@ -293,10 +293,12 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		const earlier = spawn("perl", [
 			"-e",
 			'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "uploading\\n"; sleep 6; open(my $m, ">", $ARGV[1]) or die; close $m',
-			join(gitDir, "push.lock"),
+			`${gitDir}.push.lock`,
 			finished,
 		]);
 		await new Promise((resolve) => earlier.stdout.once("data", resolve));
+		// A failed commit rebuilds the git directory meanwhile.
+		rmSync(gitDir, { recursive: true, force: true });
 		write(join(site, "src/pages/page-1.astro"), "edit");
 		run(snapshotStagingCommand(site, snapshot));
 		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "second", ...identity }));
