@@ -3086,12 +3086,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		await sandbox.startProcess(install, "pnpm install --prefer-offline --reporter=append-only", {
 			cwd: SITE_PATH,
 		});
-		const installLogsDone = this.pumpLogs(await sandbox.followProcessLogs(install));
 		const stopInstall = () => void sandbox.stopProcess(install);
 		signal?.addEventListener("abort", stopInstall, { once: true });
 		if (signal?.aborted) stopInstall();
+		let installLogsDone: Promise<void> | undefined;
 		let exited = false;
 		try {
+			installLogsDone = this.pumpLogs(await sandbox.followProcessLogs(install));
 			const installResult = await sandbox.waitForProcessExit(install, 300000);
 			exited = true;
 			signal?.throwIfAborted();
@@ -3100,7 +3101,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			signal?.removeEventListener("abort", stopInstall);
 			// Its log follows the install, so an install still running must stop first.
 			if (!exited) await sandbox.stopProcess(install).catch(() => undefined);
-			await installLogsDone.catch(() => {});
+			await installLogsDone?.catch(() => {});
 		}
 	}
 

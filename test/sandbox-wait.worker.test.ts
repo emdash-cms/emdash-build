@@ -387,6 +387,30 @@ describe("installing dependencies", () => {
 			expect(stopped[0]).toMatch(/^install-/);
 		});
 	});
+
+	it("stops an install whose output cannot be followed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000021");
+		await runInDurableObject(agent, async (instance) => {
+			const stopped: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				installDeps: () => Promise<number>;
+			};
+			harness.sandboxOps = () => ({
+				startProcess: async () => undefined,
+				followProcessLogs: async () => {
+					throw new Error("The container did not answer.");
+				},
+				stopProcess: async (id: string) => {
+					stopped.push(id);
+				},
+			});
+
+			await expect(harness.installDeps()).rejects.toThrow("did not answer");
+			// Left running, it would race the next install in the same directory.
+			expect(stopped).toEqual([expect.stringMatching(/^install-/)]);
+		});
+	});
 });
 
 describe("the tools' view of the Sandbox", () => {
