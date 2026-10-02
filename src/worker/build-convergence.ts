@@ -661,6 +661,20 @@ const ABANDONED_REPAIR_NOTE =
 const BYPASSED_REPAIR_NOTE =
 	"A later call of the same tool succeeded, but not as these failed calls; one may have been retried under another name or slug. Check each is covered (for example with content_list) before creating it again; otherwise say in your final summary what is still missing:";
 
+/**
+ * Say which failure a forced step is for: two calls of one tool can fail the
+ * same way, and a retry of the other would look like the repair.
+ */
+function withForcedRepairNote(
+	messages: ModelMessage[],
+	failure: UnresolvedBuildFailure,
+): ModelMessage[] {
+	// Keys end with what failed: a collection, locale and entry, or an image.
+	const subject = failure.key.split("\0").slice(1).filter(Boolean).join(" / ");
+	const text = `Retry this failed ${failure.toolName} call${subject ? ` for ${subject}` : ""} now: ${failure.error.slice(0, 200)}`;
+	return [...messages, { role: "user", content: [{ type: "text", text }] }];
+}
+
 /** Keep repairs the builder no longer forces in front of the model, so its summary reports them. */
 function withAbandonedRepairNote(
 	messages: ModelMessage[],
@@ -725,7 +739,10 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 		: undefined;
 	if (unresolved && recoveryTool) {
 		convergence.noteForcedRecovery(unresolved.key);
-		return required(recoveryTool);
+		return {
+			messages: withForcedRepairNote(prunedMessages, unresolved),
+			allowedTools: { toolNames: [recoveryTool], mode: "required" },
+		};
 	}
 	if (convergence.shouldForceText()) {
 		return { messages: prunedMessages, toolChoice: "none" };

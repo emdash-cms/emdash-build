@@ -517,6 +517,28 @@ describe("build loop convergence", () => {
 		expect(convergence.hasUnresolvedFailures()).toBe(false);
 	});
 
+	it("tells the model which failure a forced repair step is for", () => {
+		const convergence = new BuildConvergence();
+		for (const name of ["rye", "sourdough"]) {
+			convergence.recordUnresolvedFailure({
+				key: `content\0posts\0\0${name}`,
+				toolName: "content_create",
+				error: "[VALIDATION_ERROR] body: required",
+			});
+		}
+
+		const { messages, allowedTools } = prepareBuildStep(convergence, [] as never, [
+			"content_create",
+		]);
+
+		// Both failed the same way: without the entry, a retry of either looks like the repair.
+		expect(allowedTools).toEqual({ toolNames: ["content_create"], mode: "required" });
+		const note = JSON.stringify(messages.at(-1));
+		expect(note).toContain("posts / rye");
+		expect(note).toContain("body: required");
+		expect(note).not.toContain("sourdough");
+	});
+
 	it("keeps a forced failure the same step recorded again, even when the call partly succeeded", () => {
 		const convergence = new BuildConvergence();
 		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
