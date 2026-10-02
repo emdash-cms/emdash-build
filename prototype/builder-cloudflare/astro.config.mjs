@@ -26,6 +26,8 @@ export default defineConfig({
 		emdash({
 			database: d1({ binding: "DB", session: "auto" }),
 			storage: r2({ binding: "MEDIA" }),
+			// The builder chooses the site's EmDash version; its owner cannot act on an update notice.
+			updateCheck: false,
 		}),
 	],
 	devToolbar: { enabled: false },
