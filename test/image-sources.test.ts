@@ -21,6 +21,11 @@ describe("image sources", () => {
 		expect(sources.allows("https://unsplash.com/photos/abc123/download")).toBe(false);
 		expect(sources.allows("https://placehold.co/600x400")).toBe(false);
 		expect(sources.allows("https://IMAGES.unsplash.com.:443/photo-x")).toBe(false);
+		// Any host of those services, and random faces passed off as named people.
+		expect(sources.allows("https://fastly.picsum.photos/id/10/1200/800.jpg")).toBe(false);
+		expect(sources.allows("https://i.pravatar.cc/300?img=5")).toBe(false);
+		expect(sources.allows("https://randomuser.me/api/portraits/women/44.jpg")).toBe(false);
+		expect(sources.allows("https://notunsplash.com/hero.jpg")).toBe(true);
 		// The user's own images: a site they named, a share link the model rewrote.
 		expect(sources.allows("https://mybakery.com/wp-content/uploads/hero.jpg")).toBe(true);
 		expect(sources.allows("https://drive.google.com/uc?export=download&id=abc")).toBe(true);
