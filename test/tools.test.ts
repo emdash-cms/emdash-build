@@ -1,8 +1,17 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
@@ -17,6 +26,9 @@ import {
 	createTools,
 	ensurePreviewHmr,
 	guardProtectedFiles,
+	MODEL_COMMAND_TIMEOUT_MS,
+	modelCommand,
+	previewScreenshotCommand,
 	typecheckInputsFingerprintCommand,
 } from "../src/worker/tools.js";
 
@@ -45,6 +57,59 @@ function validatingSandbox(
 		),
 	};
 }
+
+describe("preview screenshot", () => {
+	/** Run the screenshot's wait condition against fake images, as agent-browser would in the page. */
+	function settled(
+		images: Array<{ complete: boolean; top: number; left?: number; hidden?: boolean }>,
+		waitedMs = 0,
+	) {
+		const condition = previewScreenshotCommand("preview-1", "/tmp/shot.png").match(
+			/'wait --fn "([^"]+)"'/,
+		)?.[1];
+		const document = {
+			images: images.map((image) => ({
+				complete: image.complete,
+				getBoundingClientRect: () => ({ top: image.top, left: image.left ?? 0 }),
+				getClientRects: () => (image.hidden ? [] : [{}]),
+			})),
+		};
+		const window: Record<string, number> = {};
+		const now = Date.now();
+		const clock = { now: () => now };
+		const check = new Function(
+			"document",
+			"innerHeight",
+			"innerWidth",
+			"window",
+			"Date",
+			`return (${condition});`,
+		);
+		check(document, 640, 1024, window, clock);
+		clock.now = () => now + waitedMs;
+		return Boolean(check(document, 640, 1024, window, clock));
+	}
+
+	it("waits for the images in view, which the viewport change makes fetch a new size", () => {
+		const steps = [
+			...previewScreenshotCommand("preview-1", "/tmp/shot.png").matchAll(/'([a-z]+)[^']*'/g),
+		];
+		expect(steps.map((step) => step[1])).toEqual(["open", "set", "wait", "screenshot", "close"]);
+
+		expect(settled([{ complete: false, top: 120 }])).toBe(false);
+		expect(
+			settled([
+				{ complete: true, top: 120 },
+				{ complete: false, top: 900 },
+			]),
+		).toBe(true);
+		// Nor does a lazy image that is hidden, or off to the side, which never loads.
+		expect(settled([{ complete: false, top: 0, hidden: true }])).toBe(true);
+		expect(settled([{ complete: false, top: 120, left: 1100 }])).toBe(true);
+		// An image that never loads holds the shot five seconds at most.
+		expect(settled([{ complete: false, top: 120 }], 5_001)).toBe(true);
+	});
+});
 
 describe("preview HMR configuration", () => {
 	const config = `import { defineConfig } from "astro/config";
@@ -150,11 +215,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(checkpointSite).toHaveBeenCalledOnce();
 	});
 
-	it("retries live typegen with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries live typegen once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const types = 'declare module "emdash" { interface EmDashCollections {} }';
 		const oldSandbox = { fetchPort: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
@@ -215,11 +277,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(result.stderr).toContain("Unable to render RichText because it is undefined!");
 	});
 
-	it("retries a safe read with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries a safe read once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const oldSandbox = { readFile: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
 			readFile: vi.fn(async () => ({ success: true, content: "recovered" })),
@@ -338,6 +397,31 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 				write("worker-configuration.d.ts", "declare const env: { DB: D1Database }");
 				expect(fingerprint()).not.toBe(first);
 				expect(first).toMatch(/^[0-9a-f]{64}$/);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("fingerprints what symlinks point to, and fails rather than skip a file it cannot read", () => {
+			const root = mkdtempSync(join(tmpdir(), "emdash-fingerprint-"));
+			try {
+				const site = join(root, "site");
+				mkdirSync(join(site, "src"), { recursive: true });
+				writeFileSync(join(site, "src/index.ts"), "export {}");
+				writeFileSync(join(root, "shared.ts"), "export const a = 1;");
+				symlinkSync(join(root, "shared.ts"), join(site, "src/shared.ts"));
+				const fingerprint = () =>
+					spawnSync("bash", ["-c", typecheckInputsFingerprintCommand()], {
+						cwd: site,
+						encoding: "utf8",
+					});
+				const first = fingerprint().stdout.trim();
+				writeFileSync(join(root, "shared.ts"), "export const a: number = 'broken';");
+				expect(fingerprint().stdout.trim()).not.toBe(first);
+
+				writeFileSync(join(site, "src/secret.ts"), "export {}");
+				chmodSync(join(site, "src/secret.ts"), 0o000);
+				expect(fingerprint().status).not.toBe(0);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
@@ -1180,6 +1264,21 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	});
 });
 
+describe("photo search", () => {
+	it("is offered only with an Unsplash key, since every search fails without one", () => {
+		const options = { apiToken: "test-token", cmsBaseUrl: "https://site.example/" };
+		const keyless = createTools({} as never, toolCallbacks() as never, options);
+		const keyed = createTools({} as never, toolCallbacks() as never, {
+			...options,
+			unsplashAccessKey: "unsplash-key",
+		});
+
+		expect(Object.keys(keyless)).not.toContain("search_unsplash");
+		expect(Object.keys(keyless)).toContain("upload_media");
+		expect(Object.keys(keyed)).toContain("search_unsplash");
+	});
+});
+
 describe("stopped media batch", () => {
 	afterEach(() => vi.unstubAllGlobals());
 
@@ -1974,9 +2073,10 @@ describe("protected site files", () => {
 		await expect(run({ command: "sed -i s/a/b/ wrangler.jsonc" })).resolves.toMatchObject({
 			protectedFiles: ["restored protected file wrangler.jsonc"],
 		});
-		const [command] = exec.mock.calls[0] as unknown as [string];
-		expect(command.startsWith("( guard=$(mktemp -d")).toBe(true);
-		expect(command).toContain("timeout --signal=TERM --kill-after=2s 12s bash -lc");
+		const [command, options] = exec.mock.calls[0] as unknown as [string, { timeout: number }];
+		expect(command).toBe(modelCommand("sed -i s/a/b/ wrangler.jsonc"));
+		expect(command.startsWith("{ guard=$(mktemp -d")).toBe(true);
+		expect(options.timeout).toBe(MODEL_COMMAND_TIMEOUT_MS);
 	});
 
 	it("refuses shell commands while validation is current, so a diagnostic cannot void it", async () => {

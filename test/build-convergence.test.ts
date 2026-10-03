@@ -417,12 +417,12 @@ describe("build loop convergence", () => {
 		expect(convergence.abandonedFailures()).toHaveLength(5);
 	});
 
-	it("resolves the forced failure when the forced call succeeds under a new identity", () => {
+	it("stops forcing a failure the forced call went around, and keeps it in front of the model", () => {
 		const convergence = new BuildConvergence();
 		convergence.recordUnresolvedFailure({
 			key: "content:posts:rye",
 			toolName: "content_create",
-			error: "[VALIDATION_ERROR]",
+			error: "[VALIDATION_ERROR] title",
 		});
 		prepareBuildStep(convergence, [] as never, ["content_create"]);
 		// The retry used a new title, so the tool resolved no key itself.
@@ -430,8 +430,113 @@ describe("build loop convergence", () => {
 			toolResults: [{ toolName: "content_create", output: { content: [{ type: "text" }] } }],
 		});
 
+		// Forcing it again could create a duplicate, so it no longer blocks...
 		expect(convergence.hasUnresolvedFailures()).toBe(false);
 		expect(convergence.abandonedFailures()).toEqual([]);
+		// ...but the model is still asked to check it.
+		const { messages } = prepareBuildStep(convergence, [] as never, ["content_create"]);
+		const note = JSON.stringify(messages.at(-1));
+		expect(note).toContain("[VALIDATION_ERROR] title");
+		// It may exist under another name, so the model must look before creating it again.
+		expect(note).toContain("before creating");
+
+		// A later success under its own key settles it.
+		convergence.resolveUnresolvedFailure("content:posts:rye");
+		expect(prepareBuildStep(convergence, [] as never, ["content_create"]).messages).toEqual([]);
+	});
+
+	it("keeps counting forced steps for a failure that was gone around and failed again", () => {
+		const convergence = new BuildConvergence();
+		const failure = {
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] title",
+		};
+		convergence.recordUnresolvedFailure(failure);
+		let forced = 0;
+		for (let step = 0; step < 20; step++) {
+			if (!prepareBuildStep(convergence, [] as never, ["content_create"]).allowedTools) break;
+			forced += 1;
+			// Each forced call creates some other entry; the model then retries rye, which fails again.
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { content: [] } }],
+			});
+			convergence.recordUnresolvedFailure(failure);
+		}
+
+		expect(forced).toBe(3);
+		expect(convergence.abandonedFailures()).toEqual([expect.objectContaining(failure)]);
+	});
+
+	it("does not count an unrelated success of the forced tool as the repair", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "media\0hero.jpg",
+			toolName: "upload_media",
+			error: "hero.jpg: HTTP 404",
+		});
+		prepareBuildStep(convergence, [] as never, ["upload_media", "view_preview"]);
+		// The forced call uploaded a different image, which the tool resolved on its own.
+		convergence.resolveUnresolvedFailure("media\0gallery.jpg");
+		convergence.finishStep({
+			toolResults: [{ toolName: "upload_media", output: { success: true, uploaded: 1 } }],
+		});
+
+		const { messages } = prepareBuildStep(convergence, [] as never, [
+			"upload_media",
+			"view_preview",
+		]);
+		expect(JSON.stringify(messages.at(-1))).toContain("hero.jpg: HTTP 404");
+	});
+
+	it("forces one-entry repairs each on its own budget, so none is abandoned untried", () => {
+		const convergence = new BuildConvergence();
+		const names = ["a", "b", "c", "d", "e"];
+		for (const name of names) {
+			convergence.recordUnresolvedFailure({
+				key: `content:posts:${name}`,
+				toolName: "content_create",
+				error: `[VALIDATION_ERROR] ${name}`,
+			});
+		}
+		const shown: string[] = [];
+		for (let step = 0; step < 10; step++) {
+			const next = convergence.nextUnresolvedFailure();
+			const prepared = prepareBuildStep(convergence, [] as never, ["content_create"]);
+			if (!prepared.allowedTools) break;
+			shown.push(next!.key);
+			// The model fixes exactly the entry it is shown, and the tool resolves it.
+			convergence.resolveUnresolvedFailure(next!.key);
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { content: [] } }],
+			});
+		}
+
+		expect(shown).toEqual(names.map((name) => `content:posts:${name}`));
+		expect(convergence.abandonedFailures()).toEqual([]);
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("tells the model which failure a forced repair step is for", () => {
+		const convergence = new BuildConvergence();
+		for (const name of ["rye", "sourdough"]) {
+			convergence.recordUnresolvedFailure({
+				key: `content\0posts\0\0${name}`,
+				toolName: "content_create",
+				error: "[VALIDATION_ERROR] body: required",
+			});
+		}
+
+		const { messages, allowedTools } = prepareBuildStep(convergence, [] as never, [
+			"content_create",
+		]);
+
+		// Both failed the same way: without the entry, a retry of either looks like the repair.
+		expect(allowedTools).toEqual({ toolNames: ["content_create"], mode: "required" });
+		const note = JSON.stringify(messages.at(-1));
+		expect(note).toContain("Repair this failure now with content_create, for posts / rye");
+		expect(note).toContain("body: required");
+		expect(note).not.toContain("sourdough");
 	});
 
 	it("keeps a forced failure the same step recorded again, even when the call partly succeeded", () => {

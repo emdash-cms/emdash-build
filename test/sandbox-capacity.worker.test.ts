@@ -105,10 +105,85 @@ describe("sandbox capacity", () => {
 		});
 	});
 
-	it("reads the cap from SANDBOX_MAX_CONCURRENT", () => {
+	it("gives a running container its lapsed slot back, past the cap, and out of the queue", async () => {
+		await withCapacity(1, (capacity) => {
+			expect(capacity.acquire("running")).toMatchObject({ granted: true });
+			vi.setSystemTime(1_000_000 + CAPACITY_LEASE_TTL_MS + 1);
+			expect(capacity.acquire("waiting")).toMatchObject({ granted: true });
+			expect(capacity.acquire("running", { reason: "renew" })).toMatchObject({ granted: false });
+
+			capacity.reclaim("running");
+
+			// Both containers run, so both count, and nobody else starts until one stops.
+			expect(capacity.stats()).toEqual({ limit: 1, active: 2, waiting: 0 });
+			expect(capacity.renew("running")).toBe(true);
+			expect(capacity.acquire("new")).toMatchObject({ granted: false, position: 1 });
+		});
+	});
+
+	it("puts a start the platform refused back at its place in line", async () => {
+		await withCapacity(1, (capacity) => {
+			capacity.acquire("running");
+			expect(capacity.acquire("first")).toMatchObject({ position: 1 });
+			vi.setSystemTime(1_000_001);
+			expect(capacity.acquire("second")).toMatchObject({ position: 2 });
+			capacity.release("running");
+			vi.setSystemTime(1_000_005);
+			expect(capacity.acquire("first")).toMatchObject({ granted: true });
+
+			// The platform had no instance for it: its slot goes back, its place stays.
+			capacity.requeue("first");
+
+			vi.setSystemTime(1_010_000);
+			expect(capacity.acquire("second")).toMatchObject({ granted: false, position: 2 });
+			expect(capacity.acquire("first")).toMatchObject({ granted: true });
+		});
+	});
+
+	it("keeps the place of a lease taken before places were recorded with it", async () => {
+		await runInDurableObject(testEnv.SandboxCapacity.getByName("global"), (instance, state) => {
+			const sql = state.storage.sql;
+			sql.exec("DROP TABLE leases");
+			sql.exec(`CREATE TABLE leases (
+				holder TEXT PRIMARY KEY,
+				acquired_at INTEGER NOT NULL,
+				expires_at INTEGER NOT NULL,
+				reason TEXT NOT NULL
+			)`);
+			sql.exec("INSERT INTO leases VALUES ('old', 999000, 9999999, 'start')");
+			const instanceEnv = Reflect.get(instance, "env") as Record<string, unknown>;
+			instanceEnv.SANDBOX_MAX_CONCURRENT = "1";
+			// The object starts again over the table an earlier version made.
+			const capacity = new (instance.constructor as new (
+				ctx: DurableObjectState,
+				env: unknown,
+			) => SandboxCapacity)(state, instanceEnv);
+
+			expect(capacity.acquire("waiting")).toMatchObject({ position: 1 });
+			capacity.requeue("old");
+			expect(capacity.acquire("waiting")).toMatchObject({ granted: false, position: 2 });
+			expect(capacity.acquire("old")).toMatchObject({ granted: true });
+		});
+	});
+
+	it("reads the cap from SANDBOX_MAX_CONCURRENT, decimal digits only", () => {
 		expect(capacityLimit("25")).toBe(25);
 		expect(capacityLimit(undefined)).toBe(100);
-		expect(capacityLimit("0")).toBe(100);
 		expect(capacityLimit("ten")).toBe(100);
+		expect(capacityLimit("1e1")).toBe(100);
+		expect(capacityLimit("0x0A")).toBe(100);
+		expect(capacityLimit(" 10")).toBe(100);
+		// 0 stops new starts, for draining before maintenance.
+		expect(capacityLimit("0")).toBe(0);
+	});
+
+	it("starts nothing new at a cap of 0 while running containers keep their slots", async () => {
+		await withCapacity(1, (capacity) => {
+			capacity.acquire("running");
+			(Reflect.get(capacity, "env") as Record<string, unknown>).SANDBOX_MAX_CONCURRENT = "0";
+
+			expect(capacity.acquire("new")).toMatchObject({ granted: false, position: 1 });
+			expect(capacity.renew("running")).toBe(true);
+		});
 	});
 });

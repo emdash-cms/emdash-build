@@ -17,7 +17,7 @@ const PREVIEW_HEADERS = [
 ];
 
 const PREVIEW_LABEL =
-	/^(\d{4,5})-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})-([a-z0-9_]{1,16})$/;
+	/^([1-9]\d{3,4})-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})-([a-z0-9_]{1,16})$/;
 
 export interface PreviewRoute {
 	port: number;
@@ -30,13 +30,18 @@ export interface PreviewRoute {
  * preview hostname (or a `localhost` name in local development) can name one,
  * so other traffic on a shared zone never wakes a Sandbox.
  */
-export function parsePreviewHost(url: URL, previewHostname: string): PreviewRoute | undefined {
-	const host = url.hostname.toLowerCase();
+export function parsePreviewHost(
+	url: URL,
+	previewHostname: string | undefined,
+): PreviewRoute | undefined {
+	// A fully qualified name ends in a dot; the preview is the same host.
+	const host = url.hostname.toLowerCase().replace(/\.$/, "");
 	const dot = host.indexOf(".");
 	if (dot < 0) return undefined;
 	const parent = host.slice(dot + 1);
 	const local = parent === "localhost" || parent.endsWith(".localhost");
-	if (parent !== previewHostname.toLowerCase() && !local) return undefined;
+	// Without a preview hostname only local previews route; nothing else may fail on it.
+	if (!local && parent !== previewHostname?.toLowerCase()) return undefined;
 	const match = PREVIEW_LABEL.exec(host.slice(0, dot));
 	if (!match) return undefined;
 	const port = Number(match[1]);

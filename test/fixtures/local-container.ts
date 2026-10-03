@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import type { ContainerLike } from "../../src/worker/sandbox-runtime.js";
 
@@ -7,8 +8,8 @@ type ExecResult = { stdout?: string; stderr?: string; exitCode: number };
 
 /**
  * A stand-in for `ctx.container` that runs commands as local processes, with
- * the platform's habits that matter: commands see only PATH plus the env they
- * pass, `kill()` on an exited process throws, and nothing runs while stopped.
+ * the platform's habits that matter: commands see only PATH (and a writable
+ * TMPDIR, standing in for the container's /tmp) plus the env they pass, `kill()` on an exited process throws, and nothing runs while stopped.
  */
 export class LocalContainer implements ContainerLike {
 	running = false;
@@ -71,7 +72,8 @@ export class LocalContainer implements ContainerLike {
 		if (answer) return answeredProcess(answer.result);
 		const child = spawn(argv[0]!, argv.slice(1), {
 			cwd: options.cwd && existsSync(options.cwd) ? options.cwd : undefined,
-			env: { PATH: this.path, ...options.env } as unknown as NodeJS.ProcessEnv,
+			// The container's /tmp is writable; the test's stands in for it.
+			env: { PATH: this.path, TMPDIR: tmpdir(), ...options.env } as unknown as NodeJS.ProcessEnv,
 			stdio: [
 				"ignore",
 				options.stdout === "ignore" ? "ignore" : "pipe",

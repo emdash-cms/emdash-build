@@ -16,9 +16,11 @@ function emptyLogStream(): ReadableStream<Uint8Array> {
 	});
 }
 
-function harnessSandbox(buildExitCode = 0) {
+/** Command output crosses the runtime capped at 1 MiB, as SandboxRuntime.exec cuts it. */
+const OUTPUT_LIMIT = 1024 * 1024;
+
+function harnessSandbox(buildExitCode = 0, builtCss = "h1{color:red}") {
 	const stopped: string[] = [];
-	const builtCss = "h1{color:red}";
 	const startProcess = vi.fn(
 		async (_id: string, _command: string, _options?: { cwd?: string }) => undefined,
 	);
@@ -39,7 +41,7 @@ function harnessSandbox(buildExitCode = 0) {
 			return { success: true, stdout: String(builtCss.length), stderr: "" };
 		}
 		if (command.includes("head -c")) {
-			return { success: true, stdout: btoa(builtCss), stderr: "" };
+			return { success: true, stdout: btoa(builtCss).slice(0, OUTPUT_LIMIT), stderr: "" };
 		}
 		return { success: true, stdout: "", stderr: "" };
 	});
@@ -71,6 +73,11 @@ function harnessSandbox(buildExitCode = 0) {
 					};
 				}
 				return { success: false, content: "" };
+			},
+			readFileStream: async (path: string) => {
+				if (!path.endsWith("/dist/client/assets/app.css"))
+					throw new Error(`File not found: ${path}`);
+				return new Response(builtCss).body!;
 			},
 			writeFile,
 		},
@@ -179,6 +186,40 @@ describe("Builder production snapshot preparation", () => {
 			expect(runtime.fetchPort.mock.calls[0]?.[0]).toBe(4322);
 			expect(runtime.fetchPort.mock.calls[0]?.[1]).toBe(`${LIVE_ORIGIN}/`);
 			expect(runtime.fetchPort.mock.calls[0]?.[2]).not.toHaveProperty("signal");
+		});
+	});
+
+	it("publishes a built asset larger than command output can carry", async () => {
+		const agent = testEnv.BuilderAgent.getByName(PROJECT_ID);
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true, previewUrl: PREVIEW_ORIGIN });
+			// A large bundle or font: its base64 would exceed the 1 MiB output cap.
+			const runtime = harnessSandbox(0, `h1{color:red}${"/*x*/".repeat(300_000)}`);
+			const harness = instance as unknown as {
+				sandboxOps: () => typeof runtime.sandbox;
+				execRecoveryCommand: () => Promise<{ success: boolean }>;
+				backupSite: () => Promise<string | undefined>;
+				stopDevServer: () => Promise<void>;
+				startDevServer: () => Promise<void>;
+				refreshPreviewSnapshots: () => Promise<void>;
+				prepareStaticSiteSnapshot(liveOrigin: string): Promise<{
+					assets: Array<{ path: string; bytes: Uint8Array }>;
+				}>;
+			};
+			harness.sandboxOps = () => runtime.sandbox;
+			harness.execRecoveryCommand = async () => ({ success: true });
+			harness.backupSite = async () => undefined;
+			harness.stopDevServer = async () => undefined;
+			harness.startDevServer = async () => undefined;
+			harness.refreshPreviewSnapshots = async () => undefined;
+			Reflect.set(Reflect.get(instance, "env") as object, "Sandbox", {
+				getByName: () => ({ getPreviewGeneration: async () => 4 }),
+			});
+
+			const snapshot = await harness.prepareStaticSiteSnapshot(LIVE_ORIGIN);
+
+			const css = snapshot.assets.find((asset) => asset.path.endsWith("assets/app.css"));
+			expect(css?.bytes.byteLength).toBe(13 + 5 * 300_000);
 		});
 	});
 

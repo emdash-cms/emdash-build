@@ -140,6 +140,10 @@ function needsUnavailablePublication(
 	return PUBLICATION_ACTION.test(action) && !availableCapabilities.has("publish_site");
 }
 
+/**
+ * Workers AI refuses a schema with keywords its grammar cannot enforce, such
+ * as `minItems` or `uniqueItems`, so `parseSuggestions` checks those instead.
+ */
 function responseFormat(capabilityIds: readonly string[]) {
 	return {
 		type: "json_schema" as const,
@@ -156,8 +160,6 @@ function responseFormat(capabilityIds: readonly string[]) {
 							capabilities: {
 								type: "array",
 								items: { type: "string", enum: [...capabilityIds] },
-								minItems: 1,
-								uniqueItems: true,
 							},
 						},
 						required: ["label", "prompt", "capabilities"],

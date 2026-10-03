@@ -60,6 +60,23 @@ describe("prepared dependencies on restore", () => {
 		expect(existsSync(join(site, "node_modules"))).toBe(false);
 	});
 
+	it("leaves dependencies declared outside the lockfile to pnpm install", () => {
+		write(join(site, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\npackages: {}\n");
+		// The model added a dependency without pnpm, so the lockfile still matches.
+		write(join(site, "package.json"), '{"name":"restored","dependencies":{"sharp":"^0.34.0"}}');
+
+		expect(run().status).toBe(1);
+		expect(run(undefined).status).toBe(1);
+		expect(existsSync(join(site, "node_modules"))).toBe(false);
+	});
+
+	it("reuses dependencies when only other package.json fields changed", () => {
+		write(join(site, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\npackages: {}\n");
+		write(join(site, "package.json"), '{"name":"restored","scripts":{"check":"astro check"}}');
+
+		expect(run().status).toBe(0);
+	});
+
 	it("reads the lockfile beside the archive rather than decompressing it twice", () => {
 		// Only the uncompressed copy says the lockfiles match.
 		write(preparedLockfile, "lockfileVersion: '9.0'\npackages: { beside: {} }\n");

@@ -37,6 +37,8 @@ function canonicalJson(value: unknown): unknown {
  * key, and forcing it on every step would run the turn to its step cap.
  */
 const MAX_FORCED_RECOVERY_STEPS = 3;
+/** Tools whose one call retries all of their failures at once, such as an image batch. */
+const BATCH_REPAIR_TOOLS = new Set(["upload_media"]);
 
 function reportsFailure(result: unknown): boolean {
 	return (
@@ -88,6 +90,7 @@ export class BuildConvergence {
 	private mutationTail: Promise<void> = Promise.resolve();
 	private unresolvedFailures = new Map<string, UnresolvedBuildFailure>();
 	private forcedRecoveries = new Map<string, number>();
+	private readonly bypassedFailures = new Map<string, UnresolvedBuildFailure>();
 	/** The failure the current step was forced to repair, and failures it recorded again. */
 	private forcedStep?: { key: string; toolName: string };
 	private rerecordedFailures = new Set<string>();
@@ -381,12 +384,19 @@ export class BuildConvergence {
 	recordUnresolvedFailure(failure: UnresolvedBuildFailure): void {
 		this.rerecordedFailures.add(failure.key);
 		this.unresolvedFailures.set(failure.key, failure);
+		this.bypassedFailures.delete(failure.key);
 		this.forceText = false;
 	}
 
 	resolveUnresolvedFailure(key: string): void {
 		this.unresolvedFailures.delete(key);
 		this.forcedRecoveries.delete(key);
+		this.bypassedFailures.delete(key);
+	}
+
+	/** Failures a successful forced call went around; they are no longer forced. */
+	bypassedRepairs(): UnresolvedBuildFailure[] {
+		return [...this.bypassedFailures.values()];
 	}
 
 	private isAbandoned(failure: UnresolvedBuildFailure): boolean {
@@ -406,15 +416,16 @@ export class BuildConvergence {
 	}
 
 	/**
-	 * A step is about to force a repair of this failure. A forced call usually
-	 * retries every failure of its tool at once (an image batch, say), so the
-	 * step counts against all of them rather than against each in turn.
+	 * A step is about to force a repair of this failure. It counts against that
+	 * failure, and against every failure of a batch tool, whose one call
+	 * retries them all; one-entry tools repair one failure per call.
 	 */
 	noteForcedRecovery(key: string): void {
 		const forced = this.unresolvedFailures.get(key);
 		if (!forced) return;
+		const batch = BATCH_REPAIR_TOOLS.has(forced.toolName);
 		for (const failure of this.unresolvedFailures.values()) {
-			if (failure.toolName !== forced.toolName) continue;
+			if (failure.key !== key && !(batch && failure.toolName === forced.toolName)) continue;
 			this.forcedRecoveries.set(failure.key, (this.forcedRecoveries.get(failure.key) ?? 0) + 1);
 		}
 		this.forcedStep = { key, toolName: forced.toolName };
@@ -458,9 +469,10 @@ export class BuildConvergence {
 	}
 
 	/**
-	 * A forced call that succeeded repaired its failure even when the retry
-	 * changed the failure's identity (a new title, say), which leaves the
-	 * original key unresolved; forcing it again could create a duplicate.
+	 * A forced call that succeeded without resolving its failure went around
+	 * it: a retry under a new identity (a new title, say) or a different item
+	 * altogether. Forcing it again could create a duplicate, so it stops
+	 * blocking, but it stays in front of the model to check or report.
 	 */
 	private settleForcedStep(step: BuildConvergenceStep): void {
 		const forced = this.forcedStep;
@@ -469,8 +481,11 @@ export class BuildConvergence {
 		this.rerecordedFailures = new Set();
 		if (!forced || rerecorded.has(forced.key)) return;
 		const called = (step.toolResults ?? []).some((result) => result.toolName === forced.toolName);
-		if (called && !this.stepFailed(step, forced.toolName)) {
-			this.resolveUnresolvedFailure(forced.key);
+		const failure = this.unresolvedFailures.get(forced.key);
+		if (failure && called && !this.stepFailed(step, forced.toolName)) {
+			// Its forced steps still count, should it fail again.
+			this.unresolvedFailures.delete(forced.key);
+			this.bypassedFailures.set(forced.key, failure);
 		}
 	}
 
@@ -643,22 +658,44 @@ export function canCompleteBuild(convergence: BuildConvergence, finishReason: un
 
 const ABANDONED_REPAIR_NOTE =
 	"The builder stopped requiring repairs for these failures after three attempts. Fix them if you can; otherwise say in your final summary what is still missing:";
+const BYPASSED_REPAIR_NOTE =
+	"A later call of the same tool succeeded, but not as these failed calls; one may have been retried under another name or slug. Check each is covered (for example with content_list) before creating it again; otherwise say in your final summary what is still missing:";
 
-/** Keep abandoned repairs in front of the model so its summary reports them. */
+/**
+ * Say which failure a forced step is for: two calls of one tool can fail the
+ * same way, and a retry of the other would look like the repair.
+ */
+function withForcedRepairNote(
+	messages: ModelMessage[],
+	failure: UnresolvedBuildFailure,
+): ModelMessage[] {
+	// Keys end with what failed: a collection, locale and entry, or an image.
+	const subject = failure.key.split("\0").slice(1).filter(Boolean).join(" / ");
+	// "Repair", not "retry": a content_update of a missing entry is repaired with content_create.
+	const text = `Repair this failure now with ${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
+	return [...messages, { role: "user", content: [{ type: "text", text }] }];
+}
+
+/** Keep repairs the builder no longer forces in front of the model, so its summary reports them. */
 function withAbandonedRepairNote(
 	messages: ModelMessage[],
 	convergence: BuildConvergence,
 ): ModelMessage[] {
-	const abandoned = convergence.abandonedFailures().slice(0, 5);
-	if (abandoned.length === 0) return messages;
-	const lines = abandoned.map((failure) => `- ${failure.toolName}: ${failure.error.slice(0, 200)}`);
-	return [
-		...messages,
-		{
-			role: "user",
-			content: [{ type: "text", text: [ABANDONED_REPAIR_NOTE, ...lines].join("\n") }],
-		},
+	const section = (note: string, failures: UnresolvedBuildFailure[]) =>
+		failures.length === 0
+			? []
+			: [
+					note,
+					...failures
+						.slice(0, 5)
+						.map((failure) => `- ${failure.toolName}: ${failure.error.slice(0, 200)}`),
+				];
+	const lines = [
+		...section(ABANDONED_REPAIR_NOTE, convergence.abandonedFailures()),
+		...section(BYPASSED_REPAIR_NOTE, convergence.bypassedRepairs()),
 	];
+	if (lines.length === 0) return messages;
+	return [...messages, { role: "user", content: [{ type: "text", text: lines.join("\n") }] }];
 }
 
 /**
@@ -703,7 +740,10 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 		: undefined;
 	if (unresolved && recoveryTool) {
 		convergence.noteForcedRecovery(unresolved.key);
-		return required(recoveryTool);
+		return {
+			messages: withForcedRepairNote(prunedMessages, unresolved),
+			allowedTools: { toolNames: [recoveryTool], mode: "required" },
+		};
 	}
 	if (convergence.shouldForceText()) {
 		return { messages: prunedMessages, toolChoice: "none" };

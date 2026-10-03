@@ -16,18 +16,19 @@
 		"binding": "ASSETS",
 		"run_worker_first": true,
 	},
-	// 100 concurrent sandboxes use about a quarter of the account's default
-	// container limit (1,500 vCPU); model rate limits are the next ceiling.
+	// The Sandbox Durable Object starts its own container (Sandbox SDK 1.0) with the
+	// size it asks for; SANDBOX_MAX_CONCURRENT caps how many run at once. A new
+	// application name: the default-policy one cannot change its scheduling policy.
 	"containers": [
 		{
 			"class_name": "Sandbox",
-			"image": "./Dockerfile",
-			"instance_type": {
-				"vcpu": 4,
-				"memory_mib": 12288,
-				"disk_mb": 10240,
+			"name": "emdash-build-sandbox-do",
+			"scheduling_policy": "durable_object",
+			"images": {
+				"sandbox": {
+					"dockerfile": "./Dockerfile",
+				},
 			},
-			"max_instances": 100,
 		},
 	],
 	"durable_objects": {
@@ -147,6 +148,8 @@
 		"PREVIEW_HOSTNAME": "build.emdashcms.com",
 		"ENABLE_PUBLIC_PUBLISHING": "false",
 		"ENABLE_CMS_SCRIPTS": "true",
+		// 100 sandboxes of 4 vCPU use about a quarter of the account's default container
+		// limit (1,500 vCPU); model rate limits are the next ceiling.
 		"SANDBOX_MAX_CONCURRENT": "100",
 		"SITES_HOSTNAME": "build.emdashcms.com",
 		"BRANDED_SITES_HOSTNAME": "em-da.sh",
@@ -256,6 +259,8 @@
 			"ENABLE_CMS_SCRIPTS": "true",
 			"SANDBOX_PREVIEW_MODE": "quick-tunnel",
 			"SANDBOX_MAX_CONCURRENT": "10",
+			// Worker Previews only offer the default scheduling policy.
+			"SANDBOX_SCHEDULING_POLICY": "default",
 			"SITES_HOSTNAME": "build.emdashcms.com",
 			"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
 			"WFP_ACCOUNT_ID": "1f74638c495bc9f0330ce5c8e64c1b6b",

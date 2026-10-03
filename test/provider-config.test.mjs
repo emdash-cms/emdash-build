@@ -26,7 +26,14 @@ describe("provider configuration", () => {
 		const wrangler = renderStudioWrangler(validateProviderConfig(config));
 		expect(wrangler).toMatchObject({
 			name: "example-host-emdash-build",
-			containers: [{ max_instances: 5 }],
+			containers: [
+				{
+					class_name: "Sandbox",
+					name: "example-host-emdash-build-sandbox-do",
+					scheduling_policy: "durable_object",
+					images: { sandbox: { dockerfile: "./Dockerfile" } },
+				},
+			],
 			artifacts: [{ namespace: "example-build" }],
 			// CMS programs run in Dynamic Workers.
 			worker_loaders: [{ binding: "LOADER" }],
@@ -77,7 +84,7 @@ describe("provider configuration", () => {
 			tag: "v4",
 			new_sqlite_classes: ["SiteService"],
 		});
-		// The app-owned container cap matches the platform cap it will replace.
+		// The app owns the container cap.
 		expect(wrangler.migrations.at(-1)).toEqual({
 			tag: "v5",
 			new_sqlite_classes: ["SandboxCapacity"],
