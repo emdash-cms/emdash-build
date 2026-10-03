@@ -7,18 +7,22 @@
  * up in agent.ts.
  */
 
-import { tool } from "ai";
+import { tool, type JSONValue } from "ai";
 import { z } from "zod";
-import { BuildConvergence, mutationKey } from "./build-convergence.js";
+import {
+	BuildConvergence,
+	mutationKey,
+	PREVIEW_IMAGE_CAPTION,
+	type BuildObservation,
+	type MutationScope,
+} from "./build-convergence.js";
 import { auditPublicSite } from "./public-site-audit.js";
 import { isSandboxRuntimeReplacement } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 
-import type { getSandbox } from "@cloudflare/sandbox";
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-
-type SandboxInstance = ReturnType<typeof getSandbox>;
+import type { SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -34,6 +38,8 @@ const EDIT_FILES_MAX_EDITS = 12;
 const EDIT_FILES_MAX_BYTES = 192 * 1024;
 const BATCH_READ_EXCLUDED_ROOTS = new Set([".git", ".wrangler", ".astro", "node_modules", "dist"]);
 const TYPEGEN_MAX_BYTES = 2 * 1024 * 1024;
+/** Generated declarations returned to the model; larger files point at the file itself. */
+const TYPE_DECLARATIONS_MAX_CHARS = 60_000;
 
 export interface CanonicalSiteReadPath {
 	path: string;
@@ -49,12 +55,9 @@ export interface BatchReadResult {
 	files: BatchReadFileResult[];
 }
 
-interface StreamingReadSandbox {
-	readFileStream(path: string): Promise<ReadableStream<Uint8Array>>;
-}
+type StreamingReadSandbox = Pick<SandboxOps, "readFileStream">;
 
 interface BatchReadOptions {
-	streamFile: typeof import("@cloudflare/sandbox").streamFile;
 	signal?: AbortSignal;
 	timeoutSignal?: (timeoutMs: number) => AbortSignal;
 }
@@ -182,29 +185,22 @@ async function openReadStream(
 async function readOneTextFile(
 	sandbox: StreamingReadSandbox,
 	path: CanonicalSiteReadPath,
-	streamFile: typeof import("@cloudflare/sandbox").streamFile,
 	signal?: AbortSignal,
 ): Promise<InternalReadResult> {
-	let chunks: ReturnType<typeof streamFile> | undefined;
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
 		const source = await openReadStream(sandbox, path.fullPath, signal);
 		const stream = signal
 			? source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal })
 			: source;
-		chunks = streamFile(stream);
-		const encoder = new TextEncoder();
+		reader = stream.getReader();
 		let bytes = 0;
 		const parts: Uint8Array[] = [];
 
 		while (true) {
-			const chunk = await chunks.next();
-			if (chunk.done) {
-				if (chunk.value.size > READ_FILE_MAX_BYTES) {
-					throw new Error("File exceeds the 48 KiB limit.");
-				}
-				break;
-			}
-			const part = chunk.value instanceof Uint8Array ? chunk.value : encoder.encode(chunk.value);
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			const part = chunk.value;
 			bytes += part.byteLength;
 			if (bytes > READ_FILE_MAX_BYTES) throw new Error("File exceeds the 48 KiB limit.");
 			if (part.includes(0)) throw new Error("File contains NUL bytes.");
@@ -224,7 +220,7 @@ async function readOneTextFile(
 		}
 		return { path: path.path, success: true, content, bytes };
 	} catch (error) {
-		await chunks?.return(undefined as never).catch(() => {});
+		await reader?.cancel().catch(() => {});
 		if (isSandboxRuntimeReplacement(error)) throw error;
 		return {
 			path: path.path,
@@ -277,7 +273,6 @@ export async function readFilesFromSandbox(
 			readOneTextFile(
 				sandbox,
 				path,
-				options.streamFile,
 				combineSignals([batchSignal, timeoutSignal(READ_FILE_TIMEOUT_MS)]),
 			),
 		),
@@ -396,24 +391,6 @@ export async function mapLimit<T, R>(
 	return results;
 }
 
-/** Result of a temporary-account deploy. */
-export interface DeployResult {
-	success: boolean;
-	liveUrl?: string;
-	claimUrl?: string;
-	error?: string;
-}
-
-/**
- * Cloudflare temporary preview accounts (`wrangler deploy --temporary`)
- * support only a limited set of products. EmDash's Cloudflare template binds
- * R2 (`MEDIA`) and a Worker Loader (`LOADER`) and registers a cron trigger,
- * none of which a temporary account can provision. These helpers produce a
- * stripped, temp-account-safe build so the agent can deploy a working live
- * preview (pages + D1 content) without media uploads, sandboxed plugins, or
- * scheduled publishing. They are pure so they can be unit-tested.
- */
-
 /**
  * Builder-owned Worker entry for every managed site. Development setup/reset
  * stays reachable from the container loopback for provisioning, but the public
@@ -504,59 +481,6 @@ export function stripSandboxFromAstroConfig(src: string): string {
 		.replace(/^[ \t]*sandboxRunner:\s*sandbox\(\),?\s*$\n?/m, "")
 		.replace(/^[ \t]*sandboxed:\s*\[[^\]]*\],?\s*$\n?/m, "")
 		.replace(/^[ \t]*marketplace:\s*["'][^"']*["'],?\s*$\n?/m, "");
-}
-
-/**
- * Remove `storage: r2(...)` from an astro.config. Applied to the deploy build
- * only (R2 isn't on temporary accounts) so the built worker doesn't reference
- * the absent MEDIA binding. The in-builder preview keeps storage.
- */
-export function stripStorageFromAstroConfig(src: string): string {
-	return src.replace(/^[ \t]*storage:\s*r2\([^)]*\),?\s*$\n?/m, "");
-}
-
-/**
- * Drop `r2_buckets` from the (canonical, JSON) wrangler config for the deploy
- * build, so the adapter-generated deploy config has no MEDIA binding the temp
- * account can't provision. Restored after deploy.
- */
-export function stripR2FromWrangler(jsonText: string): string {
-	const cfg = JSON.parse(jsonText) as Record<string, unknown>;
-	delete cfg.r2_buckets;
-	return JSON.stringify(cfg, null, 2);
-}
-
-/**
- * Append statements to a `wrangler d1 export` snapshot that remove everything
- * auth-related before it is loaded into a deployed site: the dev-bypass admin
- * user, its full-scope PAT (the same raw token the Worker holds for the
- * session), OAuth/device/passkey state, and the secret-bearing options.
- * Mirrors the exclusions EmDash's own backup export makes. Clearing
- * `emdash:setup_complete` along with the users sends whoever claims the deploy
- * through the setup wizard to create their own admin; public pages are not
- * gated on setup, so the site still serves. Child tables go before `users`.
- */
-export function scrubAuthFromSnapshot(sql: string): string {
-	const tables = [
-		"_emdash_api_tokens",
-		"_emdash_oauth_tokens",
-		"_emdash_authorization_codes",
-		"_emdash_device_codes",
-		"_emdash_oauth_clients",
-		"_emdash_rate_limits",
-		"auth_challenges",
-		"auth_tokens",
-		"credentials",
-		"oauth_accounts",
-		"audit_logs",
-		"users",
-	];
-	const statements = [
-		...tables.map((t) => `DELETE FROM ${t};`),
-		"DELETE FROM options WHERE name IN ('emdash:setup_complete', 'emdash:site_url', 'emdash:preview_secret');",
-		"DELETE FROM options WHERE name LIKE 'plugin:%' OR name LIKE 'emdash:passkey_pending:%';",
-	];
-	return `${sql.trimEnd()}\n${statements.join("\n")}\n`;
 }
 
 /**
@@ -683,8 +607,13 @@ interface ToolCallbacks {
 		{ ok: true; base64: string; mediaType: string } | { ok: false; error: string }
 	>;
 	savePreviewThumbnail?: (shotId: string, shot: { base64: string; mediaType: string }) => void;
-	runSandboxRead?: <T>(operation: (sandbox: SandboxInstance) => Promise<T>) => Promise<T>;
-	validateBlockContracts?: (sandbox: SandboxInstance) => Promise<BlockRendererValidationResult>;
+	runSandboxRead?: <T>(operation: (sandbox: SandboxOps) => Promise<T>) => Promise<T>;
+	validateBlockContracts?: (sandbox: SandboxOps) => Promise<BlockRendererValidationResult>;
+	/** Fingerprint of the source that last passed `pnpm validate`, kept across turns. */
+	typecheckCache?: {
+		lastPassed: () => string | undefined;
+		recordPassed: (fingerprint: string) => void;
+	};
 }
 
 interface ToolOptions {
@@ -692,8 +621,6 @@ interface ToolOptions {
 	convergence?: BuildConvergence;
 	/** Cancellation for the build turn, including queued sandbox operations. */
 	abortSignal?: AbortSignal;
-	/** SDK decoder for transport-neutral file streams. */
-	streamFile?: typeof import("@cloudflare/sandbox").streamFile;
 	unsplashAccessKey?: string;
 	/** Full-scope API token for the site's EmDash instance (Worker-side only) */
 	apiToken?: string;
@@ -721,6 +648,7 @@ interface UnsplashSearchResponse {
 type PreviewModelOutput =
 	| { type: "text"; value: string }
 	| { type: "error-text"; value: string }
+	| { type: "json"; value: JSONValue }
 	| {
 			type: "content";
 			value: Array<
@@ -750,7 +678,7 @@ type BatchFileMutationResult =
  * yet" rather than aborting. Probe TCP instead of `/`: local Astro SSR can take
  * several seconds per render even when the listener is healthy.
  */
-async function waitForDevServer(sandbox: SandboxInstance, retries = 20): Promise<boolean> {
+async function waitForDevServer(sandbox: SandboxOps, retries = 20): Promise<boolean> {
 	for (let i = 0; i < retries; i++) {
 		try {
 			const check = await sandbox.exec("timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/4321'", {
@@ -802,8 +730,22 @@ async function readResponseTextBounded(response: Response, maximumBytes: number)
 	}
 }
 
-async function refreshLiveTypes(
-	sandbox: SandboxInstance,
+/** Generated type declarations as returned to the model, bounded for its context. */
+export function typeDeclarationsForModel(declarations: string): {
+	declarations: string;
+	declarationsTruncated?: true;
+	note?: string;
+} {
+	if (declarations.length <= TYPE_DECLARATIONS_MAX_CHARS) return { declarations };
+	return {
+		declarations: declarations.slice(0, TYPE_DECLARATIONS_MAX_CHARS),
+		declarationsTruncated: true,
+		note: "The declarations were shortened. Read emdash-env.d.ts for the rest before using names beyond this excerpt.",
+	};
+}
+
+export async function refreshLiveTypes(
+	sandbox: SandboxOps,
 	abortSignal?: AbortSignal,
 ): Promise<{
 	success: boolean;
@@ -811,14 +753,14 @@ async function refreshLiveTypes(
 	stdout: string;
 	stderr: string;
 	generatedFile?: string;
+	/** The generated declarations, when they came from the live expanded schema. */
+	declarations?: string;
 }> {
 	let response: Response;
 	try {
-		response = await sandbox.containerFetch(
-			"http://localhost:4321/_emdash/api/typegen",
-			{ redirect: "manual" },
-			4321,
-		);
+		response = await sandbox.fetchPort(4321, "http://localhost:4321/_emdash/api/typegen", {
+			redirect: "manual",
+		});
 	} catch (error) {
 		if (isSandboxRuntimeReplacement(error)) throw error;
 		return {
@@ -893,19 +835,49 @@ async function refreshLiveTypes(
 		stdout: "Generated emdash-env.d.ts from the live expanded schema.",
 		stderr: "",
 		generatedFile: "emdash-env.d.ts",
+		declarations: types,
 	};
 }
 
-async function auditSandboxPublicSite(sandbox: SandboxInstance): Promise<PublicSiteAuditResult> {
+/**
+ * A digest of what `pnpm validate` can read: every file in the site except
+ * installed dependencies (pinned by the hashed lockfile), build output, git
+ * metadata, local CMS state and static assets. Anything else a check might
+ * include, such as generated declarations or a root-level module, changes it.
+ */
+export function typecheckInputsFingerprintCommand(): string {
+	const skipped = ["node_modules", ".git", "dist", ".astro", ".wrangler", "public"]
+		.map((dir) => `-path ./${dir}`)
+		.join(" -o ");
+	return (
+		`find . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
+		"| sha256sum | cut -d ' ' -f 1"
+	);
+}
+
+/** Undefined when the digest cannot be computed. */
+async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string | undefined> {
+	try {
+		const result = await sandbox.exec(typecheckInputsFingerprintCommand(), {
+			cwd: SITE_PATH,
+			timeout: 15_000,
+		});
+		const digest = result.stdout.trim();
+		return result.success && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
+	} catch (error) {
+		if (isSandboxRuntimeReplacement(error)) throw error;
+		return undefined;
+	}
+}
+
+async function auditSandboxPublicSite(sandbox: SandboxOps): Promise<PublicSiteAuditResult> {
 	const fetchPage = (path: string) => {
 		const url = new URL(path, "http://localhost:4321");
-		// AbortSignal cannot cross the Sandbox RPC boundary. containerFetch owns
-		// its container-start and request timeouts, so pass only serializable init.
-		return sandbox.containerFetch(
-			url.toString(),
-			{ headers: { Accept: "text/html" }, redirect: "manual" },
-			4321,
-		);
+		// Only serializable init: the request owns its container-start and request timeouts.
+		return sandbox.fetchPort(4321, url.toString(), {
+			headers: { Accept: "text/html" },
+			redirect: "manual",
+		});
 	};
 	const first = await auditPublicSite(fetchPage);
 	if (
@@ -1039,11 +1011,159 @@ async function uploadOneMedia(
 }
 
 /**
+ * Photo search and media upload. Both run in the Worker, so the Unsplash key
+ * and the CMS API token never enter the sandbox. A CMS program builds its own
+ * copies against its mutation scope.
+ */
+export function createMediaTools(options: {
+	mutations: MutationScope;
+	/** Persist the site after a successful upload. */
+	checkpoint: () => Promise<void>;
+	abortSignal?: AbortSignal;
+	unsplashAccessKey?: string;
+	apiToken?: string;
+	cmsBaseUrl?: string;
+}) {
+	return {
+		search_unsplash: tool({
+			description:
+				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
+				"and photographer credits. Use these URLs in content for image references. " +
+				"Always search rather than guessing photo IDs.",
+			inputSchema: z.object({
+				query: z.string().describe("Search query (e.g. 'iceland landscape')"),
+				count: z.number().optional().default(5).describe("Number of results (1-10, default 5)"),
+			}),
+			execute: async ({ query, count }) => {
+				options.abortSignal?.throwIfAborted();
+				const n = Math.min(Math.max(count, 1), 10);
+				const key = options.unsplashAccessKey;
+				if (!key) {
+					return {
+						success: false as const,
+						error: "UNSPLASH_ACCESS_KEY is not configured on the worker.",
+					};
+				}
+				const url = new URL("https://api.unsplash.com/search/photos");
+				url.searchParams.set("query", query);
+				url.searchParams.set("per_page", String(n));
+				const res = await fetch(url, {
+					headers: { Authorization: `Client-ID ${key}` },
+					signal: options.abortSignal,
+				});
+				if (!res.ok) {
+					return {
+						success: false as const,
+						error: `Unsplash API error ${res.status}: ${await res.text()}`,
+					};
+				}
+				const data = (await res.json()) as UnsplashSearchResponse;
+				const photos = data.results.map((p) => ({
+					id: p.id,
+					description: p.description ?? p.alt_description ?? "",
+					url: `${p.urls.raw}&w=1200&h=800&fit=crop&auto=format`,
+					thumb: `${p.urls.raw}&w=400&h=300&fit=crop&auto=format`,
+					photographer: p.user.name,
+					photographerUrl: `https://unsplash.com/@${p.user.username}`,
+				}));
+				return { success: true as const, query, count: photos.length, photos };
+			},
+		}),
+
+		upload_media: tool({
+			description:
+				"Download one or more images from URLs (e.g. those returned by search_unsplash) and " +
+				"register them as CMS media items. Pass ALL the images you need in a single call via the " +
+				"`images` array -- do NOT call this once per image. Image/file fields do NOT accept raw " +
+				"URLs: each result includes a `fieldValue` " +
+				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
+				"field when calling content_create/content_update. Results come back in input order and " +
+				"echo each `url` so you can match them to the right entry.",
+			inputSchema: z.object({
+				images: z
+					.array(
+						z.object({
+							url: z.string().describe("Direct image URL to download"),
+							filename: z
+								.string()
+								.optional()
+								.describe("Filename to store it as, e.g. 'hero.jpg' (default 'image')"),
+							alt: z.string().optional().describe("Alt text describing the image"),
+						}),
+					)
+					.min(1)
+					.describe("All images to upload in this call"),
+			}),
+			execute: async ({ images }) => {
+				const token = options.apiToken;
+				const base = options.cmsBaseUrl;
+				if (!token || !base) {
+					return {
+						success: false as const,
+						changed: false as const,
+						error: "Media upload is unavailable (no CMS token/URL).",
+					};
+				}
+				return options.mutations.runMutation(
+					async () => {
+						// Bounded concurrency (not unbounded Promise.all): each upload
+						// writes to D1 + R2 through the single dev server, and hammering
+						// the media endpoint trips the Vite SSR reload. A small width
+						// overlaps the fetch+upload latency without swamping it. Errors
+						// are per-image, not fatal; `mapLimit` preserves input order.
+						let uploaded = 0;
+						try {
+							const results = await mapLimit(images, 2, async (img) => {
+								if (options.abortSignal?.aborted) {
+									return { url: img.url, success: false as const, error: "Upload stopped." };
+								}
+								const result = await uploadOneMedia(
+									img.url,
+									img.filename,
+									img.alt,
+									token,
+									base,
+									options.abortSignal,
+								);
+								if (result.success) uploaded++;
+								return result;
+							});
+							options.abortSignal?.throwIfAborted();
+							for (const [index, result] of results.entries()) {
+								const image = images[index]!;
+								const identity = image.filename?.trim() || image.alt?.trim() || image.url;
+								const failureKey = `media\0${identity}`;
+								if (result.success) {
+									options.mutations.resolveUnresolvedFailure(failureKey);
+								} else {
+									options.mutations.recordUnresolvedFailure({
+										key: failureKey,
+										toolName: "upload_media",
+										error: `${identity}: ${result.error}`,
+									});
+								}
+							}
+							return { success: uploaded > 0, count: results.length, uploaded, results };
+						} finally {
+							if (uploaded > 0) await options.checkpoint();
+						}
+					},
+					{
+						key: mutationKey("upload_media", { images }),
+						cacheResult: (result) => result.success && result.uploaded === result.count,
+					},
+				);
+			},
+		}),
+	};
+}
+
+/**
  * Creates the tool set, closing over the sandbox instance.
  * Called once per onChatMessage invocation.
  */
 export function createTools(
-	sandboxSource: SandboxInstance | (() => SandboxInstance),
+	sandboxSource: SandboxOps | (() => SandboxOps),
 	callbacks: ToolCallbacks,
 	options: ToolOptions = {},
 ) {
@@ -1051,7 +1171,7 @@ export function createTools(
 		typeof sandboxSource === "function" ? sandboxSource() : sandboxSource;
 	const runSandboxRead =
 		callbacks.runSandboxRead ??
-		(<T>(operation: (sandbox: SandboxInstance) => Promise<T>) => operation(currentSandbox()));
+		(<T>(operation: (sandbox: SandboxOps) => Promise<T>) => operation(currentSandbox()));
 	const convergence = options.convergence ?? new BuildConvergence(options.abortSignal);
 	// AI SDK 6 converts an intermediate tool result twice: once for the
 	// completed step and once for the next model request. Retain each image for
@@ -1073,6 +1193,85 @@ export function createTools(
 	const readFilesQueue = new SerialTaskQueue();
 	const validationQueue = new SerialTaskQueue();
 	const previewQueue = new SerialTaskQueue();
+	/** Screenshot the observed revision and keep it for delivery to the model. */
+	const capturePreviewShot = async (
+		observation: BuildObservation,
+	): Promise<{ shotId: string; revision: number } | { error: string; retryable?: true }> => {
+		const shot = await callbacks.capturePreview();
+		if (!shot.ok) return { error: shot.error };
+		if (!convergence.recordPreviewCapture(observation)) {
+			return {
+				error: "The site changed during preview capture. Retry the current revision.",
+				retryable: true,
+			};
+		}
+		const shotId = crypto.randomUUID();
+		try {
+			callbacks.savePreviewThumbnail?.(shotId, {
+				base64: shot.base64,
+				mediaType: shot.mediaType,
+			});
+		} catch {
+			console.warn("Could not retain preview thumbnail");
+		}
+		previewShots.set(shotId, {
+			base64: shot.base64,
+			mediaType: shot.mediaType,
+			revision: observation.revision,
+			conversions: 0,
+		});
+		return { shotId, revision: observation.revision };
+	};
+	/**
+	 * The model's view of a captured shot. The SDK converts a result twice, so
+	 * the bytes are kept for two conversions and then released.
+	 */
+	const deliverPreviewShot = (shotId: string): PreviewModelOutput => {
+		const shot = previewShots.get(shotId);
+		if (!shot) {
+			return {
+				type: "error-text" as const,
+				value: "The preview screenshot could not be attached. Capture the current revision again.",
+			};
+		}
+		if (!convergence.isObservationCurrent({ revision: shot.revision })) {
+			previewShots.delete(shotId);
+			return {
+				type: "error-text" as const,
+				value: "The site changed before the screenshot could be attached. Capture it again.",
+			};
+		}
+		if (shot.modelOutput) {
+			shot.conversions += 1;
+			const converted = shot.modelOutput;
+			if (shot.conversions >= 2) previewShots.delete(shotId);
+			return converted;
+		}
+		shot.conversions += 1;
+		const maxPreviewImages = options.maxPreviewImages ?? 1;
+		const isFinalPreview = convergence.hasCurrentValidation();
+		const canDeliverExploratory = exploratoryPreviewImagesDelivered < maxPreviewImages;
+		if (!options.previewImagesEnabled || (!isFinalPreview && !canDeliverExploratory)) {
+			shot.modelOutput = {
+				type: "text" as const,
+				value:
+					"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
+			};
+			if (shot.conversions >= 2) previewShots.delete(shotId);
+			return shot.modelOutput;
+		}
+		if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
+		const converted: PreviewModelOutput = {
+			type: "content" as const,
+			value: [
+				{ type: "text" as const, text: PREVIEW_IMAGE_CAPTION },
+				{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
+			],
+		};
+		shot.modelOutput = converted;
+		if (shot.conversions >= 2) previewShots.delete(shotId);
+		return converted;
+	};
 	const trackedMutation = async <T>(
 		operation: () => Promise<T>,
 		key?: string,
@@ -1134,21 +1333,13 @@ export function createTools(
 			}),
 			execute: async ({ paths }, { abortSignal }) =>
 				readFilesQueue.run(() => {
-					if (!options.streamFile) {
-						return Promise.resolve(
-							invalidBatch(paths, new Error("Sandbox file streaming is unavailable.")),
-						);
-					}
 					if (abortSignal?.aborted) {
 						return Promise.resolve(
 							invalidBatch(paths, new Error("Read was stopped before it started.")),
 						);
 					}
 					return runSandboxRead((sandbox) =>
-						readFilesFromSandbox(sandbox, paths, {
-							streamFile: options.streamFile!,
-							signal: abortSignal,
-						}),
+						readFilesFromSandbox(sandbox, paths, { signal: abortSignal }),
 					);
 				}),
 		}),
@@ -1291,7 +1482,7 @@ export function createTools(
 						}> = [];
 						for (const file of files) {
 							options.abortSignal?.throwIfAborted();
-							let current: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+							let current: Awaited<ReturnType<SandboxOps["readFile"]>>;
 							try {
 								current = await currentSandbox().readFile(file.fullPath, {
 									encoding: "utf-8",
@@ -1398,8 +1589,8 @@ export function createTools(
 
 		edit_file: tool({
 			description:
-				"Apply a search-and-replace edit to a file. You MUST read_file first to see the current " +
-				"contents. Provide the exact text to find (oldText) and the replacement (newText); " +
+				"Apply a search-and-replace edit to a file. Read it first unless you read or wrote its current " +
+				"contents earlier in this turn. Provide the exact text to find (oldText) and the replacement (newText); " +
 				"oldText must match exactly one place, so include enough surrounding text. " +
 				"This is much faster than rewriting entire files -- use it for CSS variable changes, " +
 				"config tweaks, or any targeted edit. The oldText must match exactly (including whitespace). " +
@@ -1438,7 +1629,7 @@ export function createTools(
 				}
 				return convergence.runConditionalMutation<FileMutationResult>(
 					async () => {
-						let file: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+						let file: Awaited<ReturnType<SandboxOps["readFile"]>>;
 						try {
 							file = await currentSandbox().readFile(fullPath, { encoding: "utf-8" });
 						} catch (err) {
@@ -1528,7 +1719,7 @@ export function createTools(
 		edit_files: tool({
 			description:
 				"Apply 2-12 independent exact replacements across one or more current source files as one atomic batch. " +
-				"Read every affected file first. Multiple replacements may target the same path and are preflighted in order. Every oldText is validated before any file is written; a write failure rolls the batch back. " +
+				"Read first any affected file you have not read or written in this turn. Multiple replacements may target the same path and are preflighted in order. Every oldText is validated before any file is written; a write failure rolls the batch back. " +
 				"The preview reloads and Artifacts checkpoints once for the whole batch. Use edit_file for one file or astro.config.mjs, and do not batch edits whose contents depend on an earlier mutation.",
 			inputSchema: z.object({
 				edits: z
@@ -1592,7 +1783,7 @@ export function createTools(
 							options.abortSignal?.throwIfAborted();
 							let file = prepared.get(edit.path);
 							if (!file) {
-								let current: Awaited<ReturnType<SandboxInstance["readFile"]>>;
+								let current: Awaited<ReturnType<SandboxOps["readFile"]>>;
 								try {
 									current = await currentSandbox().readFile(edit.fullPath, { encoding: "utf-8" });
 								} catch (err) {
@@ -1723,8 +1914,17 @@ export function createTools(
 			inputSchema: z.object({
 				command: z.string().describe("The shell command to execute"),
 			}),
-			execute: async ({ command }) =>
-				trackedMutation(async () => {
+			execute: async ({ command }) => {
+				// The step's allowed tools already exclude exec here; refuse too in case
+				// the provider ignored them, since the command would void validation.
+				if (convergence.hasCurrentValidation()) {
+					return {
+						success: false as const,
+						error:
+							"The current revision already passed validation, and a shell command would void it. Make a real source or CMS change, or finish.",
+					};
+				}
+				return trackedMutation(async () => {
 					// The SDK request timeout does not reliably kill a child process. A
 					// hung curl then owns the default command session and every later exec
 					// queues behind it. Enforce the deadline inside the container and leave
@@ -1747,13 +1947,15 @@ export function createTools(
 							note: "Builder-managed files must not be modified; see protectedFiles.",
 						}),
 					};
-				}),
+				});
+			},
 		}),
 
 		refresh_types: tool({
 			description:
-				"Regenerate emdash-env.d.ts from the live expanded schema after creating or changing collections, fields, or block types. " +
-				"Call this once after a coherent schema pass, then read emdash-env.d.ts. Never hand-author replacement block unions.",
+				"Regenerate emdash-env.d.ts from the live expanded schema after creating or changing collections, fields, or block types, " +
+				"and return its declarations. Call this once after a coherent schema pass; apply_schema_plan already does it. " +
+				"Use the returned names exactly and never hand-author replacement block unions.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				trackedMutation(async () => {
@@ -1767,6 +1969,9 @@ export function createTools(
 						stdout: result.stdout.slice(0, 4000),
 						stderr: result.stderr.slice(0, 2000),
 						...(result.generatedFile ? { generatedFile: result.generatedFile } : {}),
+						...(result.success && result.declarations
+							? typeDeclarationsForModel(result.declarations)
+							: {}),
 					};
 				}),
 		}),
@@ -1776,7 +1981,8 @@ export function createTools(
 				"Validate the generated public site before completion. Runs the template's frontend boundary " +
 				"check (no React/JSX/client hydration on public routes), Astro typecheck, and a rendered crawl " +
 				"that rejects the blank scaffold and broken internal links. Fix every reported source or route " +
-				"error, then call this again until it succeeds.",
+				"error, then call this again until it succeeds. A passing result includes the final preview " +
+				"screenshot of the validated revision; review it instead of calling view_preview.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				validationQueue.run(async () => {
@@ -1808,13 +2014,28 @@ export function createTools(
 						};
 					}
 
-					const result = await runSandboxRead((sandbox) =>
-						sandbox.exec("pnpm validate", {
-							cwd: SITE_PATH,
-							timeout: 120_000,
-							signal: options.abortSignal,
-						}),
-					);
+					// A content-only change leaves the typecheck's inputs as they were
+					// when it last passed; skip it and keep the content-dependent checks.
+					const fingerprint = callbacks.typecheckCache
+						? await runSandboxRead((sandbox) => typecheckInputsFingerprint(sandbox))
+						: undefined;
+					const typecheckSkipped =
+						fingerprint !== undefined && fingerprint === callbacks.typecheckCache?.lastPassed();
+					const result = typecheckSkipped
+						? {
+								success: true,
+								exitCode: 0,
+								stdout:
+									"Source, generated types and config are unchanged since they last passed the frontend check and Astro typecheck, so those were skipped.",
+								stderr: "",
+							}
+						: await runSandboxRead((sandbox) =>
+								sandbox.exec("pnpm validate", {
+									cwd: SITE_PATH,
+									timeout: 120_000,
+									signal: options.abortSignal,
+								}),
+							);
 					const blockRendererValidation =
 						result.success && callbacks.validateBlockContracts
 							? await runSandboxRead((sandbox) => callbacks.validateBlockContracts!(sandbox))
@@ -1858,6 +2079,7 @@ export function createTools(
 							.join("\n"),
 						...(publicSiteAudit ? { publicSiteAudit } : {}),
 						...(blockRendererValidation ? { blockRendererValidation } : {}),
+						...(typecheckSkipped ? { typecheckSkipped: true as const } : {}),
 					};
 					if (!convergence.recordValidationResult(observation, output, success)) {
 						return {
@@ -1866,137 +2088,44 @@ export function createTools(
 							error: "The site changed during validation. Retry against the current revision.",
 						};
 					}
-					return output;
+					// The revision held still through the typecheck; a change the builder does
+					// not track (such as types regenerated after an Admin schema edit) would
+					// still change the digest, so the pass is recorded only if it matches.
+					if (fingerprint !== undefined && result.success && !typecheckSkipped) {
+						const after = await runSandboxRead((sandbox) => typecheckInputsFingerprint(sandbox));
+						if (after === fingerprint) callbacks.typecheckCache?.recordPassed(fingerprint);
+					}
+					if (!success || !options.previewImagesEnabled) return output;
+					// The completion gate needs a final look at the validated revision.
+					// Capturing it here spares the model a separate view_preview step.
+					const preview = await previewQueue.run(() => capturePreviewShot(observation));
+					return "shotId" in preview
+						? { ...output, preview }
+						: { ...output, previewError: preview.error };
 				}),
-		}),
-
-		search_unsplash: tool({
-			description:
-				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
-				"and photographer credits. Use these URLs in content for image references. " +
-				"Always search rather than guessing photo IDs.",
-			inputSchema: z.object({
-				query: z.string().describe("Search query (e.g. 'iceland landscape')"),
-				count: z.number().optional().default(5).describe("Number of results (1-10, default 5)"),
-			}),
-			execute: async ({ query, count }) => {
-				options.abortSignal?.throwIfAborted();
-				const n = Math.min(Math.max(count, 1), 10);
-				const key = options.unsplashAccessKey;
-				if (!key) {
-					return {
-						success: false as const,
-						error: "UNSPLASH_ACCESS_KEY is not configured on the worker.",
-					};
+			toModelOutput: ({ output }) => {
+				const o = output as { preview?: { shotId?: unknown; revision?: unknown } };
+				const { preview, ...rest } = o;
+				const text = { type: "text" as const, text: JSON.stringify(rest) };
+				if (typeof preview?.shotId !== "string") {
+					return { type: "json" as const, value: output as JSONValue };
 				}
-				const url = new URL("https://api.unsplash.com/search/photos");
-				url.searchParams.set("query", query);
-				url.searchParams.set("per_page", String(n));
-				const res = await fetch(url, {
-					headers: { Authorization: `Client-ID ${key}` },
-					signal: options.abortSignal,
-				});
-				if (!res.ok) {
-					return {
-						success: false as const,
-						error: `Unsplash API error ${res.status}: ${await res.text()}`,
-					};
+				const image = deliverPreviewShot(preview.shotId);
+				if (image.type === "content") {
+					return { type: "content" as const, value: [text, ...image.value] };
 				}
-				const data = (await res.json()) as UnsplashSearchResponse;
-				const photos = data.results.map((p) => ({
-					id: p.id,
-					description: p.description ?? p.alt_description ?? "",
-					url: `${p.urls.raw}&w=1200&h=800&fit=crop&auto=format`,
-					thumb: `${p.urls.raw}&w=400&h=300&fit=crop&auto=format`,
-					photographer: p.user.name,
-					photographerUrl: `https://unsplash.com/@${p.user.username}`,
-				}));
-				return { success: true as const, query, count: photos.length, photos };
+				const note = image.type === "json" ? JSON.stringify(image.value) : image.value;
+				return { type: "content" as const, value: [text, { type: "text" as const, text: note }] };
 			},
 		}),
 
-		upload_media: tool({
-			description:
-				"Download one or more images from URLs (e.g. those returned by search_unsplash) and " +
-				"register them as CMS media items. Pass ALL the images you need in a single call via the " +
-				"`images` array -- do NOT call this once per image. Image/file fields do NOT accept raw " +
-				"URLs: each result includes a `fieldValue` " +
-				'({ "id": "<mediaId>", "provider": "local", "alt": "..." }) to put in the entry\'s image ' +
-				"field when calling content_create/content_update. Results come back in input order and " +
-				"echo each `url` so you can match them to the right entry.",
-			inputSchema: z.object({
-				images: z
-					.array(
-						z.object({
-							url: z.string().describe("Direct image URL to download"),
-							filename: z
-								.string()
-								.optional()
-								.describe("Filename to store it as, e.g. 'hero.jpg' (default 'image')"),
-							alt: z.string().optional().describe("Alt text describing the image"),
-						}),
-					)
-					.min(1)
-					.describe("All images to upload in this call"),
-			}),
-			execute: async ({ images }) => {
-				const token = options.apiToken;
-				const base = options.cmsBaseUrl;
-				if (!token || !base) {
-					return {
-						success: false as const,
-						changed: false as const,
-						error: "Media upload is unavailable (no CMS token/URL).",
-					};
-				}
-				return trackedMutation(
-					async () => {
-						// Bounded concurrency (not unbounded Promise.all): each upload
-						// writes to D1 + R2 through the single dev server, and hammering
-						// the media endpoint trips the Vite SSR reload. A small width
-						// overlaps the fetch+upload latency without swamping it. Errors
-						// are per-image, not fatal; `mapLimit` preserves input order.
-						let uploaded = 0;
-						try {
-							const results = await mapLimit(images, 2, async (img) => {
-								if (options.abortSignal?.aborted) {
-									return { url: img.url, success: false as const, error: "Upload stopped." };
-								}
-								const result = await uploadOneMedia(
-									img.url,
-									img.filename,
-									img.alt,
-									token,
-									base,
-									options.abortSignal,
-								);
-								if (result.success) uploaded++;
-								return result;
-							});
-							options.abortSignal?.throwIfAborted();
-							for (const [index, result] of results.entries()) {
-								const image = images[index]!;
-								const identity = image.filename?.trim() || image.alt?.trim() || image.url;
-								const failureKey = `media\0${identity}`;
-								if (result.success) {
-									convergence.resolveUnresolvedFailure(failureKey);
-								} else {
-									convergence.recordUnresolvedFailure({
-										key: failureKey,
-										toolName: "upload_media",
-										error: `${identity}: ${result.error}`,
-									});
-								}
-							}
-							return { success: uploaded > 0, count: results.length, uploaded, results };
-						} finally {
-							if (uploaded > 0) await callbacks.checkpointSite();
-						}
-					},
-					mutationKey("upload_media", { images }),
-					(result) => result.success && result.uploaded === result.count,
-				);
-			},
+		...createMediaTools({
+			mutations: convergence,
+			checkpoint: callbacks.checkpointSite,
+			abortSignal: options.abortSignal,
+			unsplashAccessKey: options.unsplashAccessKey,
+			apiToken: options.apiToken,
+			cmsBaseUrl: options.cmsBaseUrl,
 		}),
 
 		restart_dev_server: tool({
@@ -2022,8 +2151,9 @@ export function createTools(
 				"Look at the live preview: capture a screenshot of the site as it renders right now and " +
 				"see it yourself. Use this after making design or content changes to check your work -- " +
 				"verify layout, spacing and alignment, colour and contrast, that images actually loaded, " +
-				"that no section is empty or broken, and that the result matches the brief. Call it before " +
-				"telling the user the site is ready. Fix anything that looks off, then look again.",
+				"that no section is empty or broken, and that the result matches the brief. A passing validate_site " +
+				"already returns the final screenshot, so call this for a look before validation or when " +
+				"validation could not capture one. Fix anything that looks off, then look again.",
 			inputSchema: z.object({}),
 			execute: async () =>
 				previewQueue.run(async () => {
@@ -2057,31 +2187,15 @@ export function createTools(
 								"The exploratory screenshot budget is full. Validate first, then request the final preview.",
 						};
 					}
-					const shot = await callbacks.capturePreview();
-					if (!shot.ok) return { success: false as const, error: shot.error };
-					if (!convergence.recordPreviewCapture(observation)) {
+					const captured = await capturePreviewShot(observation);
+					if ("error" in captured) {
 						return {
 							success: false as const,
-							retryable: true as const,
-							error: "The site changed during preview capture. Retry the current revision.",
+							...(captured.retryable ? { retryable: true as const } : {}),
+							error: captured.error,
 						};
 					}
-					const shotId = crypto.randomUUID();
-					try {
-						callbacks.savePreviewThumbnail?.(shotId, {
-							base64: shot.base64,
-							mediaType: shot.mediaType,
-						});
-					} catch {
-						console.warn("Could not retain preview thumbnail");
-					}
-					previewShots.set(shotId, {
-						base64: shot.base64,
-						mediaType: shot.mediaType,
-						revision: observation.revision,
-						conversions: 0,
-					});
-					return { success: true as const, shotId, revision: observation.revision };
+					return { success: true as const, ...captured };
 				}),
 			// Hand the first-build screenshot to the multimodal coordinator,
 			// not as JSON. `file-data` carries base64 image bytes inline.
@@ -2122,54 +2236,7 @@ export function createTools(
 							"No new screenshot was captured because the site has not changed. Use the current preview; do not call view_preview again unless you make a real change.",
 					};
 				}
-				const shot = previewShots.get(o.shotId);
-				if (!shot) {
-					return {
-						type: "error-text" as const,
-						value:
-							"The preview screenshot could not be attached. Capture the current revision again.",
-					};
-				}
-				if (!convergence.isObservationCurrent({ revision: shot.revision })) {
-					previewShots.delete(o.shotId);
-					return {
-						type: "error-text" as const,
-						value: "The site changed before the screenshot could be attached. Capture it again.",
-					};
-				}
-				if (shot.modelOutput) {
-					shot.conversions += 1;
-					const converted = shot.modelOutput;
-					if (shot.conversions >= 2) previewShots.delete(o.shotId);
-					return converted;
-				}
-				shot.conversions += 1;
-				const maxPreviewImages = options.maxPreviewImages ?? 1;
-				const isFinalPreview = convergence.hasCurrentValidation();
-				const canDeliverExploratory = exploratoryPreviewImagesDelivered < maxPreviewImages;
-				if (!options.previewImagesEnabled || (!isFinalPreview && !canDeliverExploratory)) {
-					shot.modelOutput = {
-						type: "text" as const,
-						value:
-							"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
-					};
-					if (shot.conversions >= 2) previewShots.delete(o.shotId);
-					return shot.modelOutput;
-				}
-				if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
-				const converted: PreviewModelOutput = {
-					type: "content" as const,
-					value: [
-						{
-							type: "text" as const,
-							text: "Current preview screenshot. Review layout, spacing, alignment, colour/contrast, whether images loaded, any empty or broken sections, and how well it matches the brief. If anything looks off, fix it and look again.",
-						},
-						{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
-					],
-				};
-				shot.modelOutput = converted;
-				if (shot.conversions >= 2) previewShots.delete(o.shotId);
-				return converted;
+				return deliverPreviewShot(o.shotId);
 			},
 		}),
 

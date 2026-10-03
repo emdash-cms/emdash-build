@@ -177,9 +177,13 @@ function ToolMarker({ part }: { part: MessagePart }) {
 	const Icon = ["search_unsplash", "upload_media", "view_preview", "media_list"].includes(name)
 		? ImageSquare
 		: /^(content_|schema_|settings_|menu_|taxonomy_|byline_)/.test(name) ||
-			  ["create_entries_batch", "apply_schema_plan", "update_blocks_field", "search"].includes(
-					name,
-			  )
+			  [
+					"create_entries_batch",
+					"apply_schema_plan",
+					"update_blocks_field",
+					"search",
+					"run_cms_script",
+			  ].includes(name)
 			? Database
 			: FileCode;
 	return <Icon size={15} className="build-details-marker" aria-hidden="true" />;

@@ -28,7 +28,30 @@ also kept in agent state as `lastTurnMetrics`. Fields:
   `subcalls` for batch entry-text model calls
 - per-tool `calls`, `ms` and `failures`, including calls the SDK rejected
   without running them (invalid input, unknown or disabled tool) at 0 ms;
-  `sync` is the preview re-render and backup time spent inside tools
+  `sync` is the time tools wait on sync work: `previewRefresh` for marking
+  preview snapshots stale (the re-render runs in the background) and `backup`
+  for staging and committing a checkpoint (the upload runs in the background)
+- `stepTimings` for the first 64 steps (`stepTimingsOmitted` counts the rest),
+  each measured from the step's start: the requested `effort`; `attempts`, the
+  model HTTP attempts (above 1, the times include the SDK's retry backoff);
+  `firstByteMs` to the successful attempt's response headers; `firstChunkMs`
+  to the first reasoning summary, answer text or tool input; `firstOutputMs`
+  to the first answer text or tool input (queueing plus thinking); `ms` to the
+  step's end including its tools; the step's `tokens`; and `incomplete` when
+  the step never finished (stopped, failed or out of retries)
+- `modelWaitMs`, the sum of the timed steps' `firstOutputMs`
+- `scriptCalls`: the calls `run_cms_script` programs made, by inner tool, with
+  the same `calls`, `ms` and `failures` as `tools` (the program itself is in
+  `tools.run_cms_script`)
+- `modelHttp`: model HTTP attempts, including SDK retries and entry-body
+  sub-calls, with failed statuses counted by code (`0` is a network error; a
+  Stop is not counted)
+
+`lastTurnMetrics` in agent state omits `stepTimings`; the log line has them.
+Model requests carry `cf-aig-metadata` (`session`, `turn`, `kind`, and
+`purpose` for sub-calls), so AI Gateway logs join to these records.
+`builder.initial_build_benchmark` carries an `outcome` of `completed`,
+`failed` or `stopped`; unfinished first builds are logged too.
 
 Tool times overlap when tools run in parallel, and `sync` includes time spent
 waiting behind another backup. Waiting for MCP before `onChatMessage` and a
@@ -114,6 +137,13 @@ replayed with the same key so the control plane reconciles remote identity.
 
 - Guest identities are limited to ten projects in the reference app.
 - Keep Sandbox `max_instances` aligned with the account's deliberate capacity.
+  Production allows 100 concurrent sandboxes (4 vCPU and 12 GiB each), about a
+  quarter of the default account limit of 1,500 vCPU. Past the cap, a new
+  container waits for the SDK's retries (about two minutes) and then fails, so
+  watch for `ContainerUnavailableError` and AI Gateway 429s before raising it.
+  `SANDBOX_MAX_CONCURRENT` holds the same number for the app-owned cap
+  (`SandboxCapacity`) that replaces `max_instances` with Sandbox SDK 1.0; past
+  it, a site shows its place in the queue and starts when a slot frees up.
 - Add provider rate limiting/Turnstile before opening an unrestricted public demo.
 - Expire idle Sandbox compute while retaining source in Artifacts.
 - Commit recovery snapshots from a stable staging copy after initial setup,
@@ -133,7 +163,7 @@ replayed with the same key so the control plane reconciles remote identity.
   the stable sandbox id and reloads only after recovery succeeds.
 - Opening an existing sidebar project proactively wakes the Sandbox and
   reactivates port forwarding. Vite HMR uses the public preview host, and the
-  Worker must preserve WebSocket upgrade responses from `proxyToSandbox`.
+  Worker must preserve WebSocket upgrade responses from `routePreviewRequest`.
 - Serialize per-site MCP calls through the Astro dev runner and reload the
   preview only for mutating CMS tools. Parallel MCP bursts otherwise queue
   user page loads behind several multi-second dynamic requests.

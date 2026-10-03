@@ -31,8 +31,38 @@ function canonicalJson(value: unknown): unknown {
 	);
 }
 
+/**
+ * Forced repair steps per unresolved failure. A retry that changes the
+ * failure's identity (a new title or filename) never resolves the original
+ * key, and forcing it on every step would run the turn to its step cap.
+ */
+const MAX_FORCED_RECOVERY_STEPS = 3;
+
+function reportsFailure(result: unknown): boolean {
+	return (
+		result !== null &&
+		typeof result === "object" &&
+		(result as { success?: unknown }).success === false
+	);
+}
+
 export function mutationKey(toolName: string, input: unknown): string {
 	return `${toolName}\0${JSON.stringify(canonicalJson(input))}`;
+}
+
+/** The mutation surface a tool needs; a script run hands its tools a scoped one. */
+export type MutationScope = Pick<
+	BuildConvergence,
+	| "runMutation"
+	| "runConditionalMutation"
+	| "reusedMutationResultQueued"
+	| "recordUnresolvedFailure"
+	| "resolveUnresolvedFailure"
+>;
+
+export interface ScriptScope extends MutationScope {
+	/** Whether an inner mutation has started. */
+	readonly mutated: boolean;
 }
 
 /**
@@ -57,6 +87,10 @@ export class BuildConvergence {
 	private mutationResults = new Map<string, unknown>();
 	private mutationTail: Promise<void> = Promise.resolve();
 	private unresolvedFailures = new Map<string, UnresolvedBuildFailure>();
+	private forcedRecoveries = new Map<string, number>();
+	/** The failure the current step was forced to repair, and failures it recorded again. */
+	private forcedStep?: { key: string; toolName: string };
+	private rerecordedFailures = new Set<string>();
 
 	constructor(private readonly abortSignal?: AbortSignal) {}
 
@@ -126,6 +160,75 @@ export class BuildConvergence {
 		});
 	}
 
+	/**
+	 * One mutation window for a whole program of tool calls. It holds the
+	 * mutation lane, advances the revision once when the first inner mutation
+	 * starts, and keeps observations out until `operation` (including any sync
+	 * it performs) settles. Inner calls use `scope`, which never re-enters the
+	 * lane, so they cannot deadlock behind the program itself; they still run
+	 * one at a time, as direct calls do.
+	 */
+	runScript<T>(
+		operation: (scope: ScriptScope) => Promise<T>,
+		options: { key?: string; cacheResult?: (result: T) => boolean } = {},
+	): Promise<T> {
+		return this.enqueueMutation(async () => {
+			if (options.key) {
+				const cached = this.reusedMutationResult<T>(options.key);
+				if (cached.hit) return cached.value;
+			}
+			let finish: ((succeeded?: boolean) => void) | undefined;
+			let revision = this.revision;
+			const begin = () => {
+				this.abortSignal?.throwIfAborted();
+				if (finish) return;
+				finish = this.beginMutation();
+				revision = this.revision;
+			};
+			let innerTail: Promise<unknown> = Promise.resolve();
+			const serial = <R>(run: () => Promise<R>): Promise<R> => {
+				const scheduled = innerTail.then(run, run);
+				innerTail = scheduled.catch(() => undefined);
+				return scheduled;
+			};
+			const scope: ScriptScope = {
+				get mutated() {
+					return finish !== undefined;
+				},
+				runMutation: <R>(mutation: () => Promise<R>) =>
+					serial(async () => {
+						begin();
+						return mutation();
+					}),
+				runConditionalMutation: <R>(
+					prepare: () => Promise<
+						{ changed: false; result: R } | { changed: true; operation: () => Promise<R> }
+					>,
+				) =>
+					serial(async () => {
+						const prepared = await prepare();
+						if (!prepared.changed) return prepared.result;
+						begin();
+						return prepared.operation();
+					}),
+				reusedMutationResultQueued: async () => ({ hit: false as const }),
+				recordUnresolvedFailure: (failure) => this.recordUnresolvedFailure(failure),
+				resolveUnresolvedFailure: (key) => this.resolveUnresolvedFailure(key),
+			};
+			let succeeded = false;
+			try {
+				const result = await operation(scope);
+				succeeded = !reportsFailure(result);
+				if (succeeded && finish && options.key && (options.cacheResult?.(result) ?? true)) {
+					this.recordMutationResult(options.key, result, revision);
+				}
+				return result;
+			} finally {
+				finish?.(succeeded);
+			}
+		});
+	}
+
 	private executeMutation<T>(
 		operation: () => Promise<T>,
 		options: { key?: string; cacheResult?: (result: T) => boolean },
@@ -135,11 +238,7 @@ export class BuildConvergence {
 		let succeeded = false;
 		return operation()
 			.then((result) => {
-				succeeded = !(
-					result !== null &&
-					typeof result === "object" &&
-					(result as { success?: unknown }).success === false
-				);
+				succeeded = !reportsFailure(result);
 				if (succeeded && options.key && (options.cacheResult?.(result) ?? true)) {
 					this.recordMutationResult(options.key, result, revision);
 				}
@@ -280,20 +379,51 @@ export class BuildConvergence {
 	}
 
 	recordUnresolvedFailure(failure: UnresolvedBuildFailure): void {
+		this.rerecordedFailures.add(failure.key);
 		this.unresolvedFailures.set(failure.key, failure);
 		this.forceText = false;
 	}
 
 	resolveUnresolvedFailure(key: string): void {
 		this.unresolvedFailures.delete(key);
+		this.forcedRecoveries.delete(key);
 	}
 
+	private isAbandoned(failure: UnresolvedBuildFailure): boolean {
+		return (this.forcedRecoveries.get(failure.key) ?? 0) >= MAX_FORCED_RECOVERY_STEPS;
+	}
+
+	/** Failures still worth forcing a repair for; abandoned ones no longer block completion. */
 	hasUnresolvedFailures(): boolean {
-		return this.unresolvedFailures.size > 0;
+		return this.nextUnresolvedFailure() !== undefined;
 	}
 
 	nextUnresolvedFailure(): UnresolvedBuildFailure | undefined {
-		return this.unresolvedFailures.values().next().value;
+		for (const failure of this.unresolvedFailures.values()) {
+			if (!this.isAbandoned(failure)) return failure;
+		}
+		return undefined;
+	}
+
+	/**
+	 * A step is about to force a repair of this failure. A forced call usually
+	 * retries every failure of its tool at once (an image batch, say), so the
+	 * step counts against all of them rather than against each in turn.
+	 */
+	noteForcedRecovery(key: string): void {
+		const forced = this.unresolvedFailures.get(key);
+		if (!forced) return;
+		for (const failure of this.unresolvedFailures.values()) {
+			if (failure.toolName !== forced.toolName) continue;
+			this.forcedRecoveries.set(failure.key, (this.forcedRecoveries.get(failure.key) ?? 0) + 1);
+		}
+		this.forcedStep = { key, toolName: forced.toolName };
+		this.rerecordedFailures.clear();
+	}
+
+	/** Failures that stayed unresolved through every forced repair step. */
+	abandonedFailures(): UnresolvedBuildFailure[] {
+		return [...this.unresolvedFailures.values()].filter((failure) => this.isAbandoned(failure));
 	}
 
 	markEvidenceExposed(): void {
@@ -303,6 +433,7 @@ export class BuildConvergence {
 	}
 
 	finishStep(step: BuildConvergenceStep): void {
+		this.settleForcedStep(step);
 		if (!this.hasCompleteEvidence()) {
 			if (this.hasCurrentValidation() && this.stepFailed(step, "view_preview")) {
 				this.finalPreviewFailures += 1;
@@ -324,6 +455,23 @@ export class BuildConvergence {
 			if (this.postEvidenceFailures < 2) return;
 		}
 		this.forceText = true;
+	}
+
+	/**
+	 * A forced call that succeeded repaired its failure even when the retry
+	 * changed the failure's identity (a new title, say), which leaves the
+	 * original key unresolved; forcing it again could create a duplicate.
+	 */
+	private settleForcedStep(step: BuildConvergenceStep): void {
+		const forced = this.forcedStep;
+		const rerecorded = this.rerecordedFailures;
+		this.forcedStep = undefined;
+		this.rerecordedFailures = new Set();
+		if (!forced || rerecorded.has(forced.key)) return;
+		const called = (step.toolResults ?? []).some((result) => result.toolName === forced.toolName);
+		if (called && !this.stepFailed(step, forced.toolName)) {
+			this.resolveUnresolvedFailure(forced.key);
+		}
 	}
 
 	private stepFailed(step: BuildConvergenceStep, toolName?: string): boolean {
@@ -355,6 +503,16 @@ export class BuildConvergence {
 	}
 }
 
+/** Tools whose results can carry a preview screenshot: validation attaches the final one. */
+const PREVIEW_IMAGE_TOOLS = new Set(["view_preview", "validate_site"]);
+
+/** The screenshot caption; pruning drops it with the image and keeps any other text. */
+export const PREVIEW_IMAGE_CAPTION =
+	"Current preview screenshot. Review layout, spacing, alignment, colour/contrast, whether images loaded, any empty or broken sections, and how well it matches the brief. If anything looks off, fix it and look again.";
+
+const OMITTED_PREVIEW_TEXT =
+	"A superseded preview image was omitted from the current build context.";
+
 export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean): ModelMessage[] {
 	const imageLocations: Array<{ messageIndex: number; partIndex: number }> = [];
 	for (const [messageIndex, message] of messages.entries()) {
@@ -362,7 +520,7 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 		for (const [partIndex, part] of message.content.entries()) {
 			if (
 				part.type !== "tool-result" ||
-				part.toolName !== "view_preview" ||
+				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content" ||
 				!part.output.value.some((item) => item.type === "file-data")
 			) {
@@ -390,17 +548,20 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 		if (!message || message.role !== "tool" || !Array.isArray(message.content)) {
 			continue;
 		}
-		message.content = message.content.map((part, partIndex) =>
-			indexes.has(partIndex) && part.type === "tool-result"
-				? {
-						...part,
-						output: {
-							type: "text" as const,
-							value: "A superseded preview image was omitted from the current build context.",
-						},
-					}
-				: part,
-		);
+		message.content = message.content.map((part, partIndex) => {
+			if (!indexes.has(partIndex) || part.type !== "tool-result") return part;
+			// Keep what else the result said, such as validation output beside the image.
+			const kept =
+				part.output.type === "content"
+					? part.output.value.flatMap((item) =>
+							item.type === "text" && item.text !== PREVIEW_IMAGE_CAPTION ? [item.text] : [],
+						)
+					: [];
+			return {
+				...part,
+				output: { type: "text" as const, value: [...kept, OMITTED_PREVIEW_TEXT].join("\n") },
+			};
+		});
 	}
 	return messages;
 }
@@ -433,7 +594,7 @@ export function promoteLatestPreviewImage(
 		for (const part of message.content) {
 			if (
 				part.type !== "tool-result" ||
-				part.toolName !== "view_preview" ||
+				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content"
 			) {
 				continue;
@@ -480,15 +641,45 @@ export function canCompleteBuild(convergence: BuildConvergence, finishReason: un
 	);
 }
 
+const ABANDONED_REPAIR_NOTE =
+	"The builder stopped requiring repairs for these failures after three attempts. Fix them if you can; otherwise say in your final summary what is still missing:";
+
+/** Keep abandoned repairs in front of the model so its summary reports them. */
+function withAbandonedRepairNote(
+	messages: ModelMessage[],
+	convergence: BuildConvergence,
+): ModelMessage[] {
+	const abandoned = convergence.abandonedFailures().slice(0, 5);
+	if (abandoned.length === 0) return messages;
+	const lines = abandoned.map((failure) => `- ${failure.toolName}: ${failure.error.slice(0, 200)}`);
+	return [
+		...messages,
+		{
+			role: "user",
+			content: [{ type: "text", text: [ABANDONED_REPAIR_NOTE, ...lines].join("\n") }],
+		},
+	];
+}
+
+/**
+ * One step's gating. The full tool list is always sent: narrowing it changes
+ * the cached prompt prefix, so `allowedTools` restricts calls through the
+ * provider (OpenAI `allowed_tools`) instead. A text-only step and a tool
+ * restriction are exclusive, since the provider lets the restriction win.
+ */
+export type PreparedBuildStep<TOOL_NAME extends string> = { messages: ModelMessage[] } & (
+	| {
+			toolChoice?: undefined;
+			allowedTools?: { toolNames: TOOL_NAME[]; mode: "auto" | "required" };
+	  }
+	| { toolChoice: "none"; allowedTools?: undefined }
+);
+
 export function prepareBuildStep<TOOL_NAME extends string>(
 	convergence: BuildConvergence,
 	messages: ModelMessage[],
 	toolNames: readonly TOOL_NAME[],
-): {
-	messages: ModelMessage[];
-	activeTools?: TOOL_NAME[];
-	toolChoice?: "none" | { type: "tool"; toolName: TOOL_NAME };
-} {
+): PreparedBuildStep<TOOL_NAME> {
 	const preparedPreview = promoteLatestPreviewImage(
 		messages,
 		convergence.hasCurrentPreviewCapture(),
@@ -497,39 +688,34 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 		convergence.recordPreviewDelivery(convergence.currentRevision());
 		convergence.markEvidenceExposed();
 	}
-	const prunedMessages = preparedPreview.messages;
-	const activeTools = convergence.hasCurrentValidation()
+	const prunedMessages = withAbandonedRepairNote(preparedPreview.messages, convergence);
+	// A shell command counts as a mutation, so it would void current validation.
+	const callable = convergence.hasCurrentValidation()
 		? toolNames.filter((toolName) => toolName !== "exec")
 		: [...toolNames];
+	const required = (toolName: TOOL_NAME): PreparedBuildStep<TOOL_NAME> => ({
+		messages: prunedMessages,
+		allowedTools: { toolNames: [toolName], mode: "required" },
+	});
 	const unresolved = convergence.nextUnresolvedFailure();
 	const recoveryTool = unresolved
-		? activeTools.find((toolName) => toolName === unresolved.toolName)
+		? callable.find((toolName) => toolName === unresolved.toolName)
 		: undefined;
-	if (recoveryTool) {
-		return {
-			messages: prunedMessages,
-			activeTools,
-			toolChoice: { type: "tool", toolName: recoveryTool },
-		};
+	if (unresolved && recoveryTool) {
+		convergence.noteForcedRecovery(unresolved.key);
+		return required(recoveryTool);
 	}
 	if (convergence.shouldForceText()) {
-		return { messages: prunedMessages, activeTools: [], toolChoice: "none" };
+		return { messages: prunedMessages, toolChoice: "none" };
 	}
 	if (convergence.hasCurrentValidation()) {
 		if (!convergence.hasCompleteEvidence()) {
-			const previewTool = activeTools.find((toolName) => toolName === "view_preview");
-			if (previewTool) {
-				return {
-					messages: prunedMessages,
-					activeTools,
-					toolChoice: { type: "tool", toolName: previewTool },
-				};
-			}
+			const previewTool = callable.find((toolName) => toolName === "view_preview");
+			if (previewTool) return required(previewTool);
 		}
-		return {
-			messages: prunedMessages,
-			activeTools,
-		};
+		if (callable.length < toolNames.length) {
+			return { messages: prunedMessages, allowedTools: { toolNames: callable, mode: "auto" } };
+		}
 	}
 	return { messages: prunedMessages };
 }

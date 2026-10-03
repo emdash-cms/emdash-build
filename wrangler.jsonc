@@ -16,6 +16,8 @@
 		"binding": "ASSETS",
 		"run_worker_first": true,
 	},
+	// 100 concurrent sandboxes use about a quarter of the account's default
+	// container limit (1,500 vCPU); model rate limits are the next ceiling.
 	"containers": [
 		{
 			"class_name": "Sandbox",
@@ -25,7 +27,7 @@
 				"memory_mib": 12288,
 				"disk_mb": 10240,
 			},
-			"max_instances": 10,
+			"max_instances": 100,
 		},
 	],
 	"durable_objects": {
@@ -50,6 +52,10 @@
 				"name": "SiteService",
 				"class_name": "SiteService",
 			},
+			{
+				"name": "SandboxCapacity",
+				"class_name": "SandboxCapacity",
+			},
 		],
 	},
 	"migrations": [
@@ -69,11 +75,21 @@
 			"tag": "v4",
 			"new_sqlite_classes": ["SiteService"],
 		},
+		{
+			"tag": "v5",
+			"new_sqlite_classes": ["SandboxCapacity"],
+		},
 	],
 	"ai": {
 		"binding": "AI",
 		"remote": true,
 	},
+	// run_cms_script programs run in Dynamic Workers (ENABLE_CMS_SCRIPTS gates the tool).
+	"worker_loaders": [
+		{
+			"binding": "LOADER",
+		},
+	],
 	// Session persistence: each session's site dir is snapshotted to its own
 	// Artifacts git repo (see BuilderAgent.backupSite/recoverSite).
 	"artifacts": [
@@ -130,6 +146,8 @@
 		"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
 		"PREVIEW_HOSTNAME": "build.emdashcms.com",
 		"ENABLE_PUBLIC_PUBLISHING": "false",
+		"ENABLE_CMS_SCRIPTS": "true",
+		"SANDBOX_MAX_CONCURRENT": "100",
 		"SITES_HOSTNAME": "build.emdashcms.com",
 		"BRANDED_SITES_HOSTNAME": "em-da.sh",
 		"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
@@ -182,12 +200,21 @@
 					"name": "SiteService",
 					"class_name": "SiteService",
 				},
+				{
+					"name": "SandboxCapacity",
+					"class_name": "SandboxCapacity",
+				},
 			],
 		},
 		"ai": {
 			"binding": "AI",
 			"remote": true,
 		},
+		"worker_loaders": [
+			{
+				"binding": "LOADER",
+			},
+		],
 		"artifacts": [
 			{
 				"binding": "ARTIFACTS",
@@ -226,7 +253,9 @@
 			"IDENTITY_ISSUER": "https://cf-emdash-cms.cloudflareaccess.com",
 			"PREVIEW_HOSTNAME": "build.emdashcms.com",
 			"ENABLE_PUBLIC_PUBLISHING": "false",
+			"ENABLE_CMS_SCRIPTS": "true",
 			"SANDBOX_PREVIEW_MODE": "quick-tunnel",
+			"SANDBOX_MAX_CONCURRENT": "10",
 			"SITES_HOSTNAME": "build.emdashcms.com",
 			"WFP_DISPATCH_NAMESPACE": "emdash-build-prerelease",
 			"WFP_ACCOUNT_ID": "1f74638c495bc9f0330ce5c8e64c1b6b",

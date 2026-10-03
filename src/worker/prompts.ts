@@ -47,7 +47,14 @@ export interface BuildPromptOptions {
 	/** Immutable source captured before the first model-authored mutation. */
 	initialScaffoldContext?: InitialScaffoldContext;
 	editMode?: boolean;
+	/** `run_cms_script` is available this turn. */
+	cmsScripts?: boolean;
 }
+
+const CMS_PROGRAMS = [
+	"## CMS programs",
+	"`run_cms_script` runs one short program of CMS calls in a single step and checkpoints once. Use it for three or more CMS calls that belong together, such as site settings and menus, or bylines, uploaded images, entries and the menus that link them, and for one change repeated across many entries. Use direct tools for a single change, for a result you must read before deciding what to do next, and for schema plans, block-type changes, `create_entries_batch`, files, validation and preview. Pass explicit slugs. If a program fails partway, fix only the calls its `log` marks as failed; do not re-run it whole.",
+].join("\n\n");
 
 function initialScaffoldSection(context: InitialScaffoldContext): string {
 	const files = context.files.map(
@@ -69,8 +76,11 @@ export function buildBuildPrompt({
 	templateGuidance,
 	initialScaffoldContext,
 	editMode = false,
+	cmsScripts = false,
 }: BuildPromptOptions): string {
-	if (editMode) return [followUpPrompt, blocksFollowUp].join("\n\n");
+	if (editMode) {
+		return [followUpPrompt, ...(cmsScripts ? [CMS_PROGRAMS] : []), blocksFollowUp].join("\n\n");
+	}
 
 	const sections = [
 		blankBuildPrompt,
@@ -80,6 +90,7 @@ export function buildBuildPrompt({
 		sections.push(`## Template-specific guidance\n\n${templateGuidance.trim()}`);
 	}
 	if (initialScaffoldContext) sections.push(initialScaffoldSection(initialScaffoldContext));
+	if (cmsScripts) sections.push(CMS_PROGRAMS);
 	// Runtime-owned and last so stale guidance pinned in recovered sessions cannot override it.
 	sections.push(blocksContract);
 	return sections.join("\n\n");

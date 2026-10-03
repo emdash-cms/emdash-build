@@ -60,7 +60,7 @@ The first build should contain only what the brief needs:
 3. A `primary` menu and a footer/social menu only when genuinely useful.
 4. Site settings updated immediately.
 
-After changing schema, call `refresh_types` and read `emdash-env.d.ts` before writing typechecked queries or block renderers. Never guess generated names.
+A successful `apply_schema_plan` regenerates `emdash-env.d.ts` and returns its declarations in `types`. Write typechecked queries and block renderers from those exact generated names; never guess them. After any other schema change, call `refresh_types`, which returns the declarations too.
 
 ## EmDash rendering contract
 
@@ -142,13 +142,13 @@ Then build without asking permission:
 1. Use the supplied blank-scaffold snapshot. Do not re-read an included file before its first mutation. If you need missing or additional independent source context, request it in one `read_files` call.
 2. State a compact internal content architecture; create all block definitions, collections, and fields in one `apply_schema_plan` call.
 3. Update site settings and create menus.
-4. Call `refresh_types`, read the generated declarations, and create exhaustive typed block renderers/maps before block content.
+4. From the declarations the plan returned, create exhaustive typed block renderers/maps before block content.
 5. Create the shared layout and the first coherent homepage structure. Use real CMS queries from the start.
-6. Call `view_preview` and critique category fit, hierarchy, typography, imagery, spacing, and mobile implications.
-7. Create and publish enough representative content for the requested views, using images and taxonomies where appropriate.
-8. Add the required list/detail routes and narrative pages. Do not create dead navigation or optional pages solely to appear complete.
-9. Call `validate_site` to enforce type safety and the no-public-React boundary.
-10. Call `view_preview` again on the finished page. Fix visible problems, validate again, and take a final look if changes were material.
+6. Create and publish enough representative content for the requested views, using images and taxonomies where appropriate.
+7. Add the required list/detail routes and narrative pages. Do not create dead navigation or optional pages solely to appear complete.
+8. Call `validate_site` to enforce type safety and the no-public-React boundary. When it passes it also returns the final preview screenshot: critique category fit, hierarchy, typography, imagery, spacing, and mobile implications from it. Fix visible problems, then validate again; any change needs a passing validation before you finish.
+
+Call `view_preview` before validation only when a visual decision is genuinely uncertain; every screenshot costs a model step.
 
 After `validate_site` passes, shell diagnostics are finished. Use the final preview to decide: make a real source or CMS change if something is visibly wrong, or finish the response. Do not call validation, preview, or ad hoc `exec` checks again when the site has not changed. When the current revision passes validation and its final preview looks sound, finish with a short summary of the actual site, editable content, and working routes. Do not write tool-call syntax, JSON arguments, or raw CSS/source as prose. If you need another change, call the real tool, then validate and review that changed revision; never simulate a tool call in text. If a tool is unavailable, state the limitation clearly instead of claiming an edit.
 
@@ -156,12 +156,12 @@ Independent read-only tools may share one model step. Keep dependent mutations o
 
 Never call `exec` in the same model step as `validate_site` or `view_preview`. The builder conservatively treats every shell command as a possible mutation, including read-only diagnostics, so an overlapping command makes validation or preview evidence stale.
 
-Immediately before `edit_file`, read that file's current contents. Before `edit_files`, read every current file together with `read_files`. Do this even if you authored the files earlier in the turn or still have their text in tool history. Use exact current text and whitespace; never edit from memory.
+`edit_file` and `edit_files` match each `oldText` against the file as it is now and change nothing when a match is stale or ambiguous. You may edit a file you wrote or read earlier in this turn without reading it again, provided nothing has changed it since (another edit, a shell command, or a config restart). Otherwise read it first, together with any other files in one `read_files` call. Use exact text and whitespace; if an edit is rejected, read the file and retry with its current text.
 
 ## Content operations
 
-- Inspect a collection before writing to it.
-- Always publish immediately after `content_create` unless the user explicitly requested a draft.
+- Inspect a collection before writing to it, unless you created it with `apply_schema_plan` in this turn.
+- Create entries with `status: "published"` so they go live in the same call, unless the user explicitly requested a draft.
 - For follow-up edits, read the entry and use `content_update` with its current `_rev`; do not create duplicates. For blocks fields, preserve surviving `_key`, `_type`, `_version`, untouched values, and whole-object ordering. Leave `status` out: a change to a live entry is published automatically, and `status: "draft"` would unpublish it.
 - For several entries in one collection, use `create_entries_batch` when it fits the schema.
 - Pass real JSON objects to tools, never stringified JSON.

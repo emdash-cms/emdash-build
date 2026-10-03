@@ -1,4 +1,5 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
+import { MockLanguageModelV3 } from "ai/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BuildConvergence } from "../src/worker/build-convergence.js";
 import { McpToolFailureGuard } from "../src/worker/mcp-tool-guard.js";
@@ -385,6 +386,13 @@ describe("apply_schema_plan", () => {
 			const harness = installBlockCms(instance, calls);
 			const checkpoint = vi.fn(async () => {});
 			harness.backupSite = checkpoint;
+			const regenerate = vi.fn(async () => ({
+				success: true as const,
+				file: "emdash-env.d.ts",
+				declarations: "export type PagesLayoutBlock = BakeryIntroV1Block;",
+			}));
+			(harness as unknown as { regenerateSiteTypes: typeof regenerate }).regenerateSiteTypes =
+				regenerate;
 			const run = () => harness.buildSchemaPlanTool(new BuildConvergence()).apply_schema_plan;
 			harness.blockTypes.set("visit_bakery", {
 				slug: "visit_bakery",
@@ -405,7 +413,14 @@ describe("apply_schema_plan", () => {
 				createdCollections: 2,
 				createdFields: 4,
 				createdBlockFields: 1,
+				// Generated names come back with the plan: no refresh_types or read step.
+				types: {
+					success: true,
+					file: "emdash-env.d.ts",
+					declarations: "export type PagesLayoutBlock = BakeryIntroV1Block;",
+				},
 			});
+			expect(regenerate).toHaveBeenCalledOnce();
 			const mutations = calls.filter((call) => call.name.startsWith("schema_create"));
 			expect(mutations.map((call) => `${call.name}:${call.args.slug}`)).toEqual([
 				"schema_create_block_type:bakery_intro",
@@ -459,6 +474,76 @@ describe("apply_schema_plan", () => {
 					(call) => call.name === "schema_create_collection" && call.args.slug === "missing_pages",
 				),
 			).toBe(false);
+		});
+	});
+
+	it("keeps a successful plan successful when type generation fails", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000033");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			const harness = installBlockCms(instance, calls);
+			(harness as unknown as { sandboxOps: () => unknown }).sandboxOps = () => ({
+				fetchPort: async () => new Response("typegen crashed", { status: 500 }),
+			});
+
+			const result = await harness
+				.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan.execute(structuredClone(bakeryPlan), toolOptions);
+
+			expect(result).toMatchObject({
+				success: true,
+				types: {
+					success: false,
+					error: expect.stringMatching(/HTTP 500.*Call refresh_types/),
+				},
+			});
+		});
+	});
+
+	it("still checkpoints a changed plan when Stop lands during type generation", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000034");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			const harness = installBlockCms(instance, calls);
+			const checkpoint = vi.fn(async () => {});
+			harness.backupSite = checkpoint;
+			const controller = new AbortController();
+			(harness as unknown as { regenerateSiteTypes: () => Promise<never> }).regenerateSiteTypes =
+				async () => {
+					controller.abort();
+					throw new DOMException("The operation was aborted.", "AbortError");
+				};
+
+			await expect(
+				harness
+					.buildSchemaPlanTool(new BuildConvergence())
+					.apply_schema_plan.execute(structuredClone(bakeryPlan), {
+						...toolOptions,
+						abortSignal: controller.signal,
+					}),
+			).rejects.toThrow();
+			// The schema changes are already in D1; they must reach the snapshot.
+			expect(checkpoint).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("reports generated types from the legacy CLI as success with the file to read", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000035");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				regenerateSiteTypes: () => Promise<unknown>;
+			};
+			harness.sandboxOps = () => ({
+				fetchPort: async () => new Response("not found", { status: 404 }),
+				exec: async () => ({ success: true, exitCode: 0, stdout: "Wrote types", stderr: "" }),
+			});
+
+			await expect(harness.regenerateSiteTypes()).resolves.toEqual({
+				success: true,
+				file: ".emdash/types.ts",
+				note: expect.stringContaining("Read .emdash/types.ts"),
+			});
 		});
 	});
 
@@ -1207,6 +1292,156 @@ describe("create_entries_batch schema filter", () => {
 	});
 });
 
+describe("create_entries_batch drafting", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("drafts six bodies at a time at low effort with room for reasoning and prose", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000031");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			installBlockCms(instance, calls);
+			const harness = instance as unknown as CmsToolHarness & {
+				createTurnModel: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildContentBatchTool: (convergence: BuildConvergence) => {
+					create_entries_batch: ExecutableTool;
+				};
+			};
+			const requests: Array<{ maxOutputTokens?: number; providerOptions?: unknown }> = [];
+			let active = 0;
+			let peak = 0;
+			harness.createTurnModel = () =>
+				new MockLanguageModelV3({
+					doGenerate: async (options) => {
+						requests.push({
+							maxOutputTokens: options.maxOutputTokens,
+							providerOptions: options.providerOptions,
+						});
+						active += 1;
+						peak = Math.max(peak, active);
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						active -= 1;
+						return {
+							content: [{ type: "text", text: "A real paragraph about bread." }],
+							finishReason: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 20, text: 20, reasoning: 0 },
+							},
+							warnings: [],
+						};
+					},
+				});
+			harness.fetchCollectionFieldSlugs = async () => null;
+			harness.refreshAndReloadPreview = async () => {};
+			harness.callMcpTool = async (name, _serverId, _inputSchema, args) => {
+				calls.push({ name, args });
+				return mcpJson({ item: { id: String(args.slug) } });
+			};
+
+			const tools = harness.buildContentBatchTool(new BuildConvergence());
+			const result = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm and specific.",
+					entries: Array.from({ length: 12 }, (_, index) => ({
+						title: `Loaf ${index + 1}`,
+						brief: "How this loaf is made.",
+					})),
+				},
+				toolOptions,
+			);
+
+			expect(result).toMatchObject({ success: true, created: 12, total: 12 });
+			expect(peak).toBe(6);
+			expect(requests).toHaveLength(12);
+			for (const request of requests) {
+				expect(request.maxOutputTokens).toBe(4096);
+				expect(request.providerOptions).toEqual({
+					openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+				});
+			}
+		});
+	});
+});
+
+describe("create_entries_batch truncated bodies", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("redrafts a body cut off at the length limit instead of publishing half of it", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000032");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			installBlockCms(instance, calls);
+			const harness = instance as unknown as CmsToolHarness & {
+				createTurnModel: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildContentBatchTool: (convergence: BuildConvergence) => {
+					create_entries_batch: ExecutableTool;
+				};
+			};
+			const finishes = ["length", "stop", "length", "length", "length", "length"];
+			harness.createTurnModel = () =>
+				new MockLanguageModelV3({
+					doGenerate: async () => {
+						const finish = finishes.shift() ?? "stop";
+						return {
+							content: [{ type: "text", text: finish === "length" ? "Half a par" : "Whole body." }],
+							finishReason: { unified: finish === "length" ? "length" : "stop", raw: finish },
+							usage: {
+								inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 20, text: 20, reasoning: 0 },
+							},
+							warnings: [],
+						};
+					},
+				});
+			harness.fetchCollectionFieldSlugs = async () => null;
+			harness.refreshAndReloadPreview = async () => {};
+			harness.callMcpTool = async (name, _serverId, _inputSchema, args) => {
+				calls.push({ name, args });
+				return mcpJson({ item: { id: String(args.slug) } });
+			};
+
+			const tools = harness.buildContentBatchTool(new BuildConvergence());
+			// One entry at a time keeps the scripted finish reasons in order.
+			const first = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm.",
+					entries: [{ title: "Rye", brief: "Rye loaves." }],
+				},
+				toolOptions,
+			);
+			const second = await tools.create_entries_batch.execute(
+				{
+					collection: "posts",
+					bodyField: "body",
+					voice: "Warm.",
+					entries: [{ title: "Spelt", brief: "Spelt loaves." }],
+				},
+				toolOptions,
+			);
+
+			expect(first).toMatchObject({ success: true, created: 1 });
+			expect(second).toMatchObject({
+				success: false,
+				created: 0,
+				results: [{ title: "Spelt", ok: false, error: expect.stringContaining("cut off") }],
+			});
+			const created = calls.filter((call) => call.name === "content_create");
+			expect(created).toHaveLength(1);
+			expect(JSON.stringify(created[0]?.args)).toContain("Whole body.");
+		});
+	});
+});
+
 describe("MCP failure recovery", () => {
 	beforeEach(async () => {
 		await reset();
@@ -1279,6 +1514,63 @@ describe("MCP failure recovery", () => {
 				"content_create:newsletter",
 			]);
 			expect(convergence.hasUnresolvedFailures()).toBe(false);
+		});
+	});
+});
+
+describe("content_create published in one call", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("does not claim nothing was created when only the publish step failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000036");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as CmsToolHarness & {
+				getMcpServers: () => unknown;
+				refreshAndReloadPreview: () => Promise<void>;
+				buildMcpTools: (
+					guard: McpToolFailureGuard,
+					convergence: BuildConvergence,
+				) => Record<string, ExecutableTool>;
+			};
+			harness.getMcpServers = () => ({
+				tools: [
+					{
+						name: "content_create",
+						serverId: "emdash",
+						description: "Create content",
+						inputSchema: { type: "object" },
+					},
+				],
+			});
+			harness.mcpToolMeta = () => ({ serverId: "emdash", inputSchema: { type: "object" } });
+			harness.refreshAndReloadPreview = async () => {};
+			harness.backupSite = async () => {};
+			harness.callMcpTool = async () =>
+				mcpError("[VALIDATION_ERROR] Cannot publish routable content without a slug");
+
+			const convergence = new BuildConvergence();
+			const tools = harness.buildMcpTools(new McpToolFailureGuard(), convergence);
+			const result = (await tools.content_create!.execute(
+				{ collection: "quotes", status: "published", data: { quote: "Bread is life." } },
+				toolOptions,
+			)) as { error: string };
+
+			expect(result.error).not.toContain("No content was created");
+			expect(result.error).toContain("draft");
+			expect(result.error).toContain("slug");
+			// A forced content_create retry would duplicate the saved draft.
+			expect(convergence.hasUnresolvedFailures()).toBe(false);
+
+			// A field named after publishing is an ordinary validation failure: nothing was saved.
+			harness.callMcpTool = async () => mcpError("[VALIDATION_ERROR] published_at: Required");
+			const fieldError = (await tools.content_create!.execute(
+				{ collection: "posts", status: "published", data: { title: "Rye" } },
+				toolOptions,
+			)) as { error: string };
+			expect(fieldError.error).toContain("No content was created");
+			expect(convergence.hasUnresolvedFailures()).toBe(true);
 		});
 	});
 });
@@ -1584,11 +1876,11 @@ describe("template guidance", () => {
 			runInDurableObject(agent, async (instance) => {
 				const harness = instance as unknown as {
 					templateGuidance: string | undefined;
-					getOrCreateSandbox: () => unknown;
+					sandboxOps: () => unknown;
 					loadTemplateGuidance: () => Promise<string | undefined>;
 				};
 				harness.templateGuidance = undefined;
-				harness.getOrCreateSandbox = () => ({
+				harness.sandboxOps = () => ({
 					exec: async () => ({ success: true, exitCode: 0, stdout, stderr: "" }),
 				});
 				return harness.loadTemplateGuidance();
@@ -1602,12 +1894,12 @@ describe("template guidance", () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000006");
 		await runInDurableObject(agent, async (instance) => {
 			const harness = instance as unknown as {
-				getOrCreateSandbox: () => unknown;
+				sandboxOps: () => unknown;
 				initialScaffoldPrefetch: { current: () => Promise<unknown> };
 				loadTemplateGuidance: () => Promise<string | undefined>;
 				loadInitialScaffoldContext: () => Promise<{ templateGuidance?: string }>;
 			};
-			harness.getOrCreateSandbox = () => ({
+			harness.sandboxOps = () => ({
 				exec: async () => ({ success: true, exitCode: 0, stdout: "# Scaffold", stderr: "" }),
 			});
 			await harness.loadTemplateGuidance();

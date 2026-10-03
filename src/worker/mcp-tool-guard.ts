@@ -1,3 +1,4 @@
+import type { JSONSchema7 } from "ai";
 import { mutationKey } from "./build-convergence.js";
 
 type JsonObject = Record<string, unknown>;
@@ -21,12 +22,12 @@ const CONTENT_ORDER_ALIASES: Record<string, string> = {
  * that one optional value as required-but-nullable to the builder model while
  * leaving the real MCP contract unchanged.
  */
-export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unknown {
-	if (!isObject(inputSchema)) return inputSchema;
+export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): JSONSchema7 {
+	if (!isObject(inputSchema)) return inputSchema as JSONSchema7;
 
 	const adapted = structuredClone(inputSchema) as JsonObject;
 	const properties = adapted.properties;
-	if (!isObject(properties)) return inputSchema;
+	if (!isObject(properties)) return inputSchema as JSONSchema7;
 	if (PAGINATED_CURSOR_TOOLS.has(toolName) && isObject(properties.cursor)) {
 		const stringCursor: JsonObject = { ...properties.cursor, type: "string" };
 		delete stringCursor.anyOf;
@@ -41,7 +42,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 			: [];
 		if (!required.includes("cursor")) required.push("cursor");
 		adapted.required = required;
-		return adapted;
+		return adapted as JSONSchema7;
 	}
 	if (toolName !== "menu_set_items") return inputSchema;
 	const itemsProperty = properties.items;
@@ -64,7 +65,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 		: [];
 	if (!required.includes("parentIndex")) required.push("parentIndex");
 	itemSchema.required = required;
-	return adapted;
+	return adapted as JSONSchema7;
 }
 
 /**
@@ -121,8 +122,14 @@ const AUTO_PUBLISH_NOTE =
 const CONTENT_LIST_NOTE =
 	"Pass cursor: null on the first page. On later pages, pass only the exact cursor returned by the previous response; never invent a cursor. Omit orderBy unless the collection schema confirms that field is indexed.";
 
+/** Saves the separate content_publish step EmDash's own description points to. */
+const CREATE_PUBLISHED_NOTE =
+	'In this builder, pass status: "published" to create and publish the entry in one call, unless the user asked for a draft. ' +
+	"Publishing needs a slug, which is derived only from a title or name field, so pass an explicit slug for any other entry.";
+
 /** EmDash's description, plus what the builder does differently. */
 export function mcpToolDescription(toolName: string, description: string): string {
+	if (toolName === "content_create") return `${description} ${CREATE_PUBLISHED_NOTE}`;
 	if (toolName === "content_update") return `${description} ${AUTO_PUBLISH_NOTE}`;
 	if (toolName === "content_list") return `${description} ${CONTENT_LIST_NOTE}`;
 	return description;

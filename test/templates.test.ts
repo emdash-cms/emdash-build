@@ -47,7 +47,9 @@ describe("builder template prototype", () => {
 			'Do not declare `type: "repeater"` directly in a collection\'s fields',
 		);
 		expect(prompt).toContain("from `src/components/blocks/index.ts` with `../../../emdash-env`");
-		expect(prompt).toContain("Before `edit_files`, read every current file together");
+		// Edits match current text themselves; re-reading a file the model just wrote costs a step.
+		expect(prompt).toContain("without reading it again");
+		expect(prompt).not.toContain("Do this even if you authored the files earlier in the turn");
 		expect(prompt).toContain("use `edit_files`");
 		expect(prompt).toContain(
 			"Never call `exec` in the same model step as `validate_site` or `view_preview`",
@@ -60,10 +62,20 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain("never put scaffolding language");
 		expect(prompt).not.toContain("strong, editable first version");
 		expect(prompt).not.toContain(".agents/skills/frontend-design/SKILL.md");
-		expect(prompt.indexOf("Call `view_preview`")).toBeLessThan(
-			prompt.indexOf("Call `validate_site`"),
-		);
+		// A mid-build look is optional; validation delivers the final preview.
+		expect(prompt).toContain("only when a visual decision is genuinely uncertain");
+		expect(prompt).toContain("When it passes it also returns the final preview screenshot");
+		expect(prompt).toContain('`status: "published"`');
 		expect(prompt).not.toContain("Custom Portable Text blocks");
+	});
+
+	it("describes CMS programs only when the tool is available", () => {
+		expect(buildBuildPrompt({})).not.toContain("run_cms_script");
+		for (const editMode of [false, true]) {
+			const prompt = buildBuildPrompt({ editMode, cmsScripts: true });
+			expect(prompt).toContain("`run_cms_script`");
+			expect(prompt).toContain("do not re-run it whole");
+		}
 	});
 
 	it("puts initial block guidance after stale pinned and snapshot guidance", () => {

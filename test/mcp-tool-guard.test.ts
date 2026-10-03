@@ -101,6 +101,13 @@ describe("MCP tool adaptation", () => {
 		});
 	});
 
+	it("tells the model to publish entries in the create call", () => {
+		const description = mcpToolDescription("content_create", "Create content.");
+		expect(description).toContain('status: "published"');
+		// Publishing a routable entry needs a slug, which is derived only from a title or name.
+		expect(description).toContain("slug");
+	});
+
 	it("guides first-page content listing and removes a blank cursor", () => {
 		expect(mcpToolDescription("content_list", "List entries.")).toContain(
 			"Pass cursor: null on the first page",

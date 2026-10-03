@@ -484,7 +484,7 @@ describe("ChatPanel questionnaire integration", () => {
 				parts: [
 					{
 						type: "text",
-						text: "Resume the initial build using my questionnaire answers above. Reuse the existing work; before finishing, run validate_site until it passes, then inspect the final preview.",
+						text: "Resume the initial build using my questionnaire answers above. Reuse the existing work; before finishing, run validate_site until it passes and review the preview it returns.",
 					},
 				],
 			}),

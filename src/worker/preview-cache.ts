@@ -1,3 +1,5 @@
+import { PREVIEW_PROXY_HEADER } from "./preview-router.js";
+
 /** Select only public HTML document routes for last-known-good preview caching. */
 export function previewDocumentKey(request: Request): string | undefined {
 	if (request.method !== "GET" && request.method !== "HEAD") return undefined;
@@ -24,7 +26,7 @@ export function previewDocumentKey(request: Request): string | undefined {
 
 export function preventPreviewErrorCaching(request: Request, response: Response): Response {
 	if (
-		request.headers.get("x-sandbox-preview-proxy") !== "1" ||
+		request.headers.get(PREVIEW_PROXY_HEADER) !== "1" ||
 		request.headers.get("Upgrade")?.toLowerCase() === "websocket" ||
 		response.status < 400
 	) {

@@ -15,7 +15,7 @@ describe("Worker Preview runtime", () => {
 		await runInDurableObject(agent, async (instance) => {
 			const internals = instance as unknown as {
 				execRecoveryCommand(command: string, timeout: number): Promise<{ success: boolean }>;
-				getOrCreateSandbox(): object;
+				sandboxOps(): object;
 				getApiToken(): string | undefined;
 				connectMcp(url: string, token: string): Promise<boolean>;
 				exposePreview(hostname: string): Promise<{ url: string }>;
@@ -34,7 +34,10 @@ describe("Worker Preview runtime", () => {
 			const refreshPreviewSnapshots = vi.fn(async () => undefined);
 			const broadcast = vi.fn();
 			internals.execRecoveryCommand = commands;
-			internals.getOrCreateSandbox = () => ({});
+			internals.sandboxOps = () => ({
+				ensureRunning: async () => ({ ok: true }),
+				cancelStart: async () => {},
+			});
 			internals.getApiToken = () => "test-token";
 			internals.connectMcp = async () => {
 				expect(broadcast).toHaveBeenCalledWith('{"type":"reload"}');
@@ -61,45 +64,25 @@ describe("Worker Preview runtime", () => {
 	it("uses a quick tunnel without exposing the production preview hostname", async () => {
 		const agent = testEnv.BuilderAgent.getByName(PROJECT_ID);
 		await runInDurableObject(agent, async (instance) => {
-			const tunnelProcess = {
-				command: "cloudflared tunnel --url http://127.0.0.1:4321",
-				status: "running" as const,
-				getStatus: vi.fn(async () => "running" as const),
-				getLogs: vi.fn(async () => ({ stdout: "", stderr: "" })),
-				waitForLog: vi.fn(async () => ({
-					line: "Visit https://branch-preview.trycloudflare.com",
-					match: ["https://branch-preview.trycloudflare.com"],
-				})),
-				kill: vi.fn(async () => undefined),
-			};
-			const tunnelSession = {
-				listProcesses: vi.fn(async () => []),
-				startProcess: vi.fn(async () => tunnelProcess),
-			};
-			const exposePort = vi.fn();
 			const sandbox = {
-				createSession: vi.fn(async () => tunnelSession),
-				exposePort,
+				openTunnel: vi.fn(async () => ({ url: "https://branch-preview.trycloudflare.com/" })),
+				exposePort: vi.fn(),
 			};
 			const internals = instance as unknown as {
 				env: Record<string, unknown>;
-				getOrCreateSandbox(): typeof sandbox;
+				sandboxOps(): typeof sandbox;
 				exposePreview(hostname: string): Promise<{ url: string }>;
 			};
 			const originalMode = internals.env.SANDBOX_PREVIEW_MODE;
 			try {
 				internals.env.SANDBOX_PREVIEW_MODE = "quick-tunnel";
-				internals.getOrCreateSandbox = () => sandbox;
+				internals.sandboxOps = () => sandbox;
 
 				await expect(internals.exposePreview("build.emdashcms.com")).resolves.toEqual({
 					url: "https://branch-preview.trycloudflare.com/",
 				});
-				expect(sandbox.createSession).toHaveBeenCalledWith({ id: "builder-tunnel" });
-				expect(tunnelSession.startProcess).toHaveBeenCalledWith(
-					expect.stringContaining("cloudflared tunnel"),
-					{ cwd: "/home/user/site" },
-				);
-				expect(exposePort).not.toHaveBeenCalled();
+				expect(sandbox.openTunnel).toHaveBeenCalledWith(4321);
+				expect(sandbox.exposePort).not.toHaveBeenCalled();
 			} finally {
 				internals.env.SANDBOX_PREVIEW_MODE = originalMode;
 			}
