@@ -945,6 +945,20 @@ describe("apply_schema_plan", () => {
 			expect(input.inputSchema.safeParse(withPattern("//journal/{slug}")).success).toBe(false);
 			// Without a placeholder every entry would link to the same page.
 			expect(input.inputSchema.safeParse(withPattern("/journal")).success).toBe(false);
+			// EmDash 1.1 refuses two placeholders in one segment, after the collection exists.
+			expect(input.inputSchema.safeParse(withPattern("/journal/{slug}-{id}")).success).toBe(false);
+			expect(input.inputSchema.safeParse(withPattern("/journal/{id}/{slug}")).success).toBe(true);
+			const withCollection = (change: Record<string, unknown>) => ({
+				collections: [{ ...plan.collections[1]!, ...change }],
+			});
+			expect(input.inputSchema.safeParse(withCollection({ icon: "x".repeat(65) })).success).toBe(
+				false,
+			);
+			expect(input.inputSchema.safeParse(withCollection({ icon: " book " })).success).toBe(true);
+			// Shadowed by EmDash's own admin and API routes.
+			for (const slug of ["relations", "reorder", "media"]) {
+				expect(input.inputSchema.safeParse(withCollection({ slug })).success).toBe(false);
+			}
 		});
 	});
 

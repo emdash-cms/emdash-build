@@ -59,7 +59,17 @@ describe("builder template prototype", () => {
 		);
 		expect(prompt).toContain("smallest complete, navigable, editable version");
 		expect(prompt).toContain(
-			"default to a small, coherent set of subject-specific Unsplash images",
+			"and `search_unsplash` is available, default to a small, coherent set of subject-specific photos from it",
+		);
+		// Asked for Unsplash photos it could not search for, the model wrote URLs from memory.
+		expect(prompt).not.toContain("subject-specific Unsplash images");
+		expect(prompt).toContain("Never write a photo URL from memory");
+		expect(prompt).toContain(
+			"Without `search_unsplash` or user images, design without photography",
+		);
+		// A required image field left a photo portfolio with no projects at all.
+		expect(prompt).toContain(
+			"keep image fields optional and still create every entry the site needs",
 		);
 		expect(prompt).toContain("do not describe the images as stock, sample, or placeholders");
 		expect(prompt).toContain("never put scaffolding language");
@@ -131,6 +141,11 @@ describe("builder template prototype", () => {
 		});
 		expect(prompt).toContain("editing an existing EmDash CMS site");
 		expect(prompt).toContain("Old tool output was omitted");
+		// Edit turns add pages and collections too: a team page without photos needs its members.
+		expect(prompt).toContain("never write a photo URL from memory");
+		expect(prompt).toContain(
+			"keep new image fields optional and still create the entries the request needs",
+		);
 		expect(prompt).toContain("Preserve every surviving block's `_key`, `_type`, and `_version`");
 		expect(prompt).toContain("read `.agents/skills/blocks-schema-evolution/SKILL.md`");
 		expect(prompt).toContain("An older recovered project may lack");
@@ -174,5 +189,14 @@ describe("builder template prototype", () => {
 			'import { defineConfig, passthroughImageService } from "astro/config";',
 		);
 		expect(config).toContain("service: passthroughImageService(),");
+	});
+
+	it("turns off EmDash's update check, which no site owner can act on", async () => {
+		const config = await readFile(
+			new URL("../prototype/builder-cloudflare/astro.config.mjs", import.meta.url),
+			"utf8",
+		);
+
+		expect(config).toContain("updateCheck: false,");
 	});
 });
