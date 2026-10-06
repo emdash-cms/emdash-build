@@ -311,7 +311,7 @@ export class CmsScriptRun {
 				const parsed = schema.validate
 					? await schema.validate(input)
 					: { success: true as const, value: input };
-				if (!parsed.success) throw new Error(`invalid input: ${parsed.error.message}`);
+				if (!parsed.success) throw new Error(`${name}: invalid input: ${parsed.error.message}`);
 				return target.execute!(parsed.value as never, {
 					toolCallId: `${this.options.toolCallId}:${++this.seq}`,
 					messages: [],

@@ -696,4 +696,13 @@ describe("CMS programs", () => {
 		await expect(call(undefined)).resolves.toBeDefined();
 		expect(set.executed).toHaveLength(1);
 	});
+
+	it("starts the message of an input its schema rejects with the tool name", async () => {
+		const set = tools();
+		const run = new CmsScriptRun({ toolCallId: "call-schema" });
+		const search = run.bind("search_unsplash", set.search_unsplash as never);
+
+		await expect(search({ query: 3 })).rejects.toThrow(/^search_unsplash: /);
+		expect(set.executed).toHaveLength(0);
+	});
 });
