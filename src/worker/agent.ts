@@ -3767,6 +3767,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				if (!committed.success) {
 					// A damaged snapshot repository costs only one full upload to rebuild.
 					this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
+					// An upload still reading it would fail, and report a save that worked as lost.
+					await this.pushTail;
 					await sandbox
 						.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000, background: true })
 						.catch(() => undefined);

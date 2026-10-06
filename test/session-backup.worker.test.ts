@@ -270,6 +270,51 @@ describe("background session uploads", () => {
 		});
 	});
 
+	it("waits for an upload in flight before rebuilding the repository it reads", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000027");
+		await runInDurableObject(agent, async (instance) => {
+			const releases: Array<(result: unknown) => void> = [];
+			let uploading = false;
+			let commits = 0;
+			const rebuiltDuringUpload: boolean[] = [];
+			const exec = vi.fn((command: string) => {
+				if (command.includes("git push")) {
+					uploading = true;
+					return new Promise((resolve) =>
+						releases.push((result) => {
+							uploading = false;
+							resolve(result);
+						}),
+					);
+				}
+				if (command.startsWith("rm -rf") && command.includes("session-git")) {
+					rebuiltDuringUpload.push(uploading);
+				}
+				if (command.includes("commit-tree") && ++commits === 2) {
+					return Promise.resolve({ success: false, exitCode: 128, stdout: "", stderr: "fatal" });
+				}
+				return Promise.resolve({ success: true, exitCode: 0, stdout: "abc\n", stderr: "" });
+			});
+			let generation = 3;
+			const harness = install(instance, { exec }, () => generation);
+
+			await harness.checkpointSite();
+			await settle();
+			generation += 1;
+			// Its commit fails, so the snapshot repository is rebuilt while the first upload runs.
+			const second = harness.checkpointSite();
+			await settle();
+			releases[0]!({ success: true, stdout: "abc\n", stderr: "" });
+			await second;
+			await settle();
+			releases[1]?.({ success: true, stdout: "abc\n", stderr: "" });
+			await settle();
+
+			expect(rebuiltDuringUpload).toEqual([false]);
+			expect(instance.state.persistenceError).toBeUndefined();
+		});
+	});
+
 	it("surfaces a failed background upload as a persistence error", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000024");
 		await runInDurableObject(agent, async (instance) => {
