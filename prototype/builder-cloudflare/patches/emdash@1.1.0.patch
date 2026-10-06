@@ -1,0 +1,50 @@
+diff --git a/dist/block-values-H4E0XwE8.mjs b/dist/block-values-H4E0XwE8.mjs
+index b7dc399..d7f4238 100644
+--- a/dist/block-values-H4E0XwE8.mjs
++++ b/dist/block-values-H4E0XwE8.mjs
+@@ -102,14 +102,20 @@ function normalizeBlockArray(field, value, existingValue, types, options) {
+ 	if (maxItems !== void 0 && value.length > maxItems) validationError(path, `must contain at most ${maxItems} blocks`);
+ 	const allowed = new Set(field.validation?.allowedTypes ?? []);
+ 	const retired = new Set(field.validation?.retiredTypes ?? []);
++	const soleType = !options.restoreBlocks && allowed.size === 1 ? [...allowed][0] : void 0;
+ 	const existing = existingByKey(existingValue, path);
+ 	const incomingKeyCount = value.filter((block) => isRecord(block) && block._key !== void 0).length;
+ 	if (options.replaceBlocks && incomingKeyCount > 0) validationError(path, "replaceBlocks requires an entirely keyless replacement array");
+ 	if (!options.replaceBlocks && existing.size > 0 && value.length > 0 && incomingKeyCount === 0) validationError(path, "updating an existing blocks field requires keys or replaceBlocks");
+ 	const seen = /* @__PURE__ */ new Set();
+-	return value.map((rawBlock, index) => {
++	return value.map((input, index) => {
+ 		const blockPath = `${path}[${index}]`;
+-		if (!isRecord(rawBlock)) validationError(blockPath, "must be an object");
++		if (!isRecord(input)) validationError(blockPath, "must be an object");
++		const stored = typeof input._key === "string" ? existing.get(input._key) : void 0;
++		const rawBlock = input._type === void 0 && soleType !== void 0 && (!stored || stored._type === soleType) ? {
++			...input,
++			_type: soleType
++		} : input;
+ 		if (typeof rawBlock._type !== "string" || rawBlock._type.length === 0) validationError(`${blockPath}._type`, "must be a block type slug");
+ 		if (rawBlock._version !== void 0 && (typeof rawBlock._version !== "number" || !Number.isInteger(rawBlock._version) || rawBlock._version < 1)) validationError(`${blockPath}._version`, "must be a positive integer");
+ 		if (rawBlock._key !== void 0 && (typeof rawBlock._key !== "string" || rawBlock._key.length === 0)) validationError(`${blockPath}._key`, "must be a non-empty string");
+diff --git a/dist/portable-text-BnRuiR1-.mjs b/dist/portable-text-BnRuiR1-.mjs
+index 2dff9e2..dfd4fcf 100644
+--- a/dist/portable-text-BnRuiR1-.mjs
++++ b/dist/portable-text-BnRuiR1-.mjs
+@@ -266,7 +266,8 @@ function convertNestedBlockPortableText(value, field, direction) {
+ 	return value.map((block) => {
+ 		if (!block || typeof block !== "object" || Array.isArray(block)) return block;
+ 		const record = { ...block };
+-		const type = typeof record._type === "string" ? record._type : void 0;
++		const allowed = field.validation?.allowedTypes;
++		const type = typeof record._type === "string" ? record._type : record._type === void 0 && allowed?.length === 1 ? allowed[0] : void 0;
+ 		const version = typeof record._version === "number" ? record._version : void 0;
+ 		const blockType = field.blockTypes?.find((candidate) => candidate.slug === type);
+ 		const definition = blockType?.versions.find((candidate) => candidate.version === (version ?? blockType.currentVersion));
+@@ -298,7 +299,7 @@ function convertDataForRead(data, fields, raw = false) {
+ function convertDataForWrite(data, fields) {
+ 	const result = { ...data };
+ 	for (const field of fields) if (field.type === "portableText" && typeof result[field.slug] === "string") result[field.slug] = markdownToPortableText(result[field.slug]);
+-	else if (field.type === "blocks") result[field.slug] = convertNestedBlockPortableText(result[field.slug], field, "write");
++	else if (field.type === "blocks" && Array.isArray(result[field.slug])) result[field.slug] = convertNestedBlockPortableText(result[field.slug], field, "write");
+ 	return result;
+ }
+ 

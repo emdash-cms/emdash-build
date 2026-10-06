@@ -21,6 +21,7 @@ import {
 	prepareBuildStep,
 	releaseStepPreviewImages,
 } from "../src/worker/build-convergence.js";
+import { ImageSources } from "../src/worker/image-sources.js";
 import { capturedPreviewShotId } from "../src/worker/readiness.js";
 import {
 	createTools,
@@ -1276,6 +1277,132 @@ describe("photo search", () => {
 		expect(Object.keys(keyless)).not.toContain("search_unsplash");
 		expect(Object.keys(keyless)).toContain("upload_media");
 		expect(Object.keys(keyed)).toContain("search_unsplash");
+	});
+});
+
+describe("image uploads", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	const uploadOf = (tools: ReturnType<typeof createTools>) =>
+		tools.upload_media.execute as (input: { images: Array<{ url: string }> }) => Promise<unknown>;
+
+	function serveImages(searchResults: string[] = []) {
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+			if (String(url).startsWith("https://api.unsplash.com/")) {
+				return Response.json({
+					results: searchResults.map((raw, index) => ({
+						id: `photo-${index}`,
+						description: "Basalt coast",
+						alt_description: null,
+						urls: { raw, regular: raw, small: raw },
+						user: { name: "A photographer", username: "photographer" },
+						links: { html: "https://unsplash.com/photos/x" },
+					})),
+				});
+			}
+			if (init?.method === "POST") return Response.json({ item: { id: "media-1" } });
+			return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		return fetchMock;
+	}
+
+	it("refuses a stock photo written from memory, and never fetches it", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://example.com/hero.jpg" },
+					{ url: "https://images.unsplash.com/photo-1530789253388-582c481c54b0?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			success: true,
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{ success: false, error: expect.stringContaining("images the user supplied") },
+			],
+		});
+		expect(fetchMock.mock.calls.some(([url]) => String(url).includes("photo-153078"))).toBe(false);
+		// Not a failed upload to retry: the model has to find a real image first.
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("accepts a photo this turn's search returned, at any size", async () => {
+		serveImages(["https://images.unsplash.com/photo-found?ixid=abc"]);
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			unsplashAccessKey: "unsplash-key",
+			imageSources: new ImageSources(),
+		});
+		const search = (tools as Record<string, { execute?: unknown }>).search_unsplash!
+			.execute as (input: { query: string; count: number }) => Promise<unknown>;
+
+		await search({ query: "iceland coast", count: 1 });
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://images.unsplash.com/photo-found?w=2200&fit=crop" },
+					{ url: "https://images.unsplash.com/photo-guessed?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{
+					success: false,
+					error: expect.stringMatching(
+						/Search for photos.*If search fails, design without photography/,
+					),
+				},
+			],
+		});
+	});
+
+	it("opens no mutation for a call whose every image is refused", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const checkpointSite = vi.fn(async () => {});
+		const tools = createTools({} as never, { ...toolCallbacks(), checkpointSite } as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+		const revision = convergence.currentRevision();
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://images.unsplash.com/photo-guessed" }] }),
+		).resolves.toMatchObject({ success: false, changed: false, uploaded: 0 });
+		// The site did not change, so its validation and preview evidence still hold.
+		expect(convergence.currentRevision()).toBe(revision);
+		expect(checkpointSite).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("refuses stock photos without a source when the turn names none", async () => {
+		const fetchMock = serveImages();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+		});
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://images.pexels.com/photos/1/photo.jpeg" }] }),
+		).resolves.toMatchObject({ success: false, uploaded: 0 });
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
 

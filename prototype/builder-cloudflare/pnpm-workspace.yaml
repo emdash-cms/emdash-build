@@ -19,3 +19,7 @@ blockExoticSubdeps: true
 
 overrides:
   "@cloudflare/vite-plugin": "1.54.9"
+
+# Fixes for emdash 1.1.0 bugs the builder hits; drop each once a release has it.
+patchedDependencies:
+  emdash@1.1.0: patches/emdash@1.1.0.patch

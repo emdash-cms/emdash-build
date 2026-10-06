@@ -9,7 +9,7 @@ export interface Suggestion {
 	prompt: string;
 }
 
-const MAX_SUGGESTIONS = 4;
+const MAX_SUGGESTIONS = 3;
 const MAX_LABEL = 32;
 const MAX_PROMPT = 200;
 const RECENT_MESSAGES = 6;
@@ -100,19 +100,25 @@ function buildSystemPrompt(capabilities: readonly SuggestionCapability[]): strin
 	const cannotPublish = capabilities.some((capability) => capability.id === "publish_site")
 		? ""
 		: " Publishing the site is not available in this session.";
-	return `Rank the best next actions after an AI website builder finishes a change. The site uses Astro and EmDash CMS.
+	const cannotFindPhotos = capabilities.some((capability) => capability.id === "media_search")
+		? ""
+		: " Photo search is not available in this session, so never suggest adding or replacing photos.";
+	// Asked only for unfinished work, the model found none after a complete build.
+	return `Suggest what the site owner is most likely to ask an AI website builder for next. The site uses Astro and EmDash CMS.
 
 Available session capabilities:
 ${available}
 
-Anything not listed is unavailable.${cannotPublish} Only suggest an action when the conversation gives concrete evidence that it is both relevant and unfinished. It must be possible to complete now using only the listed capabilities and information already in the session. Do not suggest external services, email delivery, payments, bookings, user accounts, or comments. Do not ask the user to supply facts, copy, prices, credentials, or images. Do not suggest generic audits or vague polishing.
+Anything not listed is unavailable.${cannotPublish}${cannotFindPhotos}
 
-Return one to ${MAX_SUGGESTIONS} suggestions, strongest first. Prefer fewer high-confidence actions over filling the list. Each suggestion has:
+Return exactly ${MAX_SUGGESTIONS} suggestions, strongest first. Each must be a specific change to this site that the builder can make now with the listed capabilities, using only information already in the conversation: for example a new section or page the brief implies, more entries for a collection the site already has, or a concrete design or interaction refinement. Never suggest external services, email delivery, payments, bookings, user accounts, comments, invented testimonials, reviews, or ratings, or anything that needs the owner to supply facts, copy, prices, credentials, or images. Never suggest generic audits, vague polishing, or work the builder already did.
+
+Each suggestion has:
 - label: an imperative of 2 to 5 words in sentence case, at most 32 characters, with no ending punctuation.
-- prompt: the specific request the user would send, one or two sentences, at most 200 characters.
+- prompt: the specific request the owner would send, one or two sentences, at most 200 characters.
 - capabilities: every capability ID needed to complete it.
 
-Do not suggest work that is already done. Respond with JSON only.`;
+Respond with JSON only.`;
 }
 
 const ALWAYS_UNSUPPORTED_ACTIONS = [
@@ -122,12 +128,17 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\b(?:payments?|checkout|stripe|paypal)\b/i,
 	/\b(?:bookings?|reservations?)\b/i,
 	/\b(?:user accounts?|authentication|sign[ -]?in|log[ -]?in|registration)\b/i,
+	// Invented social proof, which the build prompt forbids; a review site's own reviews are content.
+	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+ratings?\b|\b\d-star\b/i,
 ];
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
 	{
 		capability: "media_search",
-		pattern: /\bunsplash\b|\b(?:find|search|source)\b.{0,40}\b(?:photos?|images?|photography)\b/i,
+		// Getting new photos; without a search, the only images left are ones the user already
+		// gave. A preposition before the photo word makes it an edit: "a lightbox to project images".
+		pattern:
+			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b/i,
 	},
 ];
 
@@ -225,14 +236,15 @@ export function suggestionContext(
 	].join("\n");
 }
 
+/** The usable suggestions, and how many the model offered before filtering. */
 function parseSuggestions(
 	output: unknown,
 	availableCapabilities: ReadonlySet<string>,
-): Suggestion[] {
+): { suggestions: Suggestion[]; offered: number } {
 	let response = (output as { response?: unknown } | null)?.response ?? output;
 	if (typeof response === "string") response = JSON.parse(response);
 	const items = (response as { suggestions?: unknown } | null)?.suggestions;
-	if (!Array.isArray(items)) return [];
+	if (!Array.isArray(items)) return { suggestions: [], offered: 0 };
 	const seen = new Set<string>();
 	const suggestions: Suggestion[] = [];
 	for (const item of items) {
@@ -270,7 +282,7 @@ function parseSuggestions(
 		suggestions.push({ label, prompt });
 		if (suggestions.length === MAX_SUGGESTIONS) break;
 	}
-	return suggestions;
+	return { suggestions, offered: items.length };
 }
 
 /** Ask the small model for next-step prompts. Never throws; returns [] on any failure. */
@@ -292,7 +304,11 @@ export async function suggestNextSteps(
 			max_tokens: 500,
 			temperature: 0.2,
 		});
-		return parseSuggestions(output, new Set(capabilityIds));
+		const { suggestions, offered } = parseSuggestions(output, new Set(capabilityIds));
+		if (suggestions.length === 0) {
+			console.warn(`[suggestions] no usable suggestion; the model offered ${offered}`);
+		}
+		return suggestions;
 	} catch (error) {
 		console.warn("[suggestions] could not suggest next steps:", error);
 		return [];
