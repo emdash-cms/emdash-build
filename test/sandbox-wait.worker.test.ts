@@ -281,9 +281,10 @@ function restorableSite(instance: object, site: { present: boolean; installCode:
 	Object.assign(instance, {
 		waitForSandbox: async () => ({ ok: true }),
 		// No dev server answers.
-		execRecoveryCommand: async (command: string) => ({
-			success: command.includes("package.json") && site.present,
-		}),
+		execRecoveryCommand: async (command: string) => {
+			const success = command.includes("package.json") && site.present;
+			return { success, exitCode: success ? 0 : 1 };
+		},
 		sandboxOps: () => ({
 			exec: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
 			readFile: async () => ({ success: true, content: "restored" }),
@@ -460,6 +461,34 @@ describe("tool calls that find the container stopped", () => {
 			await harness.recoverSite("localhost:5173");
 			await expect(read()).rejects.toThrow("restored from its last checkpoint");
 			await expect(read()).resolves.toMatchObject({ success: true });
+		});
+	});
+
+	it("never replaces a site whose probe did not answer", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000e");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			const commands: string[] = [];
+			Object.assign(instance, {
+				// A loaded container: the probe's timeout ends it (GNU timeout exits 124).
+				execRecoveryCommand: async (command: string) =>
+					command.includes("package.json")
+						? { success: false, exitCode: 124, stdout: "", stderr: "" }
+						: { success: false, exitCode: 1, stdout: "", stderr: "" },
+				sandboxOps: () => ({
+					exec: async (command: string) => {
+						commands.push(command);
+						return { success: true, exitCode: 0, stdout: "", stderr: "" };
+					},
+				}),
+			});
+			const harness = instance as unknown as RestoreHarness;
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
+				ready: false,
+			});
+			// The site may be newer than its checkpoint; cloning would delete that work.
+			expect(commands.some((command) => command.includes("git clone"))).toBe(false);
 		});
 	});
 

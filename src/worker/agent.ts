@@ -3473,6 +3473,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const hasSite = await this.execRecoveryCommand(`test -f ${SITE_PATH}/package.json`, 5000);
 		sandbox = this.sandboxOps();
 		const apiToken = this.getApiToken();
+		// Only `test` saying no means the site is gone. A probe that timed out (124)
+		// says nothing, and restoring would clone the checkpoint over newer work.
+		if (!hasSite.success && hasSite.exitCode !== 1) {
+			return { ready: false, error: "The site's container did not answer. Try again shortly." };
+		}
 
 		if (!hasSite.success) {
 			// Site dir is gone (sandbox slept). Restore from the Artifacts repo.
