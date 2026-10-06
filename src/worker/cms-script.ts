@@ -325,12 +325,12 @@ export class CmsScriptRun {
 				const data = failed ? output : resultForProgram(output);
 				// A partial result stays usable by the program but fails the run.
 				const error = failed ? String(output.error ?? "failed") : partialFailure(output);
-				this.record(name, error, data, started);
+				this.record(name, error, data, input, started);
 				if (failed) throw new CmsCallFailure(`${name} failed: ${error}`);
 				return data;
 			} catch (error) {
 				if (!(error instanceof CmsCallFailure)) {
-					this.record(name, messageOf(error), undefined, started);
+					this.record(name, messageOf(error), undefined, input, started);
 				}
 				throw error instanceof Error ? error : new Error(String(error));
 			} finally {
@@ -386,13 +386,20 @@ export class CmsScriptRun {
 		return undefined;
 	}
 
-	private record(name: string, error: string | undefined, data: unknown, started: number): void {
+	private record(
+		name: string,
+		error: string | undefined,
+		data: unknown,
+		input: unknown,
+		started: number,
+	): void {
 		const ok = error === undefined;
 		this.options.onCall?.(name, Date.now() - started, ok);
 		const mutation = isCmsScriptMutation(name);
 		if (mutation && !ok) this.failedMutations += 1;
 		if (!mutation && ok) return;
-		const ref = ok ? referenceOf(data)?.slice(0, REF_CHARS) : undefined;
+		// A failed call names its input: the model repairs only the calls marked failed.
+		const ref = referenceOf(ok ? data : input)?.slice(0, REF_CHARS);
 		this.log.push({
 			tool: name,
 			ok,

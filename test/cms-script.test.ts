@@ -142,6 +142,34 @@ describe("CMS programs", () => {
 		]);
 	});
 
+	it("names the input of each failed call in the log", async () => {
+		const create = {
+			inputSchema: jsonSchema({ type: "object" }),
+			execute: async (input: Record<string, unknown>) => {
+				if (input.slug === "spelt") return { success: false, error: "[VALIDATION_ERROR] title" };
+				if (input.slug === "barley") throw new Error("the CMS did not answer");
+				return mcpEnvelope({ item: { id: "01X", slug: input.slug }, _rev: "r1" });
+			},
+		};
+		const run = new CmsScriptRun({ toolCallId: "call-refs" });
+		const executor = new ScriptedExecutor(async (cms) => {
+			for (const slug of ["rye", "spelt", "barley"]) {
+				await cms.content_create!({ collection: "posts", slug }).catch(() => undefined);
+			}
+		});
+
+		const outcome = await run.execute(executor, "code", {
+			content_create: run.bind("content_create", create as never),
+		});
+
+		// The model repairs only the failed calls, so it must know which inputs they were.
+		expect(cmsScriptOutput(outcome, run, true).log).toEqual([
+			{ tool: "content_create", ok: true, ref: "rye" },
+			{ tool: "content_create", ok: false, ref: "spelt", error: "[VALIDATION_ERROR] title" },
+			{ tool: "content_create", ok: false, ref: "barley", error: "the CMS did not answer" },
+		]);
+	});
+
 	it("refuses calls past a budget without counting them, and fails the program", async () => {
 		const set = tools();
 		const run = new CmsScriptRun({ toolCallId: "call-3b" });
