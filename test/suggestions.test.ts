@@ -273,6 +273,22 @@ describe("next-step suggestions", () => {
 		]);
 	});
 
+	it("keeps star classes that are the site's own content", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("List more 4-star hotels", undefined, ["cms_content"]),
+					modelSuggestion("Add a Michelin 3-star page"),
+				],
+			},
+		}));
+
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("List more 4-star hotels"),
+			suggestion("Add a Michelin 3-star page"),
+		]);
+	});
+
 	it("drops getting new photos without photo search, but not editing the ones there", async () => {
 		const reply = (labels: string[]) =>
 			vi.fn(async () => ({

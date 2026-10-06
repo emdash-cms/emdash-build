@@ -129,7 +129,7 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\b(?:bookings?|reservations?)\b/i,
 	/\b(?:user accounts?|authentication|sign[ -]?in|log[ -]?in|registration)\b/i,
 	// Invented social proof, which the build prompt forbids; a review site's own reviews are content.
-	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+ratings?\b|\b\d-star\b/i,
+	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+(?:ratings?|reviews?)\b/i,
 ];
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
