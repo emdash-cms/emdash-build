@@ -34,16 +34,20 @@ export class ImageSources {
 	}
 
 	allows(url: string): boolean {
-		let parsed: URL;
-		try {
-			parsed = new URL(url);
-		} catch {
-			// The fetch rejects it too, with an error that says what is wrong.
-			return true;
-		}
-		const photo = stockPhoto(parsed);
+		// Without its scheme, an address is checked as the https one a repair would try.
+		// One that still does not parse is left to the fetch, whose error says what is wrong.
+		const parsed = parsedUrl(url) ?? parsedUrl(`https://${url}`);
+		const photo = parsed && stockPhoto(parsed);
 		if (!photo) return true;
 		return this.searched.has(photo) || this.userTexts.some((text) => text.includes(photo));
+	}
+}
+
+function parsedUrl(url: string): URL | undefined {
+	try {
+		return new URL(url);
+	} catch {
+		return undefined;
 	}
 }
 

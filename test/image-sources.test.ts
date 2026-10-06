@@ -13,8 +13,18 @@ describe("image sources", () => {
 	it("leaves an address that is not absolute to the fetch, which says so", () => {
 		const sources = new ImageSources();
 
-		expect(sources.allows("//images.unsplash.com/photo-abc")).toBe(true);
+		expect(sources.allows("//cdn.example.com/hero.jpg")).toBe(true);
 		expect(sources.allows("not a url")).toBe(true);
+	});
+
+	it("checks a stock photo written without its scheme as the address it would be retried as", () => {
+		const sources = new ImageSources();
+		sources.recordSearchResult("https://images.unsplash.com/photo-found?w=1200");
+
+		// Not a failed fetch to repair: the repair would only be refused as a guess.
+		expect(sources.allows("//images.unsplash.com/photo-guessed")).toBe(false);
+		expect(sources.allows("images.unsplash.com/photo-guessed")).toBe(false);
+		expect(sources.allows("images.unsplash.com/photo-found")).toBe(true);
 	});
 
 	it("checks only hosts whose image URLs the model writes unseen", () => {
