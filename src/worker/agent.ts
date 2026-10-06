@@ -200,7 +200,12 @@ import {
 	type ValidatedBlocksField,
 } from "./block-renderer-validation.js";
 
-import { DEV_SERVER_PROCESS_PREFIX, isSandboxNotRunning, type SandboxOps } from "./sandbox-ops.js";
+import {
+	DEV_SERVER_PROCESS_PREFIX,
+	isSandboxNotRunning,
+	RESTORED,
+	type SandboxOps,
+} from "./sandbox-ops.js";
 
 interface PublicationEnv {
 	WFP_RELEASES?: R2Bucket;
@@ -612,8 +617,6 @@ export interface BuilderState extends BuilderReadinessState {
 
 const SANDBOX_NOT_RESTORED =
 	"The site's container had stopped and the site could not be restored from its last checkpoint.";
-const SANDBOX_RESTORED =
-	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
 
 /** A Workers RPC failure that the platform says may succeed if repeated. */
 function isRetryableObjectError(error: unknown): boolean {
@@ -2515,13 +2518,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						// This call's tool may have written before it, as for the call that found the stop.
 						if (recovered.restored) {
 							this.restoreUnreported = false;
-							throw new Error(SANDBOX_RESTORED);
+							throw new Error(RESTORED);
 						}
 					}
 					// One no call waited on, such as the preview's Resume, is told to the next call.
 					if (this.restoreUnreported) {
 						this.restoreUnreported = false;
-						throw new Error(SANDBOX_RESTORED);
+						throw new Error(RESTORED);
 					}
 					try {
 						return await call(target, property, args);
@@ -2531,7 +2534,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						const recovered = await this.recoverSite(this.recoveryHostname(), true);
 						if (!recovered.ready) throw error;
 						this.restoreUnreported = false;
-						throw new Error(SANDBOX_RESTORED);
+						throw new Error(RESTORED);
 					}
 				};
 			},

@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
+import { NOT_RUNNING, RESTORED } from "../src/worker/sandbox-ops.js";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
@@ -2123,5 +2123,58 @@ describe("protected site files", () => {
 			write({ path: ".dev.vars.production", content: "SECRET=1" }),
 		).resolves.toMatchObject({ success: false, error: expect.stringMatching(/protected/) });
 		expect(sandbox.writeFile).not.toHaveBeenCalled();
+	});
+});
+
+describe("a restore under a tool", () => {
+	// What the builder's sandbox throws once it has restored the site from its last checkpoint.
+	const restored = () => new Error(RESTORED);
+
+	it("reports a restore found by write_file's first read, and writes nothing", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => {
+				throw restored();
+			}),
+			writeFile: vi.fn(async () => ({ success: true })),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_file
+			.execute as unknown as (input: { path: string; content: string }) => Promise<unknown>;
+
+		await expect(write({ path: "src/pages/index.astro", content: "new" })).rejects.toThrow(
+			RESTORED,
+		);
+		expect(sandbox.writeFile).not.toHaveBeenCalled();
+	});
+
+	it("reports a restore found while waiting for the dev server after a write", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: false })),
+			writeFile: vi.fn(async () => ({ success: true })),
+			exec: vi.fn(async () => {
+				throw restored();
+			}),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_file
+			.execute as unknown as (input: { path: string; content: string }) => Promise<unknown>;
+
+		await expect(write({ path: "src/data/site.json", content: "{}" })).resolves.toMatchObject({
+			success: false,
+			error: expect.stringContaining(RESTORED),
+		});
+	});
+
+	it("reports a restore found by validate_site's source fingerprint", async () => {
+		const exec = vi.fn(async (command: string) => {
+			if (command.includes("sha256sum")) throw restored();
+			return { success: true, exitCode: 0, stdout: "typed", stderr: "" };
+		});
+		const typecheckCache = { lastPassed: vi.fn(() => undefined), recordPassed: vi.fn() };
+		const validate = createTools(
+			validatingSandbox(exec) as never,
+			{ ...toolCallbacks(), typecheckCache } as never,
+		).validate_site.execute as unknown as () => Promise<unknown>;
+
+		await expect(validate()).rejects.toThrow(RESTORED);
+		expect(exec.mock.calls.some(([command]) => command === "pnpm validate")).toBe(false);
 	});
 });

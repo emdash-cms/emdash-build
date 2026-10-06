@@ -21,7 +21,7 @@ import { SerialTaskQueue } from "./serial-task-queue.js";
 
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-import { isSandboxNotRunning, type SandboxOps } from "./sandbox-ops.js";
+import { isSandboxInterruption, type SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -220,7 +220,7 @@ async function readOneTextFile(
 		return { path: path.path, success: true, content, bytes };
 	} catch (error) {
 		await reader?.cancel().catch(() => {});
-		if (isSandboxNotRunning(error)) throw error;
+		if (isSandboxInterruption(error)) throw error;
 		return {
 			path: path.path,
 			success: false,
@@ -811,7 +811,8 @@ async function waitForDevServer(sandbox: SandboxOps, retries = 20): Promise<bool
 				timeout: 3000,
 			});
 			if (check.success) return true;
-		} catch {
+		} catch (error) {
+			if (isSandboxInterruption(error)) throw error;
 			// Server is mid-restart (exec/curl timed out); keep polling.
 		}
 		await new Promise((r) => setTimeout(r, 500));
@@ -888,7 +889,7 @@ export async function refreshLiveTypes(
 			redirect: "manual",
 		});
 	} catch (error) {
-		if (isSandboxNotRunning(error)) throw error;
+		if (isSandboxInterruption(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -916,7 +917,7 @@ export async function refreshLiveTypes(
 		try {
 			detail = await readResponseTextBounded(response, 1000);
 		} catch (error) {
-			if (isSandboxNotRunning(error)) throw error;
+			if (isSandboxInterruption(error)) throw error;
 			detail = error instanceof Error ? error.message : String(error);
 		}
 		return {
@@ -930,7 +931,7 @@ export async function refreshLiveTypes(
 	try {
 		types = await readResponseTextBounded(response, TYPEGEN_MAX_BYTES);
 	} catch (error) {
-		if (isSandboxNotRunning(error)) throw error;
+		if (isSandboxInterruption(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -1014,7 +1015,7 @@ async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string |
 		const digest = result.stdout.trim();
 		return result.success && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
 	} catch (error) {
-		if (isSandboxNotRunning(error)) throw error;
+		if (isSandboxInterruption(error)) throw error;
 		return undefined;
 	}
 }
@@ -1547,7 +1548,8 @@ export function createTools(
 									},
 								};
 							}
-						} catch {
+						} catch (error) {
+							if (isSandboxInterruption(error)) throw error;
 							// A missing/unreadable destination is handled by the write below.
 						}
 						return {

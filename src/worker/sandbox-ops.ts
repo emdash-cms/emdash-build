@@ -14,6 +14,22 @@ export function isSandboxNotRunning(error: unknown): boolean {
 	return (error instanceof Error ? error.message : String(error)).startsWith("SANDBOX_NOT_RUNNING");
 }
 
+/** What a tool's container call throws once the site it found stopped was restored. */
+export const RESTORED =
+	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
+
+/**
+ * The site under the call is gone or was just replaced by its last
+ * checkpoint. A tool passes it on rather than catching it: the restore
+ * message is said once, and the model has to hear it.
+ */
+export function isSandboxInterruption(error: unknown): boolean {
+	return (
+		isSandboxNotRunning(error) ||
+		(error instanceof Error ? error.message : String(error)).startsWith(RESTORED)
+	);
+}
+
 export interface SandboxExecOptions {
 	cwd?: string;
 	env?: Record<string, string>;
