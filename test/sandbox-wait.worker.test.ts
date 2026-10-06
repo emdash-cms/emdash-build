@@ -633,3 +633,46 @@ describe("the owner's heartbeat", () => {
 		});
 	});
 });
+
+describe("container commands the builder runs to start a site", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("all have a deadline, so a container that stops answering cannot hold a start", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000d1");
+		await runInDurableObject(agent, async (instance) => {
+			const commands: { command: string; timeout?: number }[] = [];
+			const harness = instance as unknown as {
+				waitForSandbox: () => Promise<{ ok: boolean }>;
+				sandboxOps: () => unknown;
+				waitForDevServerPort: () => Promise<void>;
+				provisionSite: (hostname: string) => Promise<{ ready: boolean }>;
+				startDevServer: (previewUrl: string, configurationReady: boolean) => Promise<void>;
+			};
+			harness.waitForSandbox = async () => ({ ok: true });
+			harness.sandboxOps = () => ({
+				exec: async (command: string, options?: { timeout?: number }) => {
+					commands.push({ command, timeout: options?.timeout });
+					return { success: false, exitCode: 1, stdout: "", stderr: "" };
+				},
+				writeFile: async () => ({ success: true }),
+				startProcess: async () => {},
+				stopProcess: async () => {},
+				followProcessLogs: async () =>
+					new ReadableStream<Uint8Array>({ start: (controller) => controller.close() }),
+			});
+			harness.waitForDevServerPort = async () => {};
+
+			// The image's template check fails, so provisioning stops there.
+			await expect(harness.provisionSite("localhost")).resolves.toMatchObject({ ready: false });
+			await harness.startDevServer("http://4321-site-tok.localhost:5173/", true);
+
+			expect(commands.map(({ command }) => command)).toEqual([
+				expect.stringContaining("test -f"),
+				expect.stringContaining("modules.yaml"),
+			]);
+			for (const { command, timeout } of commands) expect(timeout, command).toBeGreaterThan(0);
+		});
+	});
+});

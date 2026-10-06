@@ -3180,7 +3180,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		this.sendStatus("Starting dev server...");
 		const archivedModules = await sandbox.exec(
 			`grep -q '/tmp/pnpm-store' ${SITE_PATH}/node_modules/.modules.yaml`,
-			{ signal },
+			{ timeout: 15_000, signal },
 		);
 		const previewVariables = [
 			...(previewUrl ? [`EMDASH_PREVIEW_URL=${shellQuote(previewUrl)}`] : []),
@@ -4748,7 +4748,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			// network fallback so older images and local development remain recoverable.
 			this.sendStatus("Opening a blank site canvas...");
 			const preparedArchive = `${PREPARED_TEMPLATES_PATH}/${templateDir}.tgz`;
-			const prepared = await sandbox.exec(`test -f ${preparedArchive}`, { signal });
+			const prepared = await sandbox.exec(`test -f ${preparedArchive}`, {
+				timeout: 15_000,
+				signal,
+			});
 			if (prepared.success) {
 				this.sendConsole(`$ extract prepared ${templateDir}`);
 				const copied = await sandbox.exec(
