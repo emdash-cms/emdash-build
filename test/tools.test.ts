@@ -1394,6 +1394,32 @@ describe("image uploads", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	it("reports an address that is not absolute as a failed fetch to repair", async () => {
+		// Like the platform's fetch, which takes only absolute URLs.
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => {
+				new URL(url);
+				return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+			}),
+		);
+		const convergence = new BuildConvergence();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "//images.example.com/hero.jpg" }] }),
+		).resolves.toMatchObject({
+			success: false,
+			results: [{ success: false, error: expect.stringContaining("Could not fetch image") }],
+		});
+		expect(convergence.hasUnresolvedFailures()).toBe(true);
+	});
+
 	it("refuses stock photos without a source when the turn names none", async () => {
 		const fetchMock = serveImages();
 		const tools = createTools({} as never, toolCallbacks() as never, {

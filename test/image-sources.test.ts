@@ -8,7 +8,13 @@ describe("image sources", () => {
 
 		expect(sources.allows("https://images.unsplash.com/photo-abc?auto=format&w=2200")).toBe(true);
 		expect(sources.allows("https://images.unsplash.com/photo-abd?w=1200")).toBe(false);
-		expect(sources.allows("not a url")).toBe(false);
+	});
+
+	it("leaves an address that is not absolute to the fetch, which says so", () => {
+		const sources = new ImageSources();
+
+		expect(sources.allows("//images.unsplash.com/photo-abc")).toBe(true);
+		expect(sources.allows("not a url")).toBe(true);
 	});
 
 	it("checks only hosts whose image URLs the model writes unseen", () => {

@@ -38,7 +38,8 @@ export class ImageSources {
 		try {
 			parsed = new URL(url);
 		} catch {
-			return false;
+			// The fetch rejects it too, with an error that says what is wrong.
+			return true;
 		}
 		const photo = stockPhoto(parsed);
 		if (!photo) return true;
