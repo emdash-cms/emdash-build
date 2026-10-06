@@ -136,9 +136,10 @@ const ACTION_CAPABILITY_REQUIREMENTS = [
 	{
 		capability: "media_search",
 		// Getting new photos; without a search, the only images left are ones the user already
-		// gave. A preposition before the photo word makes it an edit: "a lightbox to project images".
+		// gave. A preposition before the photo word, or a part of the photos after it, makes it an
+		// edit: "a lightbox to project images", "image captions".
 		pattern:
-			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b/i,
+			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b(?!\s+(?:captions?|credits?|alt|lightbox(?:es)?|grids?|carousels?|sliders?|layouts?|sides?|hover|zoom|overlays?|borders?|sizes?)\b)/i,
 	},
 ];
 

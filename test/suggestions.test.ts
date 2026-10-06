@@ -317,6 +317,26 @@ describe("next-step suggestions", () => {
 		);
 	});
 
+	it("keeps edits to the photos there when a photo word names what changes", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		for (const imageEdits of [
+			["Add image captions", "Add an image lightbox", "Swap hero image side"],
+			["Add photo credits", "Replace the photo grid", "Add image carousel"],
+		]) {
+			expect(await suggestNextSteps({ run: reply(imageEdits) }, "Brief", keyless)).toEqual(
+				imageEdits.map((label) => suggestion(label)),
+			);
+		}
+	});
+
 	it("gives the model the brief and the latest reply as plain text only", () => {
 		const messages = [
 			{ role: "user", parts: [{ type: "text", text: "A food blog called Salt & Smoke" }] },
