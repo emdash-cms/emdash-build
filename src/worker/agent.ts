@@ -58,6 +58,7 @@ import {
 	previewScreenshotCommand,
 	readFilesFromSandbox,
 	refreshLiveTypes,
+	reportingRestores,
 	typeDeclarationsForModel,
 	type DeployResult,
 } from "./tools.js";
@@ -7310,16 +7311,19 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				...this.buildBlockEvolutionTools(convergence, metrics),
 				...this.buildContentBatchTool(convergence, metrics),
 			};
-			const tools = {
-				...directTools,
-				...(await this.buildCmsScriptTool({
-					convergence,
-					failureGuard: mcpFailureGuard,
-					metrics,
-					abortSignal: buildAbortSignal,
-					toolNames: Object.keys(directTools),
-				})),
-			};
+			const tools = reportingRestores(
+				{
+					...directTools,
+					...(await this.buildCmsScriptTool({
+						convergence,
+						failureGuard: mcpFailureGuard,
+						metrics,
+						abortSignal: buildAbortSignal,
+						toolNames: Object.keys(directTools),
+					})),
+				},
+				() => this.restoreUnreported,
+			);
 			const buildToolNames = Object.keys(tools) as Array<keyof typeof tools>;
 			const initialScaffoldContext = isInitialBuild
 				? await this.loadInitialScaffoldContext()

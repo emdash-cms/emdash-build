@@ -7,7 +7,7 @@
  * up in agent.ts.
  */
 
-import { tool, type JSONValue } from "ai";
+import { tool, type JSONValue, type ToolSet } from "ai";
 import { z } from "zod";
 import {
 	BuildConvergence,
@@ -21,7 +21,7 @@ import { SerialTaskQueue } from "./serial-task-queue.js";
 
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-import { isSandboxInterruption, type SandboxOps } from "./sandbox-ops.js";
+import { isSandboxInterruption, RESTORED, type SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -794,6 +794,30 @@ type BatchFileMutationResult =
 			message: string;
 	  }
 	| { success: false; changed: boolean; error: string };
+
+/**
+ * The tools, each telling the model about a restore it has not heard of
+ * before running. Container calls report one themselves, but CMS, media and
+ * script calls never reach the container, so a turn of only those would not.
+ */
+export function reportingRestores<T extends ToolSet>(tools: T, unreported: () => boolean): T {
+	return Object.fromEntries(
+		Object.entries(tools).map(([name, definition]) => {
+			const execute = definition.execute;
+			if (!execute) return [name, definition];
+			return [
+				name,
+				{
+					...definition,
+					execute: async (...args: Parameters<typeof execute>) => {
+						if (unreported()) throw new Error(RESTORED);
+						return await execute(...args);
+					},
+				},
+			];
+		}),
+	) as T;
+}
 
 /**
  * Wait for the dev server to be responsive after a file change. Best-effort:

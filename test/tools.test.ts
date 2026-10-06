@@ -13,8 +13,9 @@ import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NOT_RUNNING, RESTORED } from "../src/worker/sandbox-ops.js";
 import { createOpenAI } from "@ai-sdk/openai";
-import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai";
+import { generateText, simulateReadableStream, stepCountIs, streamText, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
+import { z } from "zod";
 import {
 	BuildConvergence,
 	canCompleteBuild,
@@ -25,6 +26,7 @@ import { capturedPreviewShotId } from "../src/worker/readiness.js";
 import {
 	createTools,
 	ensurePreviewHmr,
+	reportingRestores,
 	guardProtectedFiles,
 	MODEL_COMMAND_TIMEOUT_MS,
 	modelCommand,
@@ -2176,5 +2178,23 @@ describe("a restore under a tool", () => {
 
 		await expect(validate()).rejects.toThrow(RESTORED);
 		expect(exec.mock.calls.some(([command]) => command === "pnpm validate")).toBe(false);
+	});
+});
+
+describe("tools while a restore is unheard", () => {
+	it("report it before running, though a CMS or media call never reaches the container", async () => {
+		let unreported = true;
+		const execute = vi.fn(async () => ({ success: true }));
+		const tools = reportingRestores(
+			{ content_update: tool({ inputSchema: z.object({}), execute }) },
+			() => unreported,
+		);
+		const update = () =>
+			tools.content_update.execute!({}, { toolCallId: "call", messages: [] }) as Promise<unknown>;
+
+		await expect(update()).rejects.toThrow(RESTORED);
+		expect(execute).not.toHaveBeenCalled();
+		unreported = false;
+		await expect(update()).resolves.toEqual({ success: true });
 	});
 });
