@@ -434,12 +434,19 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 	async ensureRunning(): Promise<SandboxStart> {
 		// A stop that failed leaves the container running; the next alarm tries again.
 		await this.stopping?.catch(() => undefined);
-		const start = await this.runtime().ensureRunning();
-		if (start.ok) {
-			this.touch();
-			await this.armAlarm();
+		let started = false;
+		try {
+			const start = await this.runtime().ensureRunning();
+			started = start.ok;
+			return start;
+		} finally {
+			// A start that failed can leave the container running, holding its slot:
+			// the alarm is what stops it and frees the slot.
+			if (started || this.container()?.running) {
+				this.touch();
+				await this.armAlarm();
+			}
 		}
-		return start;
 	}
 
 	cancelStart(): Promise<void> {

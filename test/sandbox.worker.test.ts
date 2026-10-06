@@ -295,6 +295,24 @@ describe("Sandbox lifetime", () => {
 		expect(stats.active).toBe(1);
 	});
 
+	it("keeps an alarm on a container whose start failed but which still runs", async () => {
+		await runInDurableObject(stub(), async (instance, state) => {
+			const container = fakeContainer();
+			install(instance, container);
+			// The readiness probe ran out of time and destroying the container did not answer.
+			Reflect.set(instance, "runtime", () => ({
+				ensureRunning: async () => {
+					container.start({});
+					throw new Error("The container did not become ready.");
+				},
+			}));
+
+			await expect(instance.ensureRunning()).rejects.toThrow("did not become ready");
+			// Without one, nothing would ever stop it or free its slot.
+			expect(await state.storage.getAlarm()).not.toBeNull();
+		});
+	});
+
 	it("stops after ten idle minutes once BuilderAgent has saved the site, and frees its slot", async () => {
 		await runInDurableObject(stub(), async (instance, state) => {
 			vi.useFakeTimers({ toFake: ["Date"] });
