@@ -66,6 +66,9 @@ export function snapshotStagingCommand(sitePath: string, snapshotPath: string): 
 		.map((path) => `-path ${shellQuote(path)}`)
 		.join(" -o ");
 	return (
+		// A site without its package.json is what a failed restore leaves behind;
+		// staging it would let the checkpoint replace the real one.
+		`test -f ${shellQuote(`${sitePath}/package.json`)} && ` +
 		`rm -rf ${shellQuote(snapshotPath)} && mkdir -p ${shellQuote(snapshotPath)} && ` +
 		`bash -o pipefail -c ${shellQuote(copyFiles)} sh ` +
 		`${shellQuote(sitePath)} ${shellQuote(snapshotPath)} && ` +

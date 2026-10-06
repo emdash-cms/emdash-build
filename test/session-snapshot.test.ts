@@ -64,6 +64,7 @@ describe("session snapshot staging", () => {
 		snapshot = join(root, "snapshot");
 		publish = join(root, "publish");
 		write(join(site, ".gitignore"), "node_modules\ndist\n.astro\n");
+		write(join(site, "package.json"), "{}");
 		write(join(site, "src/pages/index.astro"), "home");
 		const database = join(site, ".wrangler/state/d1/db.sqlite");
 		mkdirSync(dirname(database), { recursive: true });
@@ -123,6 +124,18 @@ describe("session snapshot staging", () => {
 		}
 	});
 
+	it("refuses to stage a site without its package.json", () => {
+		// What a failed restore leaves: a container whose site is gone, where a later
+		// write recreated a few files. Saving that would replace the real checkpoint.
+		rmSync(join(site, "package.json"));
+		write(join(snapshot, "src/pages/index.astro"), "previous checkpoint");
+
+		expect(() => sh(snapshotStagingCommand(site, snapshot))).toThrow();
+		expect(readFileSync(join(snapshot, "src/pages/index.astro"), "utf8")).toBe(
+			"previous checkpoint",
+		);
+	});
+
 	it("fails when the site cannot be staged", () => {
 		expect(() => sh(snapshotStagingCommand(join(root, "missing"), snapshot))).toThrow();
 	});
@@ -179,6 +192,7 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		for (let index = 0; index < 30; index++) {
 			write(join(site, `src/pages/page-${index}.astro`), `page ${index}`);
 		}
+		write(join(site, "package.json"), "{}");
 		write(join(site, ".wrangler/state/v3/r2/media/photo"), "photo bytes");
 		sh(`git init -q --bare '${remote}'`);
 		write(
