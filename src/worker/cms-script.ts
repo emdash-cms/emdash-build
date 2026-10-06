@@ -25,8 +25,12 @@ export const CMS_SCRIPT_LIMITS = {
 	maxArgBytes: 256 * 1024,
 	resultChars: 6_000,
 	consoleChars: 4_000,
+	errorChars: 2_000,
 	maxLogged: 60,
 } as const;
+
+/** Log references are slugs and ids; a longer one is the program's own input echoed back. */
+const REF_CHARS = 100;
 
 const CMS_SCRIPT_READS = [
 	"schema_list_collections",
@@ -90,15 +94,17 @@ export function isCmsScriptMutation(name: string): boolean {
  * `throw new Error()` would otherwise read as success.
  */
 export function guardProgram(normalized: string): string {
-	// A lone arrow function comes back verbatim, so a statement's `;` would end up inside the call.
-	const program = normalized.trim().replace(/;(\s*\/\/[^\n]*)?$/, "$1");
 	return [
 		"async () => {",
 		"  try {",
-		// Own lines, as codemode's executor does: a trailing line comment must not swallow the call.
-		"    return await (",
-		program,
-		"    )();",
+		// Its own statement, on its own lines: a trailing `;` or comment after the
+		// function then ends the statement instead of breaking the call.
+		"    const program =",
+		normalized.trim(),
+		"    ;",
+		"    const result = await program();",
+		// Statements before the program's function make normalizeCode return it uncalled.
+		'    return typeof result === "function" ? await result() : result;',
 		"  } catch (error) {",
 		"    if (error instanceof Error && error.message) throw error;",
 		'    throw new Error("The program threw " + (error instanceof Error ? "an Error with no message" : String(error)));',
@@ -247,6 +253,10 @@ export class CmsScriptRun {
 	mutations = 0;
 	failedMutations = 0;
 	refused = 0;
+	/** Calls still running when the program returned: it did not await them. */
+	unawaited = 0;
+	/** Changes the program asked for after it returned, refused. */
+	lateCalls = 0;
 	private readonly loggedRefusals = new Set<string>();
 	private searches = 0;
 	private images = 0;
@@ -268,7 +278,21 @@ export class CmsScriptRun {
 	bind(name: string, target: CmsScriptTarget) {
 		const schema = asSchema(target.inputSchema);
 		return async (input: unknown = {}): Promise<unknown> => {
-			if (this.closed) throw new Error(`${name}: the program has already finished`);
+			if (this.closed) {
+				// A read nobody waited for is harmless; a change is lost work.
+				if (isCmsScriptMutation(name)) this.lateCalls += 1;
+				throw new Error(`${name}: the program has already finished`);
+			}
+			if (input === null || typeof input !== "object" || Array.isArray(input)) {
+				const message = `${name}: the input must be an object`;
+				this.refused += 1;
+				// It has no reference, so a repeat would only grow the log.
+				if (!this.loggedRefusals.has(message)) {
+					this.loggedRefusals.add(message);
+					this.log.push({ tool: name, ok: false, error: message });
+				}
+				throw new Error(message);
+			}
 			this.signal.throwIfAborted();
 			const refusal = this.charge(name, input);
 			if (refusal) {
@@ -276,7 +300,7 @@ export class CmsScriptRun {
 				// An exhausted budget refuses every later call of its kind, so its first refusal says it all.
 				if (!refusal.exhausted || !this.loggedRefusals.has(refusal.message)) {
 					this.loggedRefusals.add(refusal.message);
-					const ref = referenceOf(input);
+					const ref = referenceOf(input)?.slice(0, REF_CHARS);
 					this.log.push({ tool: name, ok: false, ...(ref ? { ref } : {}), error: refusal.message });
 				}
 				throw new Error(refusal.message);
@@ -332,7 +356,8 @@ export class CmsScriptRun {
 				? input.images.length
 				: 0;
 		const exhausted = (message: string) => ({ message, exhausted: true });
-		if (this.calls + 1 > limits.maxCalls) {
+		// Refused calls count too, so a program that catches refusals cannot loop on them.
+		if (this.calls + this.refused + 1 > limits.maxCalls) {
 			return exhausted(`${name}: a program may make at most ${limits.maxCalls} calls`);
 		}
 		if (mutation && this.mutations + 1 > limits.maxMutations) {
@@ -367,7 +392,7 @@ export class CmsScriptRun {
 		const mutation = isCmsScriptMutation(name);
 		if (mutation && !ok) this.failedMutations += 1;
 		if (!mutation && ok) return;
-		const ref = ok ? referenceOf(data) : undefined;
+		const ref = ok ? referenceOf(data)?.slice(0, REF_CHARS) : undefined;
 		this.log.push({
 			tool: name,
 			ok,
@@ -409,6 +434,8 @@ export class CmsScriptRun {
 		);
 		try {
 			const outcome = await Promise.race([watchdog, stopped]);
+			// A read counts too: the change waiting on it can no longer be made.
+			if (!outcome.stop) this.unawaited = this.inFlight.size;
 			return outcome.error === "Execution timed out" ? { ...outcome, stop: "timeout" } : outcome;
 		} finally {
 			if (onAbort) this.signal.removeEventListener("abort", onAbort);
@@ -436,11 +463,13 @@ export function cmsScriptOutput(
 	changed: boolean,
 ): CmsScriptOutput {
 	const limits = CMS_SCRIPT_LIMITS;
+	const logs = (outcome.logs ?? []).join("\n");
 	const error =
 		outcome.stop === "timeout"
 			? `The program ran past its ${limits.timeoutMs / 1000}-second limit and was stopped; calls it started have finished. Check the log before retrying.`
-			: outcome.error;
-	const logs = (outcome.logs ?? []).join("\n");
+			: (outcome.error?.slice(0, limits.errorChars) ??
+				unfinishedCalls(run) ??
+				emptyProgram(outcome, run, logs));
 	const log = boundedLog(run.log, limits.maxLogged);
 	return {
 		success: !error && run.failedMutations === 0 && run.refused === 0,
@@ -455,6 +484,25 @@ export function cmsScriptOutput(
 		...(run.log.length > log.length ? { logOmitted: run.log.length - log.length } : {}),
 		...(logs ? { console: logs.slice(0, limits.consoleChars) } : {}),
 	};
+}
+
+/** Why a program that returned with calls still running, or asking for more, fails. */
+function unfinishedCalls(run: CmsScriptRun): string | undefined {
+	const plural = (count: number, kind: string) => `${count} cms ${kind}${count === 1 ? "" : "s"}`;
+	const parts = [
+		...(run.unawaited > 0 ? [`returned before ${plural(run.unawaited, "call")} finished`] : []),
+		...(run.lateCalls > 0
+			? [`made ${plural(run.lateCalls, "change")} after it returned, which were refused`]
+			: []),
+	];
+	if (parts.length === 0) return undefined;
+	return `The program ${parts.join(" and ")}. Await every cms call: an async callback passed to forEach or map is not awaited.`;
+}
+
+/** A program that did nothing, such as one that only defines its function, fails rather than passing. */
+function emptyProgram(outcome: ExecuteResult, run: CmsScriptRun, logs: string): string | undefined {
+	if (run.calls > 0 || run.refused > 0 || outcome.result !== undefined || logs) return undefined;
+	return "The program made no cms calls and returned nothing: it must be one async arrow function whose body awaits cms calls.";
 }
 
 /** The log cut to `max` entries in order, keeping failures first: the model repairs from them. */

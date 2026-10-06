@@ -730,6 +730,107 @@ describe("apply_schema_plan", () => {
 		});
 	});
 
+	it("takes a collection url field as the string field it has to be", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000a1");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = installBlockCms(instance, []);
+			const tool = harness.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan as unknown as {
+				inputSchema: {
+					safeParse: (value: unknown) => {
+						success: boolean;
+						data?: { collections: Array<{ fields: Array<{ type: string }> }> };
+					};
+				};
+			};
+
+			// Block fields have a url type; collection fields do not, and the model mixes them up.
+			const parsed = tool.inputSchema.safeParse({
+				collections: [
+					{
+						slug: "events",
+						label: "Events",
+						fields: [{ slug: "booking_url", label: "Booking link", type: "url" }],
+					},
+				],
+			});
+
+			expect(parsed.success).toBe(true);
+			expect(parsed.data?.collections[0]?.fields[0]?.type).toBe("string");
+		});
+	});
+
+	it("takes a block url field as a string field, since its links are internal paths", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000a2");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = installBlockCms(instance, []);
+			const tool = harness.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan as unknown as {
+				inputSchema: {
+					safeParse: (value: unknown) => {
+						success: boolean;
+						data?: { blockTypes: Array<{ fields: Array<{ type: string }> }> };
+					};
+				};
+			};
+
+			// EmDash refuses "/events" in a url field, so every call to action failed to save.
+			const parsed = tool.inputSchema.safeParse({
+				blockTypes: [
+					{
+						slug: "observatory_hero",
+						label: "Hero",
+						fields: [
+							{ slug: "headline", label: "Headline", type: "string" },
+							{ slug: "cta_url", label: "Call to action link", type: "url" },
+						],
+					},
+				],
+			});
+
+			expect(parsed.success).toBe(true);
+			expect(parsed.data?.blockTypes[0]?.fields.map((field) => field.type)).toEqual([
+				"string",
+				"string",
+			]);
+		});
+	});
+
+	it("still matches a block made with a url field before such fields became strings", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000a3");
+		await runInDurableObject(agent, async (instance) => {
+			const calls: McpCall[] = [];
+			const harness = installBlockCms(instance, calls);
+			const link = { slug: "cta_url", label: "Call to action link", type: "url" };
+			harness.blockTypes.set("observatory_hero", {
+				slug: "observatory_hero",
+				label: "Hero",
+				currentVersion: 1,
+				versions: [
+					{ version: 1, fields: [link], active: true, fingerprint: "observatory_hero-v1" },
+				],
+			});
+			const tool = harness.buildSchemaPlanTool(new BuildConvergence())
+				.apply_schema_plan as unknown as {
+				inputSchema: { parse: (value: unknown) => unknown };
+				execute: ExecutableTool["execute"];
+			};
+
+			const plan = tool.inputSchema.parse({
+				blockTypes: [{ slug: "observatory_hero", label: "Hero", fields: [link] }],
+			});
+
+			// The field stays url, so the model hears that it takes only absolute URLs.
+			expect(await tool.execute(plan, toolOptions)).toMatchObject({
+				success: true,
+				createdBlockTypes: 0,
+				skippedBlockTypes: 1,
+				notes: [expect.stringContaining("observatory_hero.cta_url is still a url field")],
+			});
+			expect(calls.some((call) => call.name.startsWith("schema_create"))).toBe(false);
+		});
+	});
+
 	it("skips fields that already exist in the live collection", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000001");
 		await runInDurableObject(agent, async (instance) => {

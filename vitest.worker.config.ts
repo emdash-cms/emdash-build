@@ -18,6 +18,7 @@ export default defineConfig({
 					ProviderControlPlane: { className: "ProviderControlPlane", useSQLite: true },
 					SiteService: { className: "SiteService", useSQLite: true },
 					SandboxCapacity: { className: "SandboxCapacity", useSQLite: true },
+					Sandbox: { className: "Sandbox", useSQLite: true },
 				},
 				workerLoaders: { LOADER: {} },
 				bindings: {

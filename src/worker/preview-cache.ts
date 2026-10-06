@@ -7,6 +7,9 @@ export function previewDocumentKey(request: Request): string | undefined {
 	const url = new URL(request.url);
 	if (
 		url.pathname.startsWith("/_emdash/") ||
+		// Astro's per-request endpoints answer with fragments or data, never a page.
+		url.pathname.startsWith("/_server-islands/") ||
+		url.pathname.startsWith("/_actions/") ||
 		url.pathname.startsWith("/@") ||
 		url.pathname.startsWith("/src/") ||
 		url.pathname.startsWith("/node_modules/") ||
@@ -68,6 +71,17 @@ export function hasNegotiatedVary(response: Response): boolean {
 		.split(",")
 		.map((header) => header.trim().toLowerCase())
 		.some((header) => header !== "" && header !== "accept-encoding");
+}
+
+/**
+ * Whether someone is loading the response as a page: a navigation, or a
+ * client without fetch metadata asking for HTML. A page's script fetching a
+ * fragment is not, so a fragment is not refused as an incomplete page.
+ */
+export function isPageNavigation(request: Request): boolean {
+	const destination = request.headers.get("Sec-Fetch-Dest");
+	if (destination) return ["document", "iframe", "frame"].includes(destination);
+	return (request.headers.get("Accept") ?? "").includes("text/html");
 }
 
 export function isCredentialedPreviewRequest(request: Request): boolean {

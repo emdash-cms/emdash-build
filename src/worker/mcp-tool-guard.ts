@@ -7,7 +7,6 @@ function isObject(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const PAGINATED_CURSOR_TOOLS = new Set(["content_list", "search", "media_list"]);
 const CONTENT_ORDER_ALIASES: Record<string, string> = {
 	created_at: "createdAt",
 	updated_at: "updatedAt",
@@ -28,7 +27,8 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): JSON
 	const adapted = structuredClone(inputSchema) as JsonObject;
 	const properties = adapted.properties;
 	if (!isObject(properties)) return inputSchema as JSONSchema7;
-	if (PAGINATED_CURSOR_TOOLS.has(toolName) && isObject(properties.cursor)) {
+	// Every listing's cursor: left optional, the model invents one, such as ":x".
+	if (isObject(properties.cursor)) {
 		const stringCursor: JsonObject = { ...properties.cursor, type: "string" };
 		delete stringCursor.anyOf;
 		delete stringCursor.description;
@@ -80,10 +80,8 @@ export function normalizeMcpToolArgs(
 ): { args: Record<string, unknown>; repaired: boolean } {
 	let normalized = args;
 	let repaired = false;
-	if (
-		PAGINATED_CURSOR_TOOLS.has(toolName) &&
-		(args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim()))
-	) {
+	// A blank cursor means the first page to the model, and nothing to EmDash, for any listing.
+	if (args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim())) {
 		normalized = { ...normalized };
 		delete normalized.cursor;
 		repaired = true;
@@ -96,6 +94,13 @@ export function normalizeMcpToolArgs(
 		if (normalized === args) normalized = { ...normalized };
 		normalized.orderBy = normalizedOrderBy;
 		repaired = true;
+	}
+	if (toolName === "content_create") {
+		const created = normalizeContentCreate(normalized);
+		if (created !== normalized) {
+			normalized = created;
+			repaired = true;
+		}
 	}
 	if (toolName !== "menu_set_items" || !Array.isArray(normalized.items)) {
 		return { args: normalized, repaired };
@@ -113,6 +118,26 @@ export function normalizeMcpToolArgs(
 	return repaired
 		? { args: { ...normalized, items: normalizedItems }, repaired: true }
 		: { args: normalized, repaired: false };
+}
+
+/**
+ * Luna builds entries from objects that carry their slug, and fills optional
+ * identifiers with "". EmDash rejects both: `slug` is a built-in entry field,
+ * never a data field, and "" names no locale or entry. An explicit slug wins.
+ */
+function normalizeContentCreate(args: JsonObject): JsonObject {
+	let next = args;
+	const copy = () => (next === args ? (next = { ...args }) : next);
+	if (isObject(args.data) && typeof args.data.slug === "string" && args.data.slug) {
+		const { slug, ...data } = args.data;
+		const target = copy();
+		target.data = data;
+		if (!target.slug) target.slug = slug;
+	}
+	for (const key of ["locale", "translationOf"]) {
+		if (args[key] === "") delete copy()[key];
+	}
+	return next;
 }
 
 const AUTO_PUBLISH_NOTE =

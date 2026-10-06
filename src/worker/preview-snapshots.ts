@@ -1,4 +1,5 @@
 import {
+	isPageNavigation,
 	hasNegotiatedVary,
 	isCredentialedPreviewRequest,
 	isPreviewContentMutation,
@@ -22,6 +23,12 @@ const MAX_REFRESH_PATHS = 4;
 const STALE_REVALIDATE_WAIT_MS = 5000;
 /** Secondary routes refreshed at a mutation boundary must not stall the agent's tool call. */
 const SECONDARY_REFRESH_WAIT_MS = 8000;
+/**
+ * A render that never answers, such as a page awaiting a fetch that hangs or
+ * a container that stopped answering, is given up after this, so it cannot
+ * hold its route or the agent's refresh loop for good.
+ */
+const RENDER_TIMEOUT_MS = 60_000;
 const UNSAFE_CACHED_HEADERS = new Set([
 	"content-encoding",
 	"content-length",
@@ -53,11 +60,21 @@ type RenderResult = Omit<PreviewRefreshResult, "path">;
 
 export type PreviewSnapshotState = "current" | "stale" | "missing";
 
-async function readBodyUpTo(response: Response, maximumBytes: number): Promise<ArrayBuffer | null> {
+/** Whether HTML is (the start of) a whole page rather than a fragment. */
+function isPageMarkup(html: string): boolean {
+	return /<html[\s>]/i.test(html);
+}
+
+async function readBodyUpTo(
+	response: Response,
+	maximumBytes: number,
+): Promise<ArrayBuffer | "too-large" | null> {
+	// Not awaited: this is often one branch of a clone, whose cancel waits for the other.
+	const drop = (cancel: () => Promise<void>) => void cancel().catch(() => undefined);
 	const declaredLength = Number(response.headers.get("Content-Length"));
 	if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
-		await response.body?.cancel().catch(() => undefined);
-		return null;
+		if (response.body) drop(() => response.body!.cancel());
+		return "too-large";
 	}
 	if (!response.body) return null;
 	const reader = response.body.getReader();
@@ -69,8 +86,8 @@ async function readBodyUpTo(response: Response, maximumBytes: number): Promise<A
 			if (done) break;
 			total += value.byteLength;
 			if (total > maximumBytes) {
-				await reader.cancel();
-				return null;
+				drop(() => reader.cancel());
+				return "too-large";
 			}
 			chunks.push(value);
 		}
@@ -103,9 +120,9 @@ export interface PreviewSnapshotHost {
 	 * A route rendered the way an anonymous visitor sees it, straight from the
 	 * dev server. Snapshots are shared by every viewer of the preview URL, so
 	 * they must never be built from a browser request carrying the editor's
-	 * cookies or credentials.
+	 * cookies or credentials. The signal ends a render that is given up.
 	 */
-	renderCanonical(cachePath: string): Promise<Response>;
+	renderCanonical(cachePath: string, signal: AbortSignal): Promise<Response>;
 	validatePortToken(port: number, token: string): Promise<boolean>;
 }
 
@@ -118,6 +135,7 @@ export interface PreviewSnapshotHost {
  */
 export class PreviewSnapshots {
 	private verifiedPreviewRows = new Map<string, number>();
+	private renderTimeoutMs = RENDER_TIMEOUT_MS;
 
 	constructor(private readonly host: PreviewSnapshotHost) {
 		const sql = host.sql;
@@ -207,13 +225,16 @@ export class PreviewSnapshots {
 		path: string,
 		response: Response,
 		generation: number,
-	): Promise<"stored" | "invalid" | "uncacheable"> {
+	): Promise<"stored" | "invalid" | "fragment" | "uncacheable"> {
 		if (!response.ok || !response.headers.get("Content-Type")?.includes("text/html")) {
 			await response.body?.cancel().catch(() => undefined);
 			return "uncacheable";
 		}
 		const body = await readBodyUpTo(response, MAX_CACHED_HTML_BYTES);
-		if (!body || !isCompletePublicHtml(new TextDecoder().decode(body))) return "invalid";
+		if (body === "too-large") return "uncacheable";
+		if (!body) return "invalid";
+		const text = new TextDecoder().decode(body);
+		if (!isCompletePublicHtml(text)) return isPageMarkup(text) ? "invalid" : "fragment";
 		if (response.headers.has("Set-Cookie") || hasNegotiatedVary(response)) return "uncacheable";
 		const headers = [...response.headers.entries()].filter(
 			([name]) => !UNSAFE_CACHED_HEADERS.has(name.toLowerCase()),
@@ -308,7 +329,25 @@ export class PreviewSnapshots {
 	}
 
 	private async renderAndStore(cachePath: string, generation: number): Promise<RenderResult> {
-		const response = await this.host.renderCanonical(cachePath);
+		const controller = new AbortController();
+		const render = this.renderAndStoreUntil(cachePath, generation, controller.signal);
+		const settled = await settleWithin(render, this.renderTimeoutMs);
+		if (settled.status === "fulfilled") return settled.value;
+		if (settled.status === "rejected") throw settled.reason;
+		controller.abort();
+		render.catch(() => undefined);
+		return {
+			success: false,
+			error: `The page did not render within ${this.renderTimeoutMs / 1000} seconds.`,
+		};
+	}
+
+	private async renderAndStoreUntil(
+		cachePath: string,
+		generation: number,
+		signal: AbortSignal,
+	): Promise<RenderResult> {
+		const response = await this.host.renderCanonical(cachePath, signal);
 		const outcome = await this.storePreview(cachePath, response, generation);
 		const rendered =
 			outcome === "stored" ||
@@ -323,7 +362,7 @@ export class PreviewSnapshots {
 			success,
 			rendered,
 			status: response.status,
-			...(outcome === "invalid"
+			...(outcome === "invalid" || outcome === "fragment"
 				? { invalidHtml: true, error: "The public page returned empty or incomplete HTML." }
 				: {}),
 		};
@@ -438,7 +477,9 @@ export class PreviewSnapshots {
 		) {
 			if (isShareablePreviewResponse(request, response)) {
 				try {
-					if ((await this.storePreview(cachePath, response.clone(), generation)) === "invalid") {
+					const stored = await this.storePreview(cachePath, response.clone(), generation);
+					// A fragment a page fetches is fine; a cut-off page is not, however it is loaded.
+					if (stored === "invalid" || (stored === "fragment" && isPageNavigation(request))) {
 						await response.body?.cancel().catch(() => undefined);
 						return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 							status: 503,
@@ -450,7 +491,12 @@ export class PreviewSnapshots {
 				}
 			} else if (!isCredentialedPreviewRequest(request)) {
 				const body = await readBodyUpTo(response.clone(), MAX_CACHED_HTML_BYTES);
-				if (!body || !isCompletePublicHtml(new TextDecoder().decode(body))) {
+				const text = body && body !== "too-large" ? new TextDecoder().decode(body) : "";
+				if (
+					body !== "too-large" &&
+					!isCompletePublicHtml(text) &&
+					(isPageMarkup(text) || isPageNavigation(request))
+				) {
 					await response.body?.cancel().catch(() => undefined);
 					return new Response("Preview page is incomplete. Try again after the site is fixed.", {
 						status: 503,

@@ -116,9 +116,9 @@ export function renderStudioWrangler(config) {
 		containers: [
 			{
 				class_name: "Sandbox",
-				image: "./Dockerfile",
-				instance_type: { vcpu: 4, memory_mib: 12288, disk_mb: 10240 },
-				max_instances: config.sandboxMaxInstances,
+				name: `${config.providerId}-emdash-build-sandbox-do`,
+				scheduling_policy: "durable_object",
+				images: { sandbox: { dockerfile: "./Dockerfile" } },
 			},
 		],
 		durable_objects: {

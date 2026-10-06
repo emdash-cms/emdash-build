@@ -1,4 +1,5 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -15,6 +16,8 @@ import {
 	canReuseFinalSnapshotForTurn,
 	canSkipFinalSnapshot,
 	publishStagingCommand,
+	SNAPSHOT_HISTORY_LIMIT,
+	snapshotCloneCommand,
 	snapshotCommitCommand,
 	snapshotPushCommand,
 	snapshotStagingCommand,
@@ -61,6 +64,7 @@ describe("session snapshot staging", () => {
 		snapshot = join(root, "snapshot");
 		publish = join(root, "publish");
 		write(join(site, ".gitignore"), "node_modules\ndist\n.astro\n");
+		write(join(site, "package.json"), "{}");
 		write(join(site, "src/pages/index.astro"), "home");
 		const database = join(site, ".wrangler/state/d1/db.sqlite");
 		mkdirSync(dirname(database), { recursive: true });
@@ -120,6 +124,18 @@ describe("session snapshot staging", () => {
 		}
 	});
 
+	it("refuses to stage a site without its package.json", () => {
+		// What a failed restore leaves: a container whose site is gone, where a later
+		// write recreated a few files. Saving that would replace the real checkpoint.
+		rmSync(join(site, "package.json"));
+		write(join(snapshot, "src/pages/index.astro"), "previous checkpoint");
+
+		expect(() => sh(snapshotStagingCommand(site, snapshot))).toThrow();
+		expect(readFileSync(join(snapshot, "src/pages/index.astro"), "utf8")).toBe(
+			"previous checkpoint",
+		);
+	});
+
 	it("fails when the site cannot be staged", () => {
 		expect(() => sh(snapshotStagingCommand(join(root, "missing"), snapshot))).toThrow();
 	});
@@ -149,14 +165,12 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 	let remote: string;
 
 	const identity = { name: "EmDash Build", email: "agent@emdash.build" };
-	// GNU timeout is in the container but not on every test host.
+	// GNU timeout and util-linux flock are in the container but not on every test host.
 	const run = (command: string) =>
 		execFileSync("bash", ["-c", command], {
 			encoding: "utf8",
 			env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
 		});
-	const looseObjects = () =>
-		Number(sh(`find '${remote}/objects' -type f -path '*/[0-9a-f][0-9a-f]/*' | wc -l`).trim());
 	const snapshotOnce = (message: string) => {
 		run(snapshotStagingCommand(site, snapshot));
 		const commit = run(
@@ -178,37 +192,195 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		for (let index = 0; index < 30; index++) {
 			write(join(site, `src/pages/page-${index}.astro`), `page ${index}`);
 		}
+		write(join(site, "package.json"), "{}");
 		write(join(site, ".wrangler/state/v3/r2/media/photo"), "photo bytes");
 		sh(`git init -q --bare '${remote}'`);
 		write(
 			join(root, "bin/timeout"),
 			'#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done\nshift\nexec "$@"\n',
 		);
-		sh(`chmod +x '${join(root, "bin/timeout")}'`);
+		// flock on a descriptor the shell holds: the lock lasts until the shell lets it go.
+		write(
+			join(root, "bin/flock"),
+			'#!/usr/bin/perl\nuse Fcntl qw(:flock);\nopen(my $fh, ">>&=", $ARGV[-1]) or die "flock: $!\\n";\nflock($fh, LOCK_EX) or die "flock: $!\\n";\n',
+		);
+		sh(`chmod +x '${join(root, "bin/timeout")}' '${join(root, "bin/flock")}'`);
 	});
 
 	afterEach(() => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("keeps one commit on the remote while pushing only what changed", () => {
-		const first = snapshotOnce("first");
-		const afterFirst = looseObjects();
-		write(join(site, "src/pages/page-7.astro"), "page 7, edited");
-		const second = snapshotOnce("second");
-		const added = looseObjects() - afterFirst;
+	/** The bytes a checkpoint's push sends, from git's progress report. */
+	const pushedBytes = (stderr: string) => {
+		const match = [
+			...stderr.matchAll(/Writing objects: 100% \(\d+\/\d+\), ([\d.]+) (bytes|KiB|MiB)/g),
+		].at(-1);
+		return match ? Number(match[1]) * { bytes: 1, KiB: 1024, MiB: 1024 ** 2 }[match[2]!]! : 0;
+	};
+	const checkpoint = (message: string) => {
+		run(snapshotStagingCommand(site, snapshot));
+		const commit = run(
+			snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message, ...identity }),
+		).trim();
+		const push = spawnSync(
+			"bash",
+			[
+				"-c",
+				snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 }).replace(
+					"git push -q",
+					"git push --progress",
+				),
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			},
+		);
+		expect(push.status, push.stderr).toBe(0);
+		return { commit, bytes: pushedBytes(push.stderr) };
+	};
 
-		expect(afterFirst).toBeGreaterThan(30);
-		// One blob, the trees on its path, and the commit.
-		expect(added).toBeLessThanOrEqual(6);
-		expect(second).not.toBe(first);
-		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(second);
-		// Restores and clones still see a single snapshot commit.
-		expect(sh(`git -C '${remote}' rev-list --count main`).trim()).toBe("1");
+	it("uploads only what changed since the last checkpoint", () => {
+		// Photos do not compress.
+		writeFileSync(join(site, ".wrangler/state/v3/r2/media/hero"), randomBytes(512 * 1024));
+		const first = checkpoint("first");
+		write(join(site, "src/pages/page-7.astro"), "page 7, edited");
+		const second = checkpoint("second");
+
+		expect(first.bytes).toBeGreaterThan(512 * 1024);
+		// The edited page, the trees above it and the commit; not the photo again.
+		expect(second.bytes).toBeLessThan(8 * 1024);
+		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(second.commit);
 		expect(sh(`git -C '${remote}' show main:src/pages/page-7.astro`)).toBe("page 7, edited");
 		expect(sh(`git -C '${remote}' show main:.wrangler/state/v3/r2/media/photo`)).toBe(
 			"photo bytes",
 		);
+	});
+
+	// Twenty-one checkpoints of real git and tar.
+	it(
+		"starts the history again after a run of checkpoints, so it stays short",
+		{ timeout: 120_000 },
+		() => {
+			const depths: number[] = [];
+			for (let index = 0; index <= SNAPSHOT_HISTORY_LIMIT; index++) {
+				write(join(site, "src/pages/page-1.astro"), `page 1, edit ${index}`);
+				checkpoint(`checkpoint ${index}`);
+				depths.push(Number(sh(`git -C '${remote}' rev-list --count main`).trim()));
+			}
+
+			expect(Math.max(...depths)).toBe(SNAPSHOT_HISTORY_LIMIT);
+			expect(depths.at(-1)).toBe(1);
+		},
+	);
+
+	it("starts again from a root commit after a failed upload, so one cannot wedge the rest", () => {
+		checkpoint("first");
+		write(join(site, "src/pages/page-1.astro"), "edit");
+		run(snapshotStagingCommand(site, snapshot));
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "unsent", ...identity }));
+		// The upload fails: the remote is gone, as when its repository is recreated.
+		rmSync(remote, { recursive: true, force: true });
+		const failed = spawnSync(
+			"bash",
+			["-c", snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 })],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			},
+		);
+		expect(failed.status).not.toBe(0);
+		sh(`git init -q --bare '${remote}'`);
+
+		const next = checkpoint("after the failure");
+
+		// A root commit: the new remote gets one snapshot, not the unsent chain.
+		expect(sh(`git -C '${remote}' rev-list --count main`).trim()).toBe("1");
+		expect(sh(`git -C '${remote}' rev-parse main`).trim()).toBe(next.commit);
+	});
+
+	it("waits for an upload already under way, so a late one cannot land over a newer one", async () => {
+		checkpoint("first");
+		const finished = join(root, "earlier-upload-finished");
+		// An upload started before the builder restarted is still running.
+		const earlier = spawn("perl", [
+			"-e",
+			'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "uploading\\n"; sleep 6; open(my $m, ">", $ARGV[1]) or die; close $m',
+			`${gitDir}.push.lock`,
+			finished,
+		]);
+		await new Promise((resolve) => earlier.stdout.once("data", resolve));
+		// A failed commit rebuilds the git directory meanwhile.
+		rmSync(gitDir, { recursive: true, force: true });
+		write(join(site, "src/pages/page-1.astro"), "edit");
+		run(snapshotStagingCommand(site, snapshot));
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "second", ...identity }));
+
+		run(snapshotPushCommand({ gitDir, remote: `file://${remote}`, timeoutSeconds: 30 }));
+
+		expect(existsSync(finished)).toBe(true);
+	});
+
+	it("clears a lock a killed upload left on its own ref", () => {
+		checkpoint("first");
+		write(join(gitDir, "refs/heads/pushed.lock"), "stale");
+		write(join(site, "src/pages/page-1.astro"), "edit");
+
+		const next = checkpoint("second");
+
+		expect(sh(`git --git-dir='${gitDir}' rev-parse refs/heads/pushed`).trim()).toBe(next.commit);
+	});
+
+	it("restores the latest checkpoint without its history", () => {
+		checkpoint("first");
+		write(join(site, "src/pages/page-2.astro"), "page 2, edited");
+		checkpoint("second");
+		const restored = join(root, "restored");
+
+		run(snapshotCloneCommand(`file://${remote}`, restored));
+
+		expect(readFileSync(join(restored, "src/pages/page-2.astro"), "utf8")).toBe("page 2, edited");
+		expect(sh(`git -C '${restored}' rev-list --count HEAD`).trim()).toBe("1");
+	});
+
+	it("falls back to a full clone when the shallow one fails, not when it runs out of time", () => {
+		checkpoint("first");
+		const restored = join(root, "restored");
+		const shallowClone = (exitCode: number) =>
+			write(join(root, "bin/timeout"), `#!/bin/bash\nexit ${exitCode}\n`);
+		const restore = () =>
+			spawnSync("bash", ["-c", snapshotCloneCommand(`file://${remote}`, restored)], {
+				env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+			}).status;
+
+		// A full clone downloads more than the one that just ran out of time.
+		shallowClone(124);
+		expect(restore()).not.toBe(0);
+		expect(existsSync(restored)).toBe(false);
+
+		// A server that cannot serve a shallow clone still gets a full one.
+		shallowClone(128);
+		expect(restore()).toBe(0);
+		expect(readFileSync(join(restored, "src/pages/page-1.astro"), "utf8")).toBe("page 1");
+	});
+
+	it("leaves no site behind from a clone stopped part way", () => {
+		checkpoint("first");
+		const restored = join(root, "restored");
+		// The clone writes its files, then is stopped at its deadline before it can tidy up.
+		write(
+			join(root, "bin/timeout"),
+			'#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done\nshift\n"$@"\nexit 124\n',
+		);
+
+		const status = spawnSync("bash", ["-c", snapshotCloneCommand(`file://${remote}`, restored)], {
+			env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}` },
+		}).status;
+
+		// A partial site would pass for a real one and be saved over the checkpoint.
+		expect(status).not.toBe(0);
+		expect(existsSync(restored)).toBe(false);
 	});
 
 	it("leaves the shell session's environment as it found it", () => {
@@ -222,6 +394,19 @@ describe("incremental session snapshots", { timeout: 30_000 }, () => {
 		).trim();
 
 		expect(leaked).toBe(`[][][${process.cwd()}]`);
+	});
+
+	it("clears its own stale lock but not the lock of an upload in progress", () => {
+		snapshotOnce("first");
+		// A killed commit left its ref lock; an upload running now holds its own.
+		write(join(gitDir, "refs/heads/snapshot.lock"), "stale");
+		write(join(gitDir, "refs/heads/pushed.lock"), "held");
+		run(snapshotStagingCommand(site, snapshot));
+
+		run(snapshotCommitCommand({ snapshotPath: snapshot, gitDir, message: "second", ...identity }));
+
+		expect(existsSync(join(gitDir, "refs/heads/pushed.lock"))).toBe(true);
+		expect(existsSync(join(gitDir, "refs/heads/snapshot.lock"))).toBe(false);
 	});
 
 	it("uploads even when the next checkpoint is rebuilding the staging copy", () => {

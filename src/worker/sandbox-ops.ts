@@ -1,10 +1,18 @@
 /**
  * Everything the builder does inside a site's container goes through this
  * port: commands, files, background processes, ports and preview exposure.
- * `legacySandboxOps` implements it on Sandbox SDK 0.12; results keep that
- * SDK's shapes, so callers read `success`, `exitCode`, `stdout` and `content`
- * as before.
+ * The Sandbox Durable Object implements it on Sandbox SDK 1.0. Results keep
+ * the 0.12 SDK's shapes, so callers read `success`, `exitCode`, `stdout` and
+ * `content` as before.
  */
+
+/** What a container call throws, before doing anything, when no container runs. */
+export const NOT_RUNNING = "SANDBOX_NOT_RUNNING: The site's container is not running.";
+
+/** Nothing ran, so the call can be repeated once the container is started. */
+export function isSandboxNotRunning(error: unknown): boolean {
+	return (error instanceof Error ? error.message : String(error)).startsWith("SANDBOX_NOT_RUNNING");
+}
 
 export interface SandboxExecOptions {
 	cwd?: string;
@@ -12,11 +20,8 @@ export interface SandboxExecOptions {
 	/** Milliseconds before the command is stopped. */
 	timeout?: number;
 	signal?: AbortSignal;
-	/**
-	 * Run beside other commands instead of after them. On 0.12 the default
-	 * session runs its commands one at a time.
-	 */
-	concurrent?: boolean;
+	/** Upkeep the owner did not ask for, such as a checkpoint: it does not keep the container awake. */
+	background?: boolean;
 }
 
 export interface SandboxExecResult {
@@ -41,10 +46,7 @@ export type SandboxStart =
 	| { ok: false; reason: "capacity"; position?: number; retryAfterMs: number };
 
 export interface SandboxOps {
-	/**
-	 * Start the container unless it runs, within the deployment's cap. On 0.12
-	 * the platform's `max_instances` is the cap, so this always succeeds.
-	 */
+	/** Start the container unless it runs, within the deployment's cap. */
 	ensureRunning(): Promise<SandboxStart>;
 	/** Give up the site's place in the queue for a container. Does nothing once one runs. */
 	cancelStart(): Promise<void>;

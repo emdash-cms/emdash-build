@@ -5,15 +5,13 @@ const DEFAULT_MAX_REDIRECTS = 5;
 const IGNORED_PATH_PREFIXES = ["/_emdash", "/_astro/", "/@vite/", "/node_modules/"];
 const DISPOSE_SYMBOL = (Symbol as typeof Symbol & { readonly dispose?: symbol }).dispose;
 
-function isSandboxRuntimeReplacement(error: unknown): boolean {
-	if (!error || typeof error !== "object") return false;
-	const { code, context } = error as { code?: unknown; context?: unknown };
-	return (
-		code === "OPERATION_INTERRUPTED" &&
-		Boolean(context) &&
-		typeof context === "object" &&
-		(context as { reason?: unknown }).reason === "runtime_replaced"
-	);
+/**
+ * A request that found the site's container stopped ran nothing, and is no
+ * site defect. (The smoke runner loads this module alone, so the check from
+ * sandbox-ops is repeated here.)
+ */
+function isSandboxNotRunning(error: unknown): boolean {
+	return (error instanceof Error ? error.message : String(error)).startsWith("SANDBOX_NOT_RUNNING");
 }
 
 export function isCompletePublicHtml(html: string): boolean {
@@ -258,7 +256,7 @@ export async function auditPublicSite(
 			try {
 				response = await fetchPage(currentPath);
 			} catch (error) {
-				if (isSandboxRuntimeReplacement(error)) throw error;
+				if (isSandboxNotRunning(error)) throw error;
 				issues.push({
 					path: currentPath,
 					reason: "request-failed",
@@ -322,7 +320,7 @@ export async function auditPublicSite(
 				try {
 					detail = errorDetail(await readHtml(response, maxHtmlBytes));
 				} catch (error) {
-					if (isSandboxRuntimeReplacement(error)) throw error;
+					if (isSandboxNotRunning(error)) throw error;
 					detail = error instanceof Error ? error.message : String(error);
 				} finally {
 					disposeResponse(response);

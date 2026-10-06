@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
+import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 import { auditPublicSite } from "../src/worker/public-site-audit.js";
 
 function html(body: string, init: ResponseInit = {}): Response {
@@ -210,11 +211,8 @@ describe("public site acceptance audit", () => {
 		});
 	});
 
-	it("does not turn a runtime replacement into a site defect", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("does not turn a stopped container into a site defect", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		await expect(auditPublicSite(async () => Promise.reject(interrupted))).rejects.toBe(
 			interrupted,
 		);

@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-	isSandboxRuntimeReplacement,
-	isSandboxWakeReset,
-	previewTokenForRoute,
-	previewTokenFromUrl,
-} from "../src/worker/recovery.js";
+import { previewTokenForRoute, previewTokenFromUrl } from "../src/worker/recovery.js";
+import { NOT_RUNNING, isSandboxNotRunning } from "../src/worker/sandbox-ops.js";
 
 describe("preview recovery", () => {
 	it("keeps the production token random and supports an isolated preview route suffix", () => {
@@ -38,24 +34,10 @@ describe("preview recovery", () => {
 		).toBeUndefined();
 	});
 
-	it("recognizes the Sandbox wake/reset failure", () => {
-		expect(
-			isSandboxWakeReset(
-				new Error(
-					"A call to blockConcurrencyWhile() in a Durable Object waited for too long. The call was canceled and the Durable Object was reset.",
-				),
-			),
-		).toBe(true);
-		expect(isSandboxWakeReset(new Error("git clone failed"))).toBe(false);
-	});
-
-	it("recognizes a Sandbox runtime replacement", () => {
-		expect(
-			isSandboxRuntimeReplacement({
-				code: "OPERATION_INTERRUPTED",
-				context: { reason: "runtime_replaced" },
-			}),
-		).toBe(true);
-		expect(isSandboxRuntimeReplacement(new Error("runtime replaced"))).toBe(false);
+	it("recognizes a call that found the container stopped, even across RPC", () => {
+		expect(isSandboxNotRunning(new Error(NOT_RUNNING))).toBe(true);
+		// Workers RPC keeps an error's message but not its class.
+		expect(isSandboxNotRunning(new Error(`${NOT_RUNNING}`).message)).toBe(true);
+		expect(isSandboxNotRunning(new Error("git clone failed"))).toBe(false);
 	});
 });

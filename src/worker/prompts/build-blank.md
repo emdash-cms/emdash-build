@@ -69,9 +69,9 @@ A successful `apply_schema_plan` regenerates `emdash-env.d.ts` and returns its d
 - Every query returns `cacheHint`; call `Astro.cache.set(cacheHint)` on the page.
 - `entry.id` is the URL slug. `entry.data.id` is the database ULID used by APIs such as taxonomy lookups and comments.
 - Image fields are objects. Render them with `<Image image={...} />` from `emdash/ui`, not as a string `img` source.
-- Render rich text with `<RichText value={...} />` from `src/components/ui/RichText.astro`, which wraps EmDash's `PortableText` with prose styles.
+- Render rich text with `<RichText value={...} />`, the default export of `src/components/ui/RichText.astro`, which wraps EmDash's `PortableText` with prose styles; `emdash/ui` has no `RichText`. A block's `vN.astro` imports it with `import RichText from "../../ui/RichText.astro";`, a page directly in `src/pages/` with `../components/ui/RichText.astro`.
 - Spread the entry's visual-editing attributes onto displayed editable fields where the API exposes them.
-- The site layout must include `EmDashHead`, `EmDashBodyStart`, and `EmDashBodyEnd` with a `createPublicPageContext()` so plugins and visual editing work.
+- The site layout must include `EmDashHead`, `EmDashBodyStart`, and `EmDashBodyEnd` with a `createPublicPageContext()` so plugins and visual editing work. Its `image` is a URL string: never pass it an image field's object, which crashes the render.
 - Use `getSiteSettings()` and `getMenu()` rather than hard-coding global identity or navigation.
 - Handle missing entries and empty collections deliberately; never crash or render an unexplained blank page.
 

@@ -184,6 +184,43 @@ describe("preview refresh loop robustness", () => {
 			await expect(stopped).rejects.toThrow();
 		});
 	});
+
+	it("says why a snapshot failed, not that it returned HTTP unknown", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000049");
+		await runInDurableObject(agent, async (instance) => {
+			const lines: string[] = [];
+			const error = "The page did not render within 60 seconds.";
+			install(instance, { refreshPreview: vi.fn(async () => ({ success: false, error })) });
+			Reflect.set(instance, "sendConsole", (line: string) => lines.push(line));
+			const harness = instance as unknown as { refreshPreviewCache: () => Promise<boolean> };
+
+			await expect(harness.refreshPreviewCache()).resolves.toBe(false);
+			expect(lines).toEqual([`Warning: preview snapshot failed: ${error}`]);
+		});
+	});
+
+	it("holds one CMS call for a render that outlasts the wait, not each", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000048");
+		await runInDurableObject(agent, async (instance) => {
+			const { stub } = deferredSandbox();
+			const { harness } = install(instance, stub);
+			const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
+			Reflect.set(instance, "mcp", { callTool });
+			Reflect.set(instance, "previewRenderWaitMs", 300);
+			const timedCall = async () => {
+				const started = Date.now();
+				await harness.callMcpTool("content_get", "emdash", { type: "object" }, {});
+				return Date.now() - started;
+			};
+
+			// The render never finishes.
+			await harness.refreshAndReloadPreview();
+			await settle();
+
+			expect(await timedCall()).toBeGreaterThanOrEqual(290);
+			expect(await timedCall()).toBeLessThan(150);
+		});
+	});
 });
 
 describe("dependencies for a restored site", () => {

@@ -4,6 +4,7 @@ import {
 	createTools,
 	readFilesFromSandbox,
 } from "../src/worker/tools.js";
+import { NOT_RUNNING } from "../src/worker/sandbox-ops.js";
 
 const encoder = new TextEncoder();
 
@@ -221,14 +222,11 @@ describe("bounded concurrent file reads", () => {
 		);
 	});
 
-	it("does not hide a runtime replacement as a missing file", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("does not hide a stopped container as a missing file", async () => {
+		const stopped = new Error(NOT_RUNNING);
 		await expect(
-			readFiles({ readFileStream: async () => Promise.reject(interrupted) }, ["page.astro"]),
-		).rejects.toBe(interrupted);
+			readFiles({ readFileStream: async () => Promise.reject(stopped) }, ["page.astro"]),
+		).rejects.toBe(stopped);
 	});
 
 	it("serializes sibling batches and skips an aborted queued batch", async () => {

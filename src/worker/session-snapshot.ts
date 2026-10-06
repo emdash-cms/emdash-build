@@ -66,6 +66,9 @@ export function snapshotStagingCommand(sitePath: string, snapshotPath: string): 
 		.map((path) => `-path ${shellQuote(path)}`)
 		.join(" -o ");
 	return (
+		// A site without its package.json is what a failed restore leaves behind;
+		// staging it would let the checkpoint replace the real one.
+		`test -f ${shellQuote(`${sitePath}/package.json`)} && ` +
 		`rm -rf ${shellQuote(snapshotPath)} && mkdir -p ${shellQuote(snapshotPath)} && ` +
 		`bash -o pipefail -c ${shellQuote(copyFiles)} sh ` +
 		`${shellQuote(sitePath)} ${shellQuote(snapshotPath)} && ` +
@@ -108,10 +111,20 @@ export function publishStagingCommand(
 export const SNAPSHOT_GIT_DIR = "/tmp/emdash-build-session-git";
 
 /**
- * Commit the staged tree as a new root commit, in a git directory kept beside
- * the staging copy so it survives each rebuild of that copy. The remote still
- * holds one snapshot commit, but the previous snapshot's objects stay local,
- * so the next push sends only what changed. Prints the new commit id.
+ * Checkpoints chained before the history starts again from a root commit.
+ * git sends only what changed when the new commit descends from the one the
+ * remote has; a fresh root commit makes it send everything again.
+ */
+export const SNAPSHOT_HISTORY_LIMIT = 20;
+
+/**
+ * Commit the staged tree, in a git directory kept beside the staging copy so
+ * it survives each rebuild of that copy. The commit's parent is the last one
+ * pushed, so the push sends only what changed: git cannot see that an
+ * unrelated root commit shares objects with the remote. Every
+ * `SNAPSHOT_HISTORY_LIMIT` checkpoints it is a root commit again, which keeps
+ * the remote's history short and lets old snapshots be collected. Prints the
+ * new commit id.
  *
  * It runs in a subshell: the sandbox's default session keeps exported
  * variables and the working directory for later commands. The index is
@@ -130,7 +143,8 @@ export function snapshotCommitCommand(options: {
 		`export GIT_DIR=${shellQuote(options.gitDir)} GIT_WORK_TREE=${shellQuote(options.snapshotPath)}`,
 		`cd ${shellQuote(options.snapshotPath)}`,
 		'{ test -f "$GIT_DIR/HEAD" || git init -q; }',
-		'rm -f "$GIT_DIR/index" "$GIT_DIR/index.lock" "$GIT_DIR"/refs/heads/*.lock',
+		// Only the locks a killed commit leaves; an upload beside it holds pushed.lock.
+		'rm -f "$GIT_DIR/index" "$GIT_DIR/index.lock" "$GIT_DIR/refs/heads/snapshot.lock"',
 		`git config user.email ${shellQuote(options.email)}`,
 		`git config user.name ${shellQuote(options.name)}`,
 		// A background gc would stall a checkpoint; old snapshots are pruned after uploads.
@@ -138,7 +152,9 @@ export function snapshotCommitCommand(options: {
 		"git config core.logAllRefUpdates false",
 		"git add -A",
 		"tree=$(git write-tree)",
-		`commit=$(git commit-tree "$tree" -m ${shellQuote(options.message)})`,
+		"parent=$(git rev-parse -q --verify refs/heads/pushed || true)",
+		`if [ -n "$parent" ] && [ "$(git rev-list --count "$parent")" -lt ${SNAPSHOT_HISTORY_LIMIT} ]; then set -- -p "$parent"; else set --; fi`,
+		`commit=$(git commit-tree "$tree" "$@" -m ${shellQuote(options.message)})`,
 		'git update-ref refs/heads/snapshot "$commit"',
 		'echo "$commit"',
 	];
@@ -152,6 +168,8 @@ export function snapshotCommitCommand(options: {
  * local, which keeps the next push incremental; older snapshots are pruned.
  * `--no-thin` keeps each pack self-contained. The Sandbox RPC timeout does not
  * kill a stalled git child, so the push is bounded inside the container.
+ * Uploads take turns in the container, so one a restarted builder left running
+ * cannot land over a newer snapshot pushed after it.
  */
 export function snapshotPushCommand(options: {
 	gitDir: string;
@@ -160,13 +178,41 @@ export function snapshotPushCommand(options: {
 }): string {
 	const steps = [
 		`export GIT_DIR=${shellQuote(options.gitDir)}`,
+		// Beside the git directory, which a failed commit rebuilds; held until this shell exits.
+		'exec 9>>"$GIT_DIR.push.lock"',
+		"flock 9",
 		'cd "$GIT_DIR"',
 		"commit=$(git rev-parse refs/heads/snapshot)",
-		`timeout --signal=TERM --kill-after=2s ${options.timeoutSeconds}s git push -q --no-thin ${shellQuote(options.remote)} "$commit:refs/heads/main" --force`,
+		// A failed upload ends the chain: the next checkpoint is a root commit, so an
+		// upload that keeps failing (to a recreated remote, say) cannot hold every
+		// later checkpoint to the same unsent history.
+		`{ timeout --signal=TERM --kill-after=2s ${options.timeoutSeconds}s git push -q --no-thin ${shellQuote(options.remote)} "$commit:refs/heads/main" --force || { git update-ref -d refs/heads/pushed 2>/dev/null; false; }; }`,
+		// Uploads run one at a time, so a lock on this ref is a killed upload's.
+		'rm -f "$GIT_DIR/refs/heads/pushed.lock"',
 		'git update-ref refs/heads/pushed "$commit"',
 		// Objects younger than an hour may belong to a commit still being written.
 		"{ git prune --expire=1.hour.ago >/dev/null 2>&1 || true; }",
 		'echo "$commit"',
 	];
 	return `( ${steps.join(" && ")} )`;
+}
+
+/**
+ * Clone the latest checkpoint into the site directory without the history
+ * before it, which only the checkpoints use; a server that cannot serve a
+ * shallow clone gets a full one. The shallow clone gets most of the restore's
+ * two minutes: one that ran out of time (124, or 137 once killed) falls back
+ * to nothing, since a full clone downloads more. The clone goes beside the
+ * site and moves into place only once whole: a clone stopped part way would
+ * pass for a site and be saved over the checkpoint.
+ */
+export function snapshotCloneCommand(remote: string, sitePath: string): string {
+	const site = shellQuote(sitePath);
+	const partial = shellQuote(`${sitePath}.restoring`);
+	const source = shellQuote(remote);
+	return (
+		`rm -rf ${site} ${partial} && ( timeout --signal=TERM --kill-after=2s 100s git clone -q --depth 1 ${source} ${partial}; ` +
+		`shallow=$?; [ $shallow -eq 0 ] || { [ $shallow -ne 124 ] && [ $shallow -ne 137 ] && ` +
+		`rm -rf ${partial} && git clone -q ${source} ${partial}; } ) && mv ${partial} ${site}`
+	);
 }

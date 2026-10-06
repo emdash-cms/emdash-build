@@ -17,12 +17,11 @@ import {
 	type MutationScope,
 } from "./build-convergence.js";
 import { auditPublicSite } from "./public-site-audit.js";
-import { isSandboxRuntimeReplacement } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 
 import type { BlockRendererValidationResult } from "./block-renderer-validation.js";
 import type { PublicSiteAuditResult } from "./public-site-audit.js";
-import type { SandboxOps } from "./sandbox-ops.js";
+import { isSandboxNotRunning, type SandboxOps } from "./sandbox-ops.js";
 
 /** Base path for the scaffolded site inside the sandbox */
 export const SITE_PATH = "/home/user/site";
@@ -221,7 +220,7 @@ async function readOneTextFile(
 		return { path: path.path, success: true, content, bytes };
 	} catch (error) {
 		await reader?.cancel().catch(() => {});
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			path: path.path,
 			success: false,
@@ -322,8 +321,10 @@ const PROTECTED_FILE_NOTICE = "emdash-build-guard: ";
 /**
  * Wrap a shell command (run from the site root) so protected site files
  * survive it: copy them aside first, then restore any the command changed
- * or deleted and report each on stderr. The command's exit status is kept.
- * Runs in a subshell so `exit` never ends the sandbox's shared session.
+ * or deleted and report each on stderr, also when the command is stopped.
+ * The command's exit status is kept. It must be one simple command, run in
+ * the background in its own process group. The guard is the whole command,
+ * not a subshell, so whoever waits for it waits for the restore.
  *
  * This catches accidental edits, not a determined model: it shares the
  * command's permissions, and background processes can outlive it. The
@@ -340,14 +341,35 @@ export function guardProtectedFiles(command: string): string {
 		'guard=$(mktemp -d "${TMPDIR:-/tmp}/emdash-guard.XXXXXX") || exit 1',
 		"backed=",
 		`for f in ${files}; do if [ -f "$f" ]; then { mkdir -p "$guard/$(dirname "$f")" && cp "$f" "$guard/$f" && backed="$backed $f"; } || ${notice("could not back up protected file $f")}; fi; done`,
-		command,
-		"rc=$?",
+		// The command runs in its own process group (job control), so on a TERM
+		// (Stop, or the deadline) the guard can stop all of it, KILLing what
+		// ignores the TERM after a second, and still restore before the runtime's
+		// own KILL ends the guard.
+		// The trap comes first, so a TERM just as the command starts still stops it.
+		`trap 'trap "" TERM; if [ -n "\${inner:-}" ]; then kill -TERM -- "-$inner" 2>/dev/null; n=0; while kill -0 -- "-$inner" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 0.1; n=$((n + 1)); done; kill -KILL -- "-$inner" 2>/dev/null; fi' TERM`,
+		"set -m",
+		// Steps join with "; ", which may not follow "&".
+		`${command} & inner=$!`,
+		"set +m",
+		'wait "$inner"; rc=$?',
 		// Word splitting over $backed is safe: protected paths contain no spaces.
 		`for f in $backed; do if [ ! -f "$guard/$f" ]; then ${notice("could not check protected file $f: its backup was removed")}; elif ! cmp -s "$guard/$f" "$f"; then { if [ -L "$f" ]; then rm -f "$f"; elif [ -d "$f" ]; then rm -rf "$f"; fi; mkdir -p "$(dirname "$f")" && ${restore}; } || ${notice("could not restore protected file $f")}; fi; done`,
 		'rm -rf "$guard"',
 		"exit $rc",
 	];
-	return `( ${steps.join("; ")} )`;
+	return `{ ${steps.join("; ")}; }`;
+}
+
+/** How long the model's shell commands may run, so a hung one cannot block later tools. */
+export const MODEL_COMMAND_TIMEOUT_MS = 12_000;
+
+/**
+ * The model's shell command as the exec tool runs it: in a login shell, with
+ * protected files guarded. At the runtime's deadline, as on Stop, the guard
+ * stops the command and restores files.
+ */
+export function modelCommand(command: string): string {
+	return guardProtectedFiles(`bash -lc ${shellQuote(command)}`);
 }
 
 /**
@@ -390,6 +412,24 @@ export async function mapLimit<T, R>(
 	await Promise.all(workers);
 	return results;
 }
+
+/** Result of a temporary-account deploy. */
+export interface DeployResult {
+	success: boolean;
+	liveUrl?: string;
+	claimUrl?: string;
+	error?: string;
+}
+
+/**
+ * Cloudflare temporary preview accounts (`wrangler deploy --temporary`)
+ * support only a limited set of products. EmDash's Cloudflare template binds
+ * R2 (`MEDIA`) and a Worker Loader (`LOADER`) and registers a cron trigger,
+ * none of which a temporary account can provision. These helpers produce a
+ * stripped, temp-account-safe build so the agent can deploy a working live
+ * preview (pages + D1 content) without media uploads, sandboxed plugins, or
+ * scheduled publishing. They are pure so they can be unit-tested.
+ */
 
 /**
  * Builder-owned Worker entry for every managed site. Development setup/reset
@@ -481,6 +521,92 @@ export function stripSandboxFromAstroConfig(src: string): string {
 		.replace(/^[ \t]*sandboxRunner:\s*sandbox\(\),?\s*$\n?/m, "")
 		.replace(/^[ \t]*sandboxed:\s*\[[^\]]*\],?\s*$\n?/m, "")
 		.replace(/^[ \t]*marketplace:\s*["'][^"']*["'],?\s*$\n?/m, "");
+}
+
+/**
+ * Remove `storage: r2(...)` from an astro.config. Applied to the deploy build
+ * only (R2 isn't on temporary accounts) so the built worker doesn't reference
+ * the absent MEDIA binding. The in-builder preview keeps storage.
+ */
+export function stripStorageFromAstroConfig(src: string): string {
+	return src.replace(/^[ \t]*storage:\s*r2\([^)]*\),?\s*$\n?/m, "");
+}
+
+/**
+ * Drop `r2_buckets` from the (canonical, JSON) wrangler config for the deploy
+ * build, so the adapter-generated deploy config has no MEDIA binding the temp
+ * account can't provision. Restored after deploy.
+ */
+export function stripR2FromWrangler(jsonText: string): string {
+	const cfg = JSON.parse(jsonText) as Record<string, unknown>;
+	delete cfg.r2_buckets;
+	return JSON.stringify(cfg, null, 2);
+}
+
+/**
+ * Tables a deployed copy must not carry, matched by prefix as EmDash's own
+ * snapshot export matches them: the dev-bypass admin and its sessions, the
+ * session's full-scope PAT, OAuth/device/passkey state, transfer leases and
+ * plugin storage, plus the auth tables of older EmDash versions.
+ */
+const UNDEPLOYED_TABLE_PREFIXES = [
+	"_emdash_api_tokens",
+	"_emdash_oauth_tokens",
+	"_emdash_oauth_clients",
+	"_emdash_authorization_codes",
+	"_emdash_device_codes",
+	"_emdash_rate_limits",
+	"_emdash_migrations_lock",
+	"_emdash_transfer_",
+	"_plugin_",
+	"users",
+	"sessions",
+	"credentials",
+	"challenges",
+	"auth_challenges",
+	"auth_tokens",
+	"oauth_accounts",
+	"audit_logs",
+];
+
+/**
+ * Delete everything auth-related from a staged copy's local D1 before its
+ * content is exported for a deploy, so none of it reaches the deployed
+ * database, not even its history. Options other than `site:` settings go too,
+ * as in EmDash's own export: they hold plugin secrets, passkey challenges and
+ * setup state. Clearing setup with the users sends whoever claims the deploy
+ * through the setup wizard to create their own admin; public pages are not
+ * gated on setup, so the site still serves.
+ *
+ * The deletes run with foreign keys on (sqlite3 leaves them off), so EmDash's
+ * cascades and SET NULLs apply, and they fail together if content would still
+ * refer to a deleted row: D1 enforces foreign keys and would refuse to load
+ * it. It also fails if there is no database.
+ */
+const SCRUB_EACH_DATABASE = [
+	"for db do",
+	'deletes=$(sqlite3 -bail "$db" "$0") || exit 1',
+	"{ printf '%s\\n' 'PRAGMA foreign_keys=ON;' 'BEGIN;' 'PRAGMA defer_foreign_keys=ON;' \"$deletes\" 'COMMIT;'; } | " +
+		'sqlite3 -bail "$db" || exit 1',
+	"done",
+].join("\n");
+
+export function scrubStagedContentCommand(stagedPath: string): string {
+	const tables = UNDEPLOYED_TABLE_PREFIXES.map(
+		(prefix) => `substr(name, 1, ${prefix.length}) = '${prefix}'`,
+	).join(" OR ");
+	const deletes =
+		`SELECT 'DELETE FROM "' || replace(name, '"', '""') || '";' FROM sqlite_master ` +
+		`WHERE type = 'table' AND (${tables}); ` +
+		`SELECT 'DELETE FROM options WHERE substr(name, 1, 5) <> ''site:'';' FROM sqlite_master ` +
+		`WHERE type = 'table' AND name = 'options';`;
+	const databases = shellQuote(`${stagedPath}/.wrangler/state/v3/d1`);
+	return (
+		`test -n "$(find ${databases} -type f -name '*.sqlite' -print -quit)" && ` +
+		`find ${databases} -type f -name '*.sqlite' -exec sh -c ` +
+		`${shellQuote(SCRUB_EACH_DATABASE)} ` +
+		`${shellQuote(deletes)} {} +`
+	);
 }
 
 /**
@@ -762,7 +888,7 @@ export async function refreshLiveTypes(
 			redirect: "manual",
 		});
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -790,7 +916,7 @@ export async function refreshLiveTypes(
 		try {
 			detail = await readResponseTextBounded(response, 1000);
 		} catch (error) {
-			if (isSandboxRuntimeReplacement(error)) throw error;
+			if (isSandboxNotRunning(error)) throw error;
 			detail = error instanceof Error ? error.message : String(error);
 		}
 		return {
@@ -804,7 +930,7 @@ export async function refreshLiveTypes(
 	try {
 		types = await readResponseTextBounded(response, TYPEGEN_MAX_BYTES);
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return {
 			success: false,
 			exitCode: 1,
@@ -844,14 +970,37 @@ export async function refreshLiveTypes(
  * installed dependencies (pinned by the hashed lockfile), build output, git
  * metadata, local CMS state and static assets. Anything else a check might
  * include, such as generated declarations or a root-level module, changes it.
+ * Symlinks are followed, so a linked file's content counts, and a file it
+ * cannot read fails the digest rather than drop out of it.
  */
 export function typecheckInputsFingerprintCommand(): string {
 	const skipped = ["node_modules", ".git", "dist", ".astro", ".wrangler", "public"]
 		.map((dir) => `-path ./${dir}`)
 		.join(" -o ");
 	return (
-		`find . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
+		`set -o pipefail; find -L . \\( ${skipped} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r sha256sum ` +
 		"| sha256sum | cut -d ' ' -f 1"
+	);
+}
+
+/**
+ * True once every image in view has loaded or failed, or five seconds after
+ * the first check. The viewport is set after the page loads, so responsive
+ * images fetch another size, and a screenshot taken at once shows them empty.
+ * Images hidden, below the fold or off to the side do not count.
+ */
+const IN_VIEW_IMAGES_SETTLED =
+	"(window.__shotCheckedAt ??= Date.now()) && (Date.now() - window.__shotCheckedAt > 5000 || " +
+	"[...document.images].every((image) => image.complete || !image.getClientRects().length || " +
+	"image.getBoundingClientRect().top >= innerHeight || image.getBoundingClientRect().left >= innerWidth))";
+
+/** Screenshot the dev server's home page from inside the container, in a session of its own. */
+export function previewScreenshotCommand(session: string, outPath: string): string {
+	return (
+		`AGENT_BROWSER_DEFAULT_TIMEOUT=45000 AGENT_BROWSER_ARGS=--disable-dev-shm-usage agent-browser --session ${session} ` +
+		`--allowed-domains localhost,127.0.0.1 ` +
+		`batch 'open http://127.0.0.1:4321/' 'set viewport 1024 640' 'wait --fn "${IN_VIEW_IMAGES_SETTLED}"' ` +
+		`'screenshot ${outPath}' 'close'`
 	);
 }
 
@@ -865,7 +1014,7 @@ async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string |
 		const digest = result.stdout.trim();
 		return result.success && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined;
 	} catch (error) {
-		if (isSandboxRuntimeReplacement(error)) throw error;
+		if (isSandboxNotRunning(error)) throw error;
 		return undefined;
 	}
 }
@@ -873,7 +1022,6 @@ async function typecheckInputsFingerprint(sandbox: SandboxOps): Promise<string |
 async function auditSandboxPublicSite(sandbox: SandboxOps): Promise<PublicSiteAuditResult> {
 	const fetchPage = (path: string) => {
 		const url = new URL(path, "http://localhost:4321");
-		// Only serializable init: the request owns its container-start and request timeouts.
 		return sandbox.fetchPort(4321, url.toString(), {
 			headers: { Accept: "text/html" },
 			redirect: "manual",
@@ -1024,7 +1172,7 @@ export function createMediaTools(options: {
 	apiToken?: string;
 	cmsBaseUrl?: string;
 }) {
-	return {
+	const tools = {
 		search_unsplash: tool({
 			description:
 				"Search Unsplash for photos by keyword. Returns real photo URLs, descriptions, " +
@@ -1156,6 +1304,10 @@ export function createMediaTools(options: {
 			},
 		}),
 	};
+	if (options.unsplashAccessKey) return tools;
+	// Every search would fail, so the model is not offered one.
+	const { search_unsplash: _, ...withoutSearch } = tools;
+	return withoutSearch;
 }
 
 /**
@@ -1925,15 +2077,9 @@ export function createTools(
 					};
 				}
 				return trackedMutation(async () => {
-					// The SDK request timeout does not reliably kill a child process. A
-					// hung curl then owns the default command session and every later exec
-					// queues behind it. Enforce the deadline inside the container and leave
-					// a small outer margin for the termination result to cross RPC.
-					const boundedCommand =
-						`timeout --signal=TERM --kill-after=2s 12s ` + `bash -lc ${shellQuote(command)}`;
-					const result = await currentSandbox().exec(guardProtectedFiles(boundedCommand), {
+					const result = await currentSandbox().exec(modelCommand(command), {
 						cwd: SITE_PATH,
-						timeout: 17000,
+						timeout: MODEL_COMMAND_TIMEOUT_MS,
 						signal: options.abortSignal,
 					});
 					const notices = protectedFileNotices(result.stderr);

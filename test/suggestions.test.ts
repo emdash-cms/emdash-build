@@ -58,6 +58,41 @@ describe("next-step suggestions", () => {
 		);
 	});
 
+	it("asks for JSON with only the schema keywords Workers AI's grammar accepts", async () => {
+		let request: any;
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			request = input;
+			return { response: { suggestions: [] } };
+		});
+		await suggestNextSteps({ run }, "Brief", session);
+
+		const keywords = new Set<string>();
+		const visit = (schema: Record<string, any>) => {
+			for (const [key, value] of Object.entries(schema)) {
+				keywords.add(key);
+				if (key === "properties") Object.values(value).forEach((child: any) => visit(child));
+				if (key === "items") visit(value);
+			}
+		};
+		visit(request.response_format.json_schema);
+		// "The provided JSON schema contains features not supported by xgrammar."
+		expect([...keywords].sort()).toEqual(["enum", "items", "properties", "required", "type"]);
+	});
+
+	it("keeps a suggestion that repeats a capability and drops one that names none", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add a menu page", undefined, ["edit_site", "edit_site"]),
+					modelSuggestion("Add a gallery", undefined, []),
+				],
+			},
+		}));
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("Add a menu page"),
+		]);
+	});
+
 	it("accepts the JSON as a string", async () => {
 		const run = vi.fn(async () => ({
 			response: JSON.stringify({ suggestions: [modelSuggestion("Add a menu page")] }),

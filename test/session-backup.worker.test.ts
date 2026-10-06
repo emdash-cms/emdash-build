@@ -270,25 +270,6 @@ describe("background session uploads", () => {
 		});
 	});
 
-	it("runs uploads beside the model's commands", async () => {
-		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000023");
-		await runInDurableObject(agent, async (instance) => {
-			const exec = vi.fn(async (_command: string, _options?: { concurrent?: boolean }) => ({
-				success: true,
-				stdout: "abc\n",
-				stderr: "",
-			}));
-			const harness = install(instance, { exec });
-
-			await harness.backupSite();
-
-			const concurrent = exec.mock.calls.filter(([, options]) => options?.concurrent);
-			expect(concurrent).toHaveLength(1);
-			expect(concurrent[0]![0]).toContain("git push");
-			expect(concurrent[0]![1]).toMatchObject({ cwd: "/tmp" });
-		});
-	});
-
 	it("surfaces a failed background upload as a persistence error", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000024");
 		await runInDurableObject(agent, async (instance) => {
