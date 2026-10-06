@@ -1331,7 +1331,11 @@ describe("image uploads", () => {
 			uploaded: 1,
 			results: [
 				{ success: true },
-				{ success: false, error: expect.stringContaining("images the user supplied") },
+				{
+					success: false,
+					// Refused here, the same URL must not reach the site some other way.
+					error: expect.stringMatching(/images the user supplied.*page or an image field/),
+				},
 			],
 		});
 		expect(fetchMock.mock.calls.some(([url]) => String(url).includes("photo-153078"))).toBe(false);
@@ -1366,7 +1370,7 @@ describe("image uploads", () => {
 				{
 					success: false,
 					error: expect.stringMatching(
-						/Search for photos.*If search fails, design without photography/,
+						/Search for photos.*page or an image field.*If search fails, design without photography/,
 					),
 				},
 			],
