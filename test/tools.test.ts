@@ -1361,7 +1361,12 @@ describe("image uploads", () => {
 			uploaded: 1,
 			results: [
 				{ success: true },
-				{ success: false, error: expect.stringContaining("Search for photos") },
+				{
+					success: false,
+					error: expect.stringMatching(
+						/Search for photos.*If search fails, design without photography/,
+					),
+				},
 			],
 		});
 	});

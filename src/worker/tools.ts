@@ -1178,7 +1178,7 @@ export function createMediaTools(options: {
 	cmsBaseUrl?: string;
 }) {
 	const unsourcedImage = options.unsplashAccessKey
-		? "Not a photo search_unsplash returned or the user gave. Search for photos instead of writing photo URLs from memory: remembered and random-photo URLs show the wrong subject or no longer exist."
+		? "Not a photo search_unsplash returned or the user gave. Search for photos instead of writing photo URLs from memory: remembered and random-photo URLs show the wrong subject or no longer exist. If search fails, design without photography."
 		: "Not an image the user gave. There is no photo search in this session, so use images the user supplied, or design without photography; never write a photo URL from memory.";
 	const tools = {
 		search_unsplash: tool({

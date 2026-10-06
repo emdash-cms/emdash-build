@@ -65,7 +65,7 @@ describe("builder template prototype", () => {
 		expect(prompt).not.toContain("subject-specific Unsplash images");
 		expect(prompt).toContain("Never write a photo URL from memory");
 		expect(prompt).toContain(
-			"Without `search_unsplash` or user images, design without photography",
+			"Without `search_unsplash` or user images, or when photo search fails, design without photography",
 		);
 		// A required image field left a photo portfolio with no projects at all.
 		expect(prompt).toContain(
@@ -146,6 +146,7 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain(
 			"keep new image fields optional and still create the entries the request needs",
 		);
+		expect(prompt).toContain("or when photo search fails");
 		expect(prompt).toContain("Preserve every surviving block's `_key`, `_type`, and `_version`");
 		expect(prompt).toContain("read `.agents/skills/blocks-schema-evolution/SKILL.md`");
 		expect(prompt).toContain("An older recovered project may lack");
