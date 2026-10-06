@@ -1,6 +1,7 @@
 import { env, evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuilderAgent, BuilderState } from "../src/worker/agent.js";
+import { BuildConvergence, mutationKey } from "../src/worker/build-convergence.js";
 import {
 	NOT_RUNNING,
 	RESTORED,
@@ -520,7 +521,7 @@ describe("tool calls that find the container stopped", () => {
 			await expect(read()).resolves.toMatchObject({ success: true });
 
 			// The preview's Resume restored the site while the model was building.
-			harness.activeBuildConvergences.set("request", {});
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
 			await harness.recoverSite("localhost:5173");
 			await expect(read()).rejects.toThrow("restored from its last checkpoint");
 			harness.noteToolCallReported(reportedRestore());
@@ -548,12 +549,33 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("make the turn redo and revalidate what a restore replaced", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000012");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			const convergence = new BuildConvergence();
+			harness.activeBuildConvergences.set("request", convergence);
+			const key = mutationKey("write_file", { path: "src/pages/index.astro", content: "x" });
+			const write = vi.fn(async () => ({ success: true }));
+			await convergence.runMutation(write, { key });
+			const revision = convergence.currentRevision();
+
+			await harness.recoverSite("localhost:5173");
+
+			// "Redo them": the same write must run again, and the site be validated again.
+			expect(convergence.currentRevision()).toBeGreaterThan(revision);
+			await convergence.runMutation(write, { key });
+			expect(write).toHaveBeenCalledTimes(2);
+		});
+	});
+
 	it("keep an unheard restore across the object's eviction", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000011");
 		await runInDurableObject(agent, async (instance) => {
 			restorableSite(instance, { present: false, installCode: 0 });
 			const harness = instance as unknown as RestoreHarness;
-			harness.activeBuildConvergences.set("request", {});
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
 			await harness.recoverSite("localhost:5173");
 		});
 		// The owner reads the preview a while before the next message.
@@ -601,7 +623,7 @@ describe("tool calls that find the container stopped", () => {
 		await runInDurableObject(agent, async (instance) => {
 			restorableSite(instance, { present: false, installCode: 1 });
 			const harness = instance as unknown as RestoreHarness;
-			harness.activeBuildConvergences.set("request", {});
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
 
 			await expect(harness.recoverSite("localhost:5173")).resolves.toMatchObject({ ready: false });
 			// The container runs on, with the checkpoint's files in place of the model's.

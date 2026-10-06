@@ -3538,6 +3538,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (this.activeBuildConvergences.size > 0 || this.state.persistenceError) {
 				this.restoreUnreported = true;
 			}
+			for (const convergence of this.activeBuildConvergences.values()) {
+				convergence.noteSiteReplaced();
+			}
 			const installCode = await this.restoreDependencies();
 			if (installCode !== 0) {
 				this.sendConsole(`pnpm install failed during restore (exit ${installCode})`);

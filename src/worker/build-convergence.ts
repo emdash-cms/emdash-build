@@ -287,6 +287,17 @@ export class BuildConvergence {
 		};
 	}
 
+	/**
+	 * A restore put the site back to its last checkpoint: no earlier result or
+	 * check describes it any more, so a repeated change runs again and the site
+	 * needs validating again.
+	 */
+	noteSiteReplaced(): void {
+		this.mutationResults.clear();
+		this.revision += 1;
+		this.resetLoopDecision();
+	}
+
 	beginObservation(): BuildObservation | undefined {
 		if (this.mutationsInFlight > 0) return undefined;
 		return { revision: this.revision };

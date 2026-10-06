@@ -162,6 +162,26 @@ describe("build convergence evidence", () => {
 		expect(convergence.hasCompleteEvidence()).toBe(false);
 	});
 
+	it("runs a repeated change again and wants new evidence once the site is replaced", async () => {
+		const convergence = new BuildConvergence();
+		const key = mutationKey("write_file", { path: "src/pages/index.astro", content: "x" });
+		const write = vi.fn(async () => ({ success: true, changed: true }));
+		await convergence.runMutation(write, { key });
+		recordCompleteEvidence(convergence);
+
+		// A restore put the site back to its last checkpoint, without that write.
+		convergence.noteSiteReplaced();
+
+		// The validation was of the site before the restore.
+		expect(convergence.hasCurrentValidation()).toBe(false);
+		expect(convergence.hasCompleteEvidence()).toBe(false);
+		await expect(convergence.runMutation(write, { key })).resolves.toEqual({
+			success: true,
+			changed: true,
+		});
+		expect(write).toHaveBeenCalledTimes(2);
+	});
+
 	it("rejects a check that started before an overlapping mutation", () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
