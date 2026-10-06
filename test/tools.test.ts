@@ -1412,7 +1412,7 @@ describe("stopped server restart", () => {
 describe("write_files", () => {
 	function batchHarness(
 		initial: Record<string, string>,
-		writeFailure?: (path: string) => boolean,
+		writeFailure?: (path: string) => boolean | Error,
 		readFailure?: (path: string) => boolean | Error | undefined,
 	) {
 		const store = new Map(Object.entries(initial));
@@ -1426,7 +1426,9 @@ describe("write_files", () => {
 			}),
 			writeFile: vi.fn(async (path: string, content: string) => {
 				store.set(posix.normalize(path), content);
-				if (writeFailure?.(path)) throw new Error("write failed");
+				const failure = writeFailure?.(path);
+				if (failure instanceof Error) throw failure;
+				if (failure) throw new Error("write failed");
 				return { success: true };
 			}),
 			deleteFile: vi.fn(async (path: string) => {
@@ -1633,7 +1635,7 @@ describe("write_files", () => {
 describe("edit_files", () => {
 	function batchEditHarness(
 		initial: Record<string, string>,
-		writeFailure?: (path: string, content: string) => boolean,
+		writeFailure?: (path: string, content: string) => boolean | Error,
 	) {
 		const store = new Map(Object.entries(initial));
 		const sandbox = {
@@ -1643,7 +1645,9 @@ describe("edit_files", () => {
 			}),
 			writeFile: vi.fn(async (path: string, content: string) => {
 				store.set(posix.normalize(path), content);
-				if (writeFailure?.(path, content)) throw new Error("write failed");
+				const failure = writeFailure?.(path, content);
+				if (failure instanceof Error) throw failure;
+				if (failure) throw new Error("write failed");
 				return { success: true };
 			}),
 		};
@@ -2196,5 +2200,60 @@ describe("tools while a restore is unheard", () => {
 		expect(execute).not.toHaveBeenCalled();
 		unreported = false;
 		await expect(update()).resolves.toEqual({ success: true });
+	});
+});
+
+describe("a restore during a batch", () => {
+	it("does not try to undo a write batch on the restored site", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: false })),
+			writeFile: vi.fn(async (path: string) => {
+				if (path.endsWith("b.astro")) throw new Error(RESTORED);
+				return { success: true };
+			}),
+			deleteFile: vi.fn(async () => ({ success: true })),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_files
+			.execute as unknown as (input: {
+			files: Array<{ path: string; content: string }>;
+		}) => Promise<{ success: boolean; error?: string }>;
+
+		const result = await write({
+			files: [
+				{ path: "src/pages/a.astro", content: "a" },
+				{ path: "src/pages/b.astro", content: "b" },
+			],
+		});
+
+		// The site is its checkpoint now: nothing of the batch is left to undo.
+		expect(result).toMatchObject({ success: false, error: expect.stringContaining(RESTORED) });
+		expect(result.error).not.toMatch(/roll/i);
+		expect(sandbox.writeFile).toHaveBeenCalledTimes(2);
+		expect(sandbox.deleteFile).not.toHaveBeenCalled();
+	});
+
+	it("does not try to undo an edit batch on the restored site", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: true, content: "old" })),
+			writeFile: vi.fn(async (path: string) => {
+				if (path.endsWith("b.astro")) throw new Error(RESTORED);
+				return { success: true };
+			}),
+		};
+		const edit = createTools(sandbox as never, toolCallbacks() as never).edit_files
+			.execute as unknown as (input: {
+			edits: Array<{ path: string; oldText: string; newText: string }>;
+		}) => Promise<{ success: boolean; error?: string }>;
+
+		const result = await edit({
+			edits: [
+				{ path: "src/pages/a.astro", oldText: "old", newText: "new" },
+				{ path: "src/pages/b.astro", oldText: "old", newText: "new" },
+			],
+		});
+
+		expect(result).toMatchObject({ success: false, error: expect.stringContaining(RESTORED) });
+		expect(result.error).not.toMatch(/roll/i);
+		expect(sandbox.writeFile).toHaveBeenCalledTimes(2);
 	});
 });

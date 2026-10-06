@@ -1712,6 +1712,14 @@ export function createTools(
 										if (!result.success) throw new Error(`Could not write ${file.path}`);
 									}
 								} catch (err) {
+									// The site is its checkpoint now, or gone: nothing of the batch is left to undo.
+									if (isSandboxInterruption(err)) {
+										return {
+											success: false as const,
+											changed: true as const,
+											error: `Could not write file batch: ${(err as Error).message}`,
+										};
+									}
 									const rollbackErrors: string[] = [];
 									for (const file of attempted.reverse()) {
 										try {
@@ -2038,6 +2046,14 @@ export function createTools(
 										if (!result.success) throw new Error(`Could not write ${file.path}`);
 									}
 								} catch (err) {
+									// The site is its checkpoint now, or gone: nothing of the batch is left to undo.
+									if (isSandboxInterruption(err)) {
+										return {
+											success: false as const,
+											changed: true as const,
+											error: `Could not edit file batch: ${(err as Error).message}`,
+										};
+									}
 									const rollbackErrors: string[] = [];
 									for (const file of attempted.reverse()) {
 										try {
