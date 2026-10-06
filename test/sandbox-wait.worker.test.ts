@@ -1,7 +1,12 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuilderAgent, BuilderState } from "../src/worker/agent.js";
-import { NOT_RUNNING, type SandboxOps, type SandboxStart } from "../src/worker/sandbox-ops.js";
+import {
+	NOT_RUNNING,
+	RESTORED,
+	type SandboxOps,
+	type SandboxStart,
+} from "../src/worker/sandbox-ops.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
 
@@ -274,7 +279,14 @@ interface RestoreHarness {
 	toolSandboxOps: () => {
 		readFile: (path: string) => Promise<{ success: boolean; content: string }>;
 	};
+	noteToolCallReported: (event: { success: boolean; output?: unknown; error?: unknown }) => void;
 }
+
+/** A finished tool call whose error carries the restore message, as the model then sees it. */
+const reportedRestore = (wrap = (message: string) => message) => ({
+	success: false,
+	error: new Error(wrap(RESTORED)),
+});
 
 /** A container whose site is gone, or still there, for a recovery to bring back. */
 function restorableSite(instance: object, site: { present: boolean; installCode: number }) {
@@ -320,6 +332,7 @@ describe("tool calls that find the container stopped", () => {
 					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
 					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
 				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
 			};
 			harness.sandboxOps = () => ({
 				readFile: async () => (running ? { success: true, content: "restored" } : notRunning()),
@@ -337,6 +350,13 @@ describe("tool calls that find the container stopped", () => {
 				"restored from its last checkpoint",
 			);
 			expect(recoverSite).toHaveBeenCalledOnce();
+			// Until a tool result carries the message, every call is told.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			harness.noteToolCallReported(
+				reportedRestore((message) => `Could not read a.astro: ${message}`),
+			);
 			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
 				success: true,
 				content: "restored",
@@ -424,6 +444,7 @@ describe("tool calls that find the container stopped", () => {
 				toolSandboxOps: () => {
 					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
 				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
 			};
 			harness.sandboxOps = () => ({
 				writeFile: async (path: string) => {
@@ -439,13 +460,55 @@ describe("tool calls that find the container stopped", () => {
 			).rejects.toThrow("restored from its last checkpoint");
 			expect(written).toEqual([]);
 			harness.recoveryPromise = null;
+			harness.noteToolCallReported(reportedRestore());
 			await expect(
 				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
 			).resolves.toEqual({ success: true });
 		});
 	});
 
-	it("report once a restore during a build that no call waited on", async () => {
+	it("keep reporting a restore to later calls until a tool result carries it to the model", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000f");
+		await runInDurableObject(agent, async (instance) => {
+			let finishRestore!: () => void;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; restored?: boolean }> | null;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => ({ success: true, content: "restored" }),
+			});
+			harness.recoveryPromise = new Promise((resolve) => {
+				finishRestore = () => resolve({ ready: true, restored: true });
+			});
+			const read = () => harness.toolSandboxOps().readFile("/home/user/site/a.astro");
+
+			// read_files gives up on a file after 5 s, long before a clone and install finish.
+			const abandoned = read().catch((error: Error) => error.message);
+			finishRestore();
+			await abandoned;
+			harness.recoveryPromise = null;
+
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			// A result without the message, such as a timed-out read, does not count.
+			harness.noteToolCallReported({
+				success: true,
+				output: { success: false, error: "timed out" },
+			});
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			harness.noteToolCallReported({
+				success: true,
+				output: { success: false, error: `Could not write a.astro: ${RESTORED}` },
+			});
+			await expect(read()).resolves.toMatchObject({ success: true });
+		});
+	});
+
+	it("report a restore during a build that no call waited on", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000b");
 		await runInDurableObject(agent, async (instance) => {
 			restorableSite(instance, { present: false, installCode: 0 });
@@ -460,6 +523,7 @@ describe("tool calls that find the container stopped", () => {
 			harness.activeBuildConvergences.set("request", {});
 			await harness.recoverSite("localhost:5173");
 			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			harness.noteToolCallReported(reportedRestore());
 			await expect(read()).resolves.toMatchObject({ success: true });
 		});
 	});

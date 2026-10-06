@@ -1594,7 +1594,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
-	/** A restore during a build that none of the model's container calls has reported yet. */
+	/** A restore during a build that no tool result has reported to the model yet. */
 	private restoreUnreported = false;
 	/** An idle-stop check under way, which later asks share. */
 	private stopCheck?: Promise<{ busy: boolean }>;
@@ -2516,16 +2516,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						// A failed one can leave a running container with no site, or part of one.
 						if (!recovered.ready) throw new Error(recovered.error ?? SANDBOX_NOT_RESTORED);
 						// This call's tool may have written before it, as for the call that found the stop.
-						if (recovered.restored) {
-							this.restoreUnreported = false;
-							throw new Error(RESTORED);
-						}
+						if (recovered.restored) this.restoreUnreported = true;
 					}
-					// One no call waited on, such as the preview's Resume, is told to the next call.
-					if (this.restoreUnreported) {
-						this.restoreUnreported = false;
-						throw new Error(RESTORED);
-					}
+					// Every call is told, the preview's Resume's restore included, until a tool
+					// result has carried it to the model: a call that gave up waiting, or a tool
+					// that caught it, would otherwise use it up unheard.
+					if (this.restoreUnreported) throw new Error(RESTORED);
 					try {
 						return await call(target, property, args);
 					} catch (error) {
@@ -2533,12 +2529,30 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						this.sendConsole("The site's container had stopped; restoring it...");
 						const recovered = await this.recoverSite(this.recoveryHostname(), true);
 						if (!recovered.ready) throw error;
-						this.restoreUnreported = false;
+						this.restoreUnreported = true;
 						throw new Error(RESTORED);
 					}
 				};
 			},
 		});
+	}
+
+	/** A finished tool call whose error or result carries the restore message has told the model. */
+	private noteToolCallReported(event: {
+		success: boolean;
+		output?: unknown;
+		error?: unknown;
+	}): void {
+		if (!this.restoreUnreported) return;
+		const text = event.success
+			? JSON.stringify(event.output ?? null)
+			: event.error instanceof Error
+				? event.error.message
+				: String(event.error);
+		// Its first sentence: a tool may cut the rest of a long error.
+		if (text?.includes(RESTORED.slice(0, RESTORED.indexOf(".") + 1))) {
+			this.restoreUnreported = false;
+		}
 	}
 
 	/** Where recovery exposes the preview: the local app host in development. */
@@ -7411,6 +7425,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
 					errors.noteToolCall(event);
+					this.noteToolCallReported(event);
 				},
 				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
 				onAbort: () => {
