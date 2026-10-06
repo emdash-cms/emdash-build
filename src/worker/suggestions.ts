@@ -132,14 +132,19 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+(?:ratings?|reviews?)\b/i,
 ];
 
+/** A photo word, unless a part of the photos follows it: "image captions" edit the photos there. */
+const PHOTOS = String.raw`(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b(?!\s+(?:captions?|credits?|alt|lightbox(?:es)?|grids?|carousels?|sliders?|layouts?|sides?|hover|zoom|overlays?|borders?|sizes?)\b)`;
+
 const ACTION_CAPABILITY_REQUIREMENTS = [
 	{
 		capability: "media_search",
 		// Getting new photos; without a search, the only images left are ones the user already
-		// gave. A preposition before the photo word, or a part of the photos after it, makes it an
-		// edit: "a lightbox to project images", "image captions".
-		pattern:
-			/\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b(?!\s+(?:captions?|credits?|alt|lightbox(?:es)?|grids?|carousels?|sliders?|layouts?|sides?|hover|zoom|overlays?|borders?|sizes?)\b)/i,
+		// gave. A preposition before the photo word makes it an edit, "a lightbox to project
+		// images", unless the photos are new: "a carousel with five new photos".
+		pattern: new RegExp(
+			String.raw`\bunsplash\b|\b(?:find|search|source|add|replace|swap)\s+(?:(?!(?:to|on|for|in|of|with|from|per|across|around|under|over)\b)[\w-]+\s+){0,3}${PHOTOS}|\b(?:new|fresh|additional|extra)\s+(?:[\w-]+\s+){0,2}${PHOTOS}`,
+			"i",
+		),
 	},
 ];
 

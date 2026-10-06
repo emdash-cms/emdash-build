@@ -335,6 +335,17 @@ describe("next-step suggestions", () => {
 				imageEdits.map((label) => suggestion(label)),
 			);
 		}
+		// Unless it asks for new photos to fill it.
+		const newPhotos = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add photo carousel", "Add a carousel with five new landscape photos."),
+					modelSuggestion("Add image slider", "Add a slider of fresh food photos to the menu."),
+					modelSuggestion("Add a photo grid section", "Add a grid of extra travel images."),
+				],
+			},
+		}));
+		expect(await suggestNextSteps({ run: newPhotos }, "Brief", keyless)).toEqual([]);
 	});
 
 	it("gives the model the brief and the latest reply as plain text only", () => {
