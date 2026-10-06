@@ -1595,8 +1595,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
-	/** A restore during a build that no tool result has reported to the model yet. */
-	private restoreUnreported = false;
 	/** An idle-stop check under way, which later asks share. */
 	private stopCheck?: Promise<{ busy: boolean }>;
 	private recoveryReconnectMcp = false;
@@ -1660,6 +1658,23 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			base64: string;
 		}>`SELECT base64 FROM builder_preview_thumbnails WHERE shot_id = ${shotId}`[0];
 		return row ? { base64: row.base64, mediaType: "image/png" } : null;
+	}
+
+	/**
+	 * A restore no tool result has reported to the model yet. Kept in storage:
+	 * the object can be evicted between the restore and the turn that hears it.
+	 */
+	private get restoreUnreported(): boolean {
+		return this.readSecret("restoreUnreported") === "1";
+	}
+
+	private set restoreUnreported(unreported: boolean) {
+		if (unreported) {
+			this.writeSecret("restoreUnreported", "1");
+		} else {
+			this.ensureSecretsTable();
+			this.sql`DELETE FROM builder_secrets WHERE k = 'restoreUnreported'`;
+		}
 	}
 
 	/** A server-only value that is not broadcast with state. */

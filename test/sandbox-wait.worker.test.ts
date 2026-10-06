@@ -1,4 +1,4 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
+import { env, evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuilderAgent, BuilderState } from "../src/worker/agent.js";
 import {
@@ -542,6 +542,26 @@ describe("tool calls that find the container stopped", () => {
 
 			await harness.recoverSite("localhost:5173");
 
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
+	it("keep an unheard restore across the object's eviction", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000011");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			harness.activeBuildConvergences.set("request", {});
+			await harness.recoverSite("localhost:5173");
+		});
+		// The owner reads the preview a while before the next message.
+		await evictDurableObject(agent);
+
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
 			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
 				"restored from its last checkpoint",
 			);
