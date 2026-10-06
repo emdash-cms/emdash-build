@@ -528,6 +528,26 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("report a restore before a build when the last save failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000010");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			// The last turn's changes never reached the checkpoint, and the idle container
+			// was stopped after an hour of failing saves.
+			instance.setState({
+				...instance.state,
+				persistenceError: "The latest session checkpoint could not be saved.",
+			});
+
+			await harness.recoverSite("localhost:5173");
+
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
 	it("never replaces a site whose probe did not answer", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000e");
 		await runInDurableObject(agent, async (instance) => {

@@ -3517,9 +3517,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				);
 				return { ready: false, error: "The saved site snapshot could not be restored." };
 			}
-			// The site is its checkpoint now, whatever happens next: mid-build, what the
-			// model changed since that checkpoint may be gone.
-			if (this.activeBuildConvergences.size > 0) this.restoreUnreported = true;
+			// The site is its checkpoint now, whatever happens next. What the model changed
+			// since may be gone: mid-build, or before a build when the last save failed.
+			if (this.activeBuildConvergences.size > 0 || this.state.persistenceError) {
+				this.restoreUnreported = true;
+			}
 			const installCode = await this.restoreDependencies();
 			if (installCode !== 0) {
 				this.sendConsole(`pnpm install failed during restore (exit ${installCode})`);
