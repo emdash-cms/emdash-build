@@ -1334,7 +1334,9 @@ describe("image uploads", () => {
 				{
 					success: false,
 					// Refused here, the same URL must not reach the site some other way.
-					error: expect.stringMatching(/images the user supplied.*page or an image field/),
+					error: expect.stringMatching(
+						/images the user supplied.*page or an image field.*linked a photo's page, ask them for the image itself/,
+					),
 				},
 			],
 		});
@@ -1370,7 +1372,7 @@ describe("image uploads", () => {
 				{
 					success: false,
 					error: expect.stringMatching(
-						/Search for photos.*page or an image field.*If search fails, design without photography/,
+						/Search for photos.*page or an image field.*linked a photo's page, ask them for the image itself\. If search fails, design without photography/,
 					),
 				},
 			],
