@@ -294,6 +294,59 @@ describe("starting the container", { timeout: 30_000 }, () => {
 	});
 });
 
+describe("a container that stopped under a call", () => {
+	// workerd refuses calls to a container that died while running a command,
+	// but can still report it running for a while.
+	for (const refusal of [
+		"exec() requires a running container.",
+		"exec() cannot be called on a container that is not running.",
+	]) {
+		it(`reads "${refusal}" as stopped, and starts it again though it reads as running`, async () => {
+			const { container, runtime } = await running();
+			const exec = container.exec.bind(container);
+			// workerd refuses synchronously, before any promise.
+			container.exec = () => {
+				throw new Error(refusal);
+			};
+
+			// Callers restore the site on this, as for a container known to be stopped.
+			await expect(runtime.exec("true")).rejects.toThrow(NOT_RUNNING);
+			await expect(runtime.readFile("/home/user/site/package.json")).rejects.toThrow(NOT_RUNNING);
+			expect(container.running).toBe(true);
+
+			container.exec = exec;
+			await expect(runtime.ensureRunning()).resolves.toEqual({ ok: true });
+			expect(container.destroyed).toBe(1);
+			expect(container.starts).toHaveLength(2);
+			await expect(runtime.exec("true")).resolves.toMatchObject({ success: true });
+		});
+	}
+
+	it("reads the refusal on a port request as stopped", async () => {
+		const { container, runtime } = await running();
+		container.getTcpPort = () => {
+			throw new Error("exec() requires a running container.");
+		};
+
+		await expect(runtime.fetchPort(4321, "http://localhost:4321/")).rejects.toThrow(NOT_RUNNING);
+		await expect(runtime.exec("true")).rejects.toThrow(NOT_RUNNING);
+	});
+
+	it("waits out a new container that refuses calls for a moment after it starts", async () => {
+		const { container, runtime } = setup();
+		const exec = container.exec.bind(container);
+		let refusals = 3;
+		container.exec = (...args: Parameters<typeof exec>) => {
+			if (refusals-- > 0) throw new Error("exec() requires a running container.");
+			return exec(...args);
+		};
+
+		await expect(runtime.ensureRunning()).resolves.toEqual({ ok: true });
+		expect(container.starts).toHaveLength(1);
+		await expect(runtime.exec("true")).resolves.toMatchObject({ success: true });
+	});
+});
+
 describe("a container that stops answering", { timeout: 30_000 }, () => {
 	// Local workerd's habit with a container that died unnoticed: it reads as
 	// running, and calls to it never return.

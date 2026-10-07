@@ -229,6 +229,13 @@ function isPlatformCapacityError(error: unknown): boolean {
 	);
 }
 
+/** workerd refusing a call to a container it no longer runs, which `running` can lag behind. */
+function isStoppedContainer(error: unknown): boolean {
+	return /requires a running container|cannot be called on a container that is not running/i.test(
+		error instanceof Error ? error.message : String(error),
+	);
+}
+
 function isNotListening(error: unknown): boolean {
 	return /not listening/i.test(error instanceof Error ? error.message : String(error));
 }
@@ -265,6 +272,12 @@ export class SandboxRuntime implements ContainerOps {
 	private answering = false;
 	/** How long a container that has not answered yet may still be starting: a start's deadline. */
 	private startingUntil?: number;
+	/**
+	 * workerd refused a call as to a stopped container. A container that died
+	 * under a command can still read as running for a while, so it is not
+	 * believed until the container starts again.
+	 */
+	private stopped = false;
 
 	constructor(private readonly deps: SandboxRuntimeDeps) {}
 
@@ -290,13 +303,21 @@ export class SandboxRuntime implements ContainerOps {
 			this.answering = true;
 			return settled.value;
 		}
-		if (settled.status === "rejected") throw settled.reason;
+		if (settled.status === "rejected") throw this.notRunningIfStopped(settled.reason);
 		throw new Error(CONTAINER_NOT_ANSWERING);
+	}
+
+	/** A refusal as to a stopped container is NOT_RUNNING, and `running` is not believed until a start. */
+	private notRunningIfStopped(error: unknown): unknown {
+		if (!isStoppedContainer(error)) return error;
+		this.stopped = true;
+		return new Error(NOT_RUNNING);
 	}
 
 	/** Start a process in the container; one that starts after its caller gave up is stopped. */
 	private async spawn(argv: string[], options: ContainerExecOptions): Promise<ExecProcess> {
-		const spawned = this.container.exec(argv, options);
+		// workerd refuses a stopped container synchronously; as a rejection, answered() reads it.
+		const spawned = (async () => this.container.exec(argv, options))();
 		try {
 			return await this.answered(spawned);
 		} catch (error) {
@@ -310,7 +331,7 @@ export class SandboxRuntime implements ContainerOps {
 
 	private requireRunning(): ContainerLike {
 		// A container being stopped is as good as stopped: callers restore the site.
-		if (!this.container.running || this.stopping) throw new Error(NOT_RUNNING);
+		if (!this.container.running || this.stopping || this.stopped) throw new Error(NOT_RUNNING);
 		return this.container;
 	}
 
@@ -322,7 +343,7 @@ export class SandboxRuntime implements ContainerOps {
 	ensureRunning(): Promise<SandboxStart> {
 		// `running` is true as soon as start() returns, before the container is ready.
 		if (this.starting) return this.starting;
-		if (this.container.running) return Promise.resolve({ ok: true });
+		if (this.container.running && !this.stopped) return Promise.resolve({ ok: true });
 		this.starting = this.start().finally(() => {
 			this.starting = undefined;
 		});
@@ -358,17 +379,30 @@ export class SandboxRuntime implements ContainerOps {
 		this.answering = false;
 		this.startingUntil = Date.now() + (this.deps.readyTimeoutMs ?? READY_TIMEOUT_MS);
 		try {
+			// One that stopped under a call may still read as running, which start() refuses.
+			if (this.stopped && container.running) {
+				await this.answered(container.destroy()).catch(() => undefined);
+			}
+			this.stopped = false;
 			container.start(this.deps.startOptions());
 			// exec waits for a starting container. Process directories restored from a
 			// snapshot belong to processes that are gone.
 			const root = this.deps.processRoot ?? PROCESS_ROOT;
 			// The deadline covers the wait for the container to start, which exec does first.
 			const ready = (async () => {
-				const probe = await container.exec(["bash", "-c", `rm -rf ${shellQuote(root)}`], {
-					user: SANDBOX_USER,
-					env: { ...BASE_ENV },
-				});
-				return probe.exitCode;
+				for (;;) {
+					try {
+						const probe = await container.exec(["bash", "-c", `rm -rf ${shellQuote(root)}`], {
+							user: SANDBOX_USER,
+							env: { ...BASE_ENV },
+						});
+						return probe.exitCode;
+					} catch (error) {
+						// One that replaces a container that just died can refuse calls for a moment.
+						if (!isStoppedContainer(error) || Date.now() > this.startingUntil!) throw error;
+						await sleep(250);
+					}
+				}
 			})();
 			const settled = await settleWithin(ready, this.deps.readyTimeoutMs ?? READY_TIMEOUT_MS);
 			if (settled.status !== "fulfilled") {
@@ -631,7 +665,7 @@ export class SandboxRuntime implements ContainerOps {
 				.getTcpPort(port)
 				.fetch(new Request(url.replace(/^https:/, "http:"), init));
 		} catch (error) {
-			if (!isNotListening(error)) throw error;
+			if (!isNotListening(error)) throw this.notRunningIfStopped(error);
 			return new Response(`Nothing is listening on port ${port}.`, {
 				status: 503,
 				headers: { "Cache-Control": "no-store" },
