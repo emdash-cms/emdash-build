@@ -1068,7 +1068,7 @@ const collectionPlanSchema = z.object({
 				pattern
 					.split("/")
 					.every((segment) => (segment.match(/\{(?:slug|id)\}/g) ?? []).length <= 1),
-			"Use at most one placeholder per path segment, e.g. /journal/{slug}, not /journal/{slug}-{id}",
+			"Use at most one placeholder per path segment, e.g. /journal/{slug}, not /journal/{slug}-{id}. To keep an existing collection's URLs, leave urlPattern out",
 		)
 		.optional()
 		.describe(

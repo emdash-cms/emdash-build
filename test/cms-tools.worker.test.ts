@@ -933,7 +933,12 @@ describe("apply_schema_plan", () => {
 
 			// EmDash only fills in {slug} and {id}; anything else makes dead links.
 			const input = schemaTool() as unknown as {
-				inputSchema: { safeParse: (value: unknown) => { success: boolean } };
+				inputSchema: {
+					safeParse: (value: unknown) => {
+						success: boolean;
+						error?: { issues: Array<{ message: string }> };
+					};
+				};
 			};
 			const withPattern = (urlPattern: string) => ({
 				collections: [{ ...plan.collections[1]!, urlPattern }],
@@ -946,7 +951,10 @@ describe("apply_schema_plan", () => {
 			// Without a placeholder every entry would link to the same page.
 			expect(input.inputSchema.safeParse(withPattern("/journal")).success).toBe(false);
 			// EmDash 1.1 refuses two placeholders in one segment, after the collection exists.
-			expect(input.inputSchema.safeParse(withPattern("/journal/{slug}-{id}")).success).toBe(false);
+			const twoInOneSegment = input.inputSchema.safeParse(withPattern("/journal/{slug}-{id}"));
+			expect(twoInOneSegment.success).toBe(false);
+			// A site made before EmDash 1.1 keeps such URLs by leaving the pattern out.
+			expect(twoInOneSegment.error?.issues[0]?.message).toContain("leave urlPattern out");
 			expect(input.inputSchema.safeParse(withPattern("/journal/{id}/{slug}")).success).toBe(true);
 			const withCollection = (change: Record<string, unknown>) => ({
 				collections: [{ ...plan.collections[1]!, ...change }],
