@@ -11,6 +11,7 @@ const GUESSED_IMAGE_DOMAINS = [
 	"pexels.com",
 	"pixabay.com",
 	"picsum.photos",
+	"unsplash.it",
 	"loremflickr.com",
 	"pravatar.cc",
 	"randomuser.me",

@@ -34,6 +34,8 @@ describe("image sources", () => {
 		// A random photo for any subject, a download link for a remembered id, a grey box.
 		expect(sources.allows("https://picsum.photos/seed/iceland/1200/800")).toBe(false);
 		expect(sources.allows("https://loremflickr.com/1200/800/iceland")).toBe(false);
+		// Picsum under its old name, which still redirects to a random photo.
+		expect(sources.allows("https://unsplash.it/1200/800?image=1015")).toBe(false);
 		expect(sources.allows("https://unsplash.com/photos/abc123/download")).toBe(false);
 		expect(sources.allows("https://placehold.co/600x400")).toBe(false);
 		expect(sources.allows("https://IMAGES.unsplash.com.:443/photo-x")).toBe(false);
