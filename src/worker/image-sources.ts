@@ -20,6 +20,16 @@ const GUESSED_IMAGE_DOMAINS = [
 	"dummyimage.com",
 ];
 
+/**
+ * The stock sites themselves, unlike their image hosts, serve web pages: a
+ * photo's page, which a user copies from the address bar, a collection, a
+ * profile. Of their addresses, only download links lead to an image:
+ * unsplash.com/photos/<id>/download, pexels.com/photo/<id>/download/,
+ * pixabay.com/images/download/<file>, pixabay.com/get/<file>.
+ */
+const STOCK_SITES = ["unsplash.com", "pexels.com", "pixabay.com"];
+const DOWNLOAD_PATH = /\/download(?:\/|$)|^\/get\//;
+
 /** Photos on those hosts a turn may upload: ones a photo search returned or the user wrote. */
 export class ImageSources {
 	private readonly searched = new Set<string>();
@@ -34,14 +44,33 @@ export class ImageSources {
 		if (photo) this.searched.add(photo);
 	}
 
+	/** A stock site's web page the user linked, which uploads as HTML: only they can give its image. */
+	isLinkedStockPage(url: string): boolean {
+		const parsed = absoluteUrl(url);
+		const page = parsed && stockPage(parsed) ? stockPhoto(parsed) : undefined;
+		return page !== undefined && this.userTexts.some((text) => text.includes(page));
+	}
+
 	allows(url: string): boolean {
-		// Without its scheme, an address is checked as the https one a repair would try.
-		// One that still does not parse is left to the fetch, whose error says what is wrong.
-		const parsed = parsedUrl(url) ?? parsedUrl(`https://${url}`);
+		const parsed = absoluteUrl(url);
+		if (parsed && stockPage(parsed)) return false;
 		const photo = parsed && stockPhoto(parsed);
 		if (!photo) return true;
 		return this.searched.has(photo) || this.userTexts.some((text) => text.includes(photo));
 	}
+}
+
+/**
+ * Without its scheme, an address is checked as the https one a repair would try.
+ * One that still does not parse is left to the fetch, whose error says what is wrong.
+ */
+function absoluteUrl(url: string): URL | undefined {
+	return parsedUrl(url) ?? parsedUrl(`https://${url}`);
+}
+
+function stockPage({ hostname, pathname }: URL): boolean {
+	const site = hostname.replace(/\.$/, "").replace(/^www\./, "");
+	return STOCK_SITES.includes(site) && !DOWNLOAD_PATH.test(pathname);
 }
 
 function parsedUrl(url: string): URL | undefined {

@@ -1205,6 +1205,10 @@ export function createMediaTools(options: {
 	const unsourcedImage = options.unsplashAccessKey
 		? "Not a photo search_unsplash returned or the user gave. Search for photos instead of writing photo URLs from memory, and do not put this URL in a page or an image field instead: remembered and random-photo URLs show the wrong subject or no longer exist. If the user linked a photo's page, ask them for the image itself. If search fails, design without photography."
 		: "Not an image the user gave. There is no photo search in this session, so use images the user supplied, or design without photography; never write a photo URL from memory, and do not put this URL in a page or an image field instead. If the user linked a photo's page, ask them for the image itself.";
+	const stockPage =
+		"This is a stock photo's web page, not the image, and cannot be uploaded. The user chose this photo: ask them for the image itself rather than using another.";
+	const refusal = (url: string) =>
+		options.imageSources.isLinkedStockPage(url) ? stockPage : unsourcedImage;
 	const tools = {
 		search_unsplash: tool({
 			description:
@@ -1299,7 +1303,7 @@ export function createMediaTools(options: {
 						results: images.map((img) => ({
 							url: img.url,
 							success: false as const,
-							error: unsourcedImage,
+							error: refusal(img.url),
 						})),
 					};
 				}
@@ -1317,7 +1321,7 @@ export function createMediaTools(options: {
 									return { url: img.url, success: false as const, error: "Upload stopped." };
 								}
 								if (!options.imageSources.allows(img.url)) {
-									return { url: img.url, success: false as const, error: unsourcedImage };
+									return { url: img.url, success: false as const, error: refusal(img.url) };
 								}
 								const result = await uploadOneMedia(
 									img.url,

@@ -1345,6 +1345,39 @@ describe("image uploads", () => {
 		expect(convergence.hasUnresolvedFailures()).toBe(false);
 	});
 
+	it("refuses a stock photo's page the user linked, asking for the image, so no repair is forced", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const page = "https://unsplash.com/photos/green-trees-abc123XYZ01";
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			unsplashAccessKey: "unsplash-key",
+			imageSources: new ImageSources([`Use this photo: ${page}`]),
+		});
+
+		const remembered = "https://www.pexels.com/photo/glacier-lagoon-2387873/";
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: page }, { url: remembered }] }),
+		).resolves.toMatchObject({
+			success: false,
+			results: [
+				{
+					success: false,
+					// Not "search instead": the user chose this photo.
+					error: expect.stringMatching(/web page.*not the image.*ask them for the image itself/),
+				},
+				// A page the user never linked is a guess like any remembered photo.
+				{ success: false, error: expect.stringMatching(/^Not a photo search_unsplash returned/) },
+			],
+		});
+		expect(fetchMock).not.toHaveBeenCalled();
+		// Uploading the page would fail on its HTML, and only the user can give the image.
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
 	it("accepts a photo this turn's search returned, at any size", async () => {
 		serveImages(["https://images.unsplash.com/photo-found?ixid=abc"]);
 		const tools = createTools({} as never, toolCallbacks() as never, {

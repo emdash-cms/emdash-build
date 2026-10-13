@@ -27,6 +27,26 @@ describe("image sources", () => {
 		expect(sources.allows("images.unsplash.com/photo-found")).toBe(true);
 	});
 
+	it("refuses a stock site's pages, even ones the user linked: they are not images", () => {
+		const pages = [
+			"https://unsplash.com/photos/green-trees-abc123XYZ01",
+			"https://www.pexels.com/photo/coast-123456/",
+			"https://pixabay.com/illustrations/tree-736885/",
+			"https://unsplash.com/ja/%E5%86%99%E7%9C%9F/fjord-abc123XYZ01",
+			"https://unsplash.com/collections/123/iceland",
+		];
+		const downloads = [
+			"https://unsplash.com/photos/abc123XYZ01/download",
+			"https://www.pexels.com/photo/123456/download/",
+			"https://pixabay.com/images/download/fjord-789_1920.jpg",
+		];
+		const sources = new ImageSources([[...pages, ...downloads].join(" ")]);
+
+		for (const page of pages) expect(sources.allows(page)).toBe(false);
+		// A download link the user gave leads to the image.
+		for (const download of downloads) expect(sources.allows(download)).toBe(true);
+	});
+
 	it("checks only hosts whose image URLs the model writes unseen", () => {
 		const sources = new ImageSources();
 
