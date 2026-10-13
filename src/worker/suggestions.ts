@@ -132,8 +132,11 @@ const ALWAYS_UNSUPPORTED_ACTIONS = [
 	/\btestimonials?\b|\b(?:customer|client|guest|patient|user)\s+reviews?\b|\bstar\s+(?:ratings?|reviews?)\b/i,
 ];
 
-/** A photo word, unless a part of the photos follows it: "image captions" edit the photos there. */
-const PHOTOS = String.raw`(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b(?!\s+(?:captions?|credits?|alt|lightbox(?:es)?|grids?|carousels?|sliders?|layouts?|sides?|hover|zoom|overlays?|borders?|sizes?)\b)`;
+/**
+ * A photo word, unless what follows makes it a part of the photos, as "image captions" edit
+ * the photos there, or something about photos, such as "photography pricing" or a "Photos link".
+ */
+const PHOTOS = String.raw`(?:photos?|images?|pictures?|portraits?|headshots?|photography|imagery)\b(?!\s+(?:captions?|credits?|alt|lightbox(?:es)?|grids?|carousels?|sliders?|layouts?|sides?|hover|zoom|overlays?|borders?|sizes?|links?|categor(?:y|ies)|services?|sessions?|tips?|pricing|packages?|faqs?)\b)`;
 
 const ACTION_CAPABILITY_REQUIREMENTS = [
 	{

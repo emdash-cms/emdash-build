@@ -348,6 +348,27 @@ describe("next-step suggestions", () => {
 		expect(await suggestNextSteps({ run: newPhotos }, "Brief", keyless)).toEqual([]);
 	});
 
+	it("keeps pills about photography that need no new photos", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		for (const labels of [
+			["Add a Photos link to the nav", "Add photo categories", "Add photography services"],
+			["Add a portrait sessions page", "Add a photography tips post", "Add photography pricing"],
+			["Add wedding photography packages", "Add a photography FAQ page"],
+		]) {
+			expect(await suggestNextSteps({ run: reply(labels) }, "Brief", keyless)).toEqual(
+				labels.map((label) => suggestion(label)),
+			);
+		}
+	});
+
 	it("gives the model the brief and the latest reply as plain text only", () => {
 		const messages = [
 			{ role: "user", parts: [{ type: "text", text: "A food blog called Salt & Smoke" }] },
