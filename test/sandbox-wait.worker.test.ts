@@ -169,6 +169,48 @@ describe("waiting for a sandbox slot", () => {
 		});
 	});
 
+	it("lets Stop from a tab that did not send the follow-up end it", async () => {
+		const id = "99999999-9999-4999-8999-0000000000a7";
+		const guestKey = "stop-guest";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(guestKey);
+		await testEnv.ProjectCatalog.getByName(guestKey).registerProject(
+			guestKey,
+			{ id, title: "Stop", status: "draft" as const, updatedAt: 1 },
+			10,
+		);
+		await runInDurableObject(agent, async (instance) => {
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			// The saved site's recovery waits for a slot until the turn is stopped.
+			Object.assign(instance, {
+				provisionSite: (_hostname: string, signal: AbortSignal) =>
+					new Promise((resolve) =>
+						signal.addEventListener("abort", () => resolve({ ready: false, stopped: true })),
+					),
+			});
+			instance.setState({ ...instance.state, siteReady: true });
+			instance.messages = [
+				{ id: "next", role: "user", parts: [{ type: "text", text: "Add an events page" }] },
+			];
+			// The chat SDK aborts the turn's signal for its request id.
+			const controller = new AbortController();
+			Object.assign(instance, {
+				abortRequest: (requestId: string) => {
+					if (requestId === "follow-up") controller.abort();
+				},
+			});
+			const turn = instance.onChatMessage(async () => {}, {
+				requestId: "follow-up",
+				abortSignal: controller.signal,
+			});
+
+			// A reloaded or second tab has no request of its own to cancel before asking.
+			await expect(within(instance.stopGeneration())).resolves.toBe(true);
+			await expect(within(turn)).resolves.toBeInstanceOf(Response);
+		});
+	});
+
 	it("tells the owner when a follow-up stopped waiting for a slot", async () => {
 		const id = "99999999-9999-4999-8999-000000000005";
 		const guestKey = "slot-guest";

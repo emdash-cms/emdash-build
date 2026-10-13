@@ -1481,6 +1481,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private buildStarted = false;
 	private activeInitialRequestId?: string;
 	private activeInitialUserMessageId?: string;
+	/** The running chat turn's request, which Stop cancels from any tab. */
+	private activeTurnRequestId?: string;
 	private activeBuildConvergences = new Map<string, BuildConvergence>();
 	private stopPromise: Promise<void> | null = null;
 	/** Set by restartInterruptedTurn for the one turn it enqueues. */
@@ -1587,6 +1589,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	async stopGeneration(generationId?: string): Promise<boolean> {
+		// A tab that did not send the running turn's request, after a reload or on
+		// another device, has none to cancel, so the turn is stopped here.
+		if (this.activeTurnRequestId) this.abortRequest(this.activeTurnRequestId);
 		await this.requestStop(generationId);
 		return true;
 	}
@@ -7055,6 +7060,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this
 				.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
 			this.beginOwnerActivity(`chat:${options.requestId}`, "chat");
+			this.activeTurnRequestId = options.requestId;
 		}
 		try {
 			await this.registerProjectForCurrentOwner();
@@ -7615,6 +7621,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	protected override async onChatResponse(result: ChatResponseResult) {
+		if (result.requestId === this.activeTurnRequestId) this.activeTurnRequestId = undefined;
 		if (result.requestId === this.activeInitialRequestId) {
 			if (result.status === "aborted") {
 				await this.requestStop(this.state.initialGeneration?.id);
