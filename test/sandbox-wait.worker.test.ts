@@ -120,6 +120,34 @@ describe("waiting for a sandbox slot", () => {
 			expect(harness.state.sandboxWait).toBeUndefined();
 		});
 	});
+
+	it("lets Stop end a follow-up whose site waits for a slot", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				doRecoverSite: (hostname: string) => Promise<{ ready: boolean }>;
+				provisionSite: (hostname: string, signal?: AbortSignal) => Promise<unknown>;
+				activeProvisionPromise: Promise<unknown> | null;
+			};
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			// The saved site's recovery is queued behind sites holding every slot.
+			let finishRecovery!: (result: { ready: boolean }) => void;
+			harness.doRecoverSite = () => new Promise((resolve) => (finishRecovery = resolve));
+			instance.setState({ ...instance.state, siteReady: true });
+			const controller = new AbortController();
+			const provision = harness.provisionSite("build.example.test", controller.signal);
+			harness.activeProvisionPromise = provision;
+
+			// The client's Stop cancels the turn's request, then asks the agent to stop.
+			controller.abort();
+			const stopped = instance.stopGeneration();
+
+			await expect(within(provision)).resolves.toEqual({ ready: false, stopped: true });
+			await expect(within(stopped)).resolves.toBe(true);
+			finishRecovery({ ready: true });
+		});
+	});
 });
 
 describe("stopping an idle container", () => {

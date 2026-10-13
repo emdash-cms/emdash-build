@@ -641,6 +641,26 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+/** `promise`'s value, or undefined as soon as `signal` aborts; the work itself goes on. */
+function unlessAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+	if (!signal) return promise;
+	return new Promise((resolve, reject) => {
+		const onAbort = () => resolve(undefined);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
+}
+
 /** True for hosts that resolve to the local machine (dev servers). */
 function isLocalHostname(host: string): boolean {
 	const h = host.split(":")[0] ?? "";
@@ -4763,8 +4783,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async provisionSite(hostname: string, signal?: AbortSignal): Promise<ProvisionResult> {
 		if (signal?.aborted) return { ready: false, stopped: true };
 		if (this.state.siteReady) {
-			const recovered = await this.recoverSite(hostname);
-			if (signal?.aborted) return { ready: false, stopped: true };
+			// Recovery can wait minutes for a slot, and the preview's restore may share
+			// it: a stopped turn leaves it running for them and returns at once.
+			const recovered = await unlessAborted(this.recoverSite(hostname), signal);
+			if (!recovered || signal?.aborted) return { ready: false, stopped: true };
 			if (recovered.ready) return recovered;
 			const error = recovered.error ?? "The saved site could not be restored.";
 			this.sendConsole(`Recovery stopped without replacing the site: ${error}`);
