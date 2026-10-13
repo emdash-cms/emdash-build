@@ -299,6 +299,43 @@ describe("builder state", () => {
 		});
 	});
 
+	it("resets an evicted instance's progress when the Sandbox's idle stop calls first", async () => {
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000023");
+		const states = await runInDurableObject(agent, async (instance) => {
+			const internals = instance as unknown as {
+				stateWrittenHere: boolean;
+				backupSite(): Promise<string | undefined>;
+			};
+			// A save that fails writes the failure to state.
+			internals.backupSite = async () => {
+				instance.setState({ ...instance.state, persistenceError: "Session backup failed." });
+				return "Session backup failed.";
+			};
+			const leftByEviction = () => {
+				instance.setState({
+					...instance.state,
+					siteReady: true,
+					status: "Restoring preview...",
+					previewRestarting: true,
+				});
+				// A new instance, called by plain RPC, which skips onStart.
+				internals.stateWrittenHere = false;
+			};
+
+			leftByEviction();
+			await instance.prepareSandboxStop(0);
+			const asked = { ...instance.state };
+			leftByEviction();
+			await instance.markSandboxStopped();
+			return [asked, instance.state];
+		});
+
+		// Else deletion, claims and publishing stay busy until the project is opened again.
+		for (const state of states) {
+			expect(state).toMatchObject({ status: "", previewRestarting: false });
+		}
+	});
+
 	it("reports when the site's brief was first saved as its creation time", async () => {
 		const guestKey = "created-at-guest";
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000012");

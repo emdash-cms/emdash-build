@@ -1430,6 +1430,19 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private lastBuildReportAt = 0;
 	private buildActivityChain: Promise<void> = Promise.resolve();
 
+	/** Before this instance writes state, its progress describes work an evicted instance ran. */
+	private resetProgressLeftByEviction(): void {
+		if (this.stateWrittenHere || !this.hasProgressInState()) return;
+		// A recovered turn marks itself active again when it resumes.
+		this.setState({
+			...this.state,
+			status: "",
+			previewRestarting: false,
+			turnActive: false,
+			...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
+		});
+	}
+
 	private hasProgressInState(): boolean {
 		return Boolean(
 			this.state.status ||
@@ -3655,6 +3668,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * container after an hour: an idle container must not run forever.
 	 */
 	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
+		// The Sandbox calls by plain RPC, which skips onStart, and may write state first.
+		this.resetProgressLeftByEviction();
 		// One check at a time: an alarm that stopped waiting asks again while the save runs.
 		this.stopCheck ??= this.checkSandboxStop(idleForMs).finally(() => {
 			this.stopCheck = undefined;
@@ -3682,6 +3697,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
 	async markSandboxStopped(): Promise<void> {
+		this.resetProgressLeftByEviction();
 		// A finished provision no longer means a warm container: the next turn must recover.
 		if (this.provisionPromise && this.provisionPromise === this.settledProvision) {
 			this.provisionPromise = null;
@@ -7534,16 +7550,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	override async onStart(): Promise<void> {
-		if (!this.stateWrittenHere && this.hasProgressInState()) {
-			// A recovered turn marks itself active again when it resumes.
-			this.setState({
-				...this.state,
-				status: "",
-				previewRestarting: false,
-				turnActive: false,
-				...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
-			});
-		}
+		this.resetProgressLeftByEviction();
 		if (this.state.initialGeneration?.status === "stopping") {
 			this.setInitialGenerationStatus("stopped", this.state.initialGeneration.terminalMessageId);
 		}
