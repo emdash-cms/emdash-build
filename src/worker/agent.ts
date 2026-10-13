@@ -663,6 +663,13 @@ function unlessAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T 
 	});
 }
 
+/** `promise`, or its abort reason as soon as `signal` aborts; the work itself goes on. */
+async function abortableWait<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	const value = await unlessAborted(promise, signal);
+	signal?.throwIfAborted();
+	return value as T;
+}
+
 /** True for hosts that resolve to the local machine (dev servers). */
 function isLocalHostname(host: string): boolean {
 	const h = host.split(":")[0] ?? "";
@@ -2552,7 +2559,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * had not finished, may be gone, and a read would not show it. Recovery
 	 * itself uses `sandboxOps`.
 	 */
-	private toolSandboxOps(): SandboxOps {
+	private toolSandboxOps(signal?: AbortSignal): SandboxOps {
 		const sandbox = this.sandboxOps();
 		// Methods are called as properties of the stub: an RPC stub answers every
 		// property, apply and call included, with a remote method.
@@ -2570,7 +2577,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					// Another call's restore may still be cloning onto the new container's empty disk.
 					const restore = this.recoveryPromise;
 					if (restore) {
-						const recovered = await restore.catch((): SiteRecoveryResult => ({ ready: false }));
+						// A restore can wait minutes for a slot: a stopped turn's call goes on without it.
+						const recovered = await abortableWait(
+							restore.catch((): SiteRecoveryResult => ({ ready: false })),
+							signal,
+						);
 						// A failed one can leave a running container with no site, or part of one.
 						if (!recovered.ready) throw new Error(recovered.error ?? SANDBOX_NOT_RESTORED);
 						// This call's tool may have written before it, as for the call that found the stop.
@@ -2585,7 +2596,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					} catch (error) {
 						if (!isSandboxNotRunning(error)) throw error;
 						this.sendConsole("The site's container had stopped; restoring it...");
-						const recovered = await this.recoverSite(this.recoveryHostname(), true);
+						const recovered = await abortableWait(
+							this.recoverSite(this.recoveryHostname(), true),
+							signal,
+						);
 						if (!recovered.ready) throw error;
 						// The site was still there: the refused call ran nothing, and nothing is lost.
 						if (!recovered.restored) return await call(target, property, args);
@@ -2627,12 +2641,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?: AbortSignal,
 	): Promise<T> {
 		try {
-			return await operation(this.toolSandboxOps());
+			return await operation(this.toolSandboxOps(signal));
 		} catch (error) {
 			if (!isRetryableObjectError(error)) throw error;
 			await new Promise((resolve) => setTimeout(resolve, 750));
 			signal?.throwIfAborted();
-			return operation(this.toolSandboxOps());
+			return operation(this.toolSandboxOps(signal));
 		}
 	}
 
@@ -3392,6 +3406,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private async restartDevServer(
 		metrics?: TurnMetrics,
+		signal?: AbortSignal,
 	): Promise<{ success: boolean; error?: string }> {
 		this.sendStatus("Restarting dev server...");
 		this.sendConsole("$ restart dev server");
@@ -3408,7 +3423,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this.sendConsole(`Warning: dev server restart lost its transport: ${message}`);
 			this.devServerProcessId = undefined;
 			try {
-				const recovered = await this.recoverSite(this.recoveryHostname(), true);
+				const recovered = await abortableWait(
+					this.recoverSite(this.recoveryHostname(), true),
+					signal,
+				);
 				if (recovered.ready) {
 					this.setState({
 						...this.state,
@@ -3502,6 +3520,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async doRecoverSite(hostname: string): Promise<SiteRecoveryResult> {
+		// A build under way when the container stopped may be stopped while this waits.
+		const duringBuild = this.activeBuildConvergences.size > 0;
 		const started = await this.waitForSandbox();
 		if (!started.ok) return { ready: false, error: started.error };
 		let sandbox = this.sandboxOps();
@@ -3585,7 +3605,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			// The site is its checkpoint now, whatever happens next. What the model changed
 			// since may be gone: mid-build, or before a build when the last save failed.
-			if (this.activeBuildConvergences.size > 0 || this.state.persistenceError) {
+			if (duringBuild || this.activeBuildConvergences.size > 0 || this.state.persistenceError) {
 				this.restoreUnreported = true;
 			}
 			for (const convergence of this.activeBuildConvergences.values()) {
@@ -5034,7 +5054,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			} catch (err) {
 				abortSignal?.throwIfAborted();
 				if (attempt < MAX_ATTEMPTS - 1) {
-					await this.waitForDevServer(abortSignal, this.toolSandboxOps());
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps(abortSignal));
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
@@ -5044,7 +5064,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (mcpResult?.isError) {
 				const text = mcpResultText(result) || `${name} failed`;
 				if (attempt < MAX_ATTEMPTS - 1 && isTransientDevServerError(text)) {
-					await this.waitForDevServer(abortSignal, this.toolSandboxOps());
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps(abortSignal));
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
@@ -7336,7 +7356,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const convergence = new BuildConvergence(buildAbortSignal);
 			if (options?.requestId) this.activeBuildConvergences.set(options.requestId, convergence);
 			const sandboxTools = createTools(
-				() => this.toolSandboxOps(),
+				() => this.toolSandboxOps(buildAbortSignal),
 				{
 					reloadPreview: () =>
 						timeSync(metrics, "previewRefresh", () =>
@@ -7345,7 +7365,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					checkpointSite: async () => {
 						await timeSync(metrics, "backup", () => this.checkpointSite());
 					},
-					restartDevServer: () => this.restartDevServer(metrics),
+					restartDevServer: () => this.restartDevServer(metrics, buildAbortSignal),
 					getRecentRenderErrors: () =>
 						[
 							...new Set(

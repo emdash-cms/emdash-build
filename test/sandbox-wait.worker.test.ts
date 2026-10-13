@@ -799,6 +799,59 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("let Stop end a call that waits on a restore queued for a slot", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a8");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				recoveryPromise: Promise<unknown> | null;
+				toolSandboxOps: (signal?: AbortSignal) => {
+					readFile: (path: string) => Promise<unknown>;
+				};
+			};
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			harness.sandboxOps = () => ({ readFile: async () => Promise.reject(new Error(NOT_RUNNING)) });
+			// Every slot is taken, so the restore waits in the queue.
+			harness.recoverSite = () => new Promise(() => {});
+
+			const ownStop = new AbortController();
+			const finding = harness.toolSandboxOps(ownStop.signal).readFile("/home/user/site/a.astro");
+			ownStop.abort();
+			await expect(within(finding)).rejects.toThrow();
+
+			harness.recoveryPromise = new Promise(() => {});
+			const waiterStop = new AbortController();
+			const waiting = harness.toolSandboxOps(waiterStop.signal).readFile("/home/user/site/b.astro");
+			waiterStop.abort();
+			// Stop waits for the turn's calls, so a call parked here would hold it.
+			await expect(within(waiting)).rejects.toThrow();
+		});
+	});
+
+	it("report a restore to the next turn though the call that waited on it was stopped", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000aa");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness & { restoreUnreported: boolean };
+			harness.activeBuildConvergences.set("stopped-turn", new BuildConvergence());
+			// Stop ends the turn while its call waits for a slot for the restore.
+			Object.assign(instance, {
+				waitForSandbox: async () => {
+					harness.activeBuildConvergences.clear();
+					return { ok: true };
+				},
+			});
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
+				restored: true,
+			});
+			// What the stopped turn changed since its last checkpoint is gone.
+			expect(harness.restoreUnreported).toBe(true);
+		});
+	});
+
 	it("end a CMS call at its first failed recovery instead of starting one per probe", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a6");
 		await runInDurableObject(agent, async (instance) => {
