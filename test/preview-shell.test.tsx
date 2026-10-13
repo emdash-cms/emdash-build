@@ -240,6 +240,25 @@ describe("preview shell", () => {
 		expect(screen.getByRole("status").textContent).toContain("Preview paused");
 	});
 
+	it("signs in to Admin on resume when Admin was first opened while paused", async () => {
+		const user = userEvent.setup();
+		const url = "https://4321-project-token.example.test/";
+		const liveUrl = "https://site.example.test/";
+		const { rerender } = render(
+			<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />,
+		);
+		await user.click(screen.getByRole("button", { name: "live" }));
+		// The live site needs no editor, so Admin can be chosen while the editor is paused.
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete paused />);
+		await user.click(screen.getByRole("tab", { name: "Admin" }));
+
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />);
+		// The cross-origin frame has no editor session yet, so Admin alone shows a login.
+		expect((screen.getByTitle("Admin") as HTMLIFrameElement).src).toBe(
+			`${url}_emdash/api/auth/dev-bypass?redirect=/_emdash/admin`,
+		);
+	});
+
 	it("keeps the saved preview visible while its editor wakes", async () => {
 		const user = userEvent.setup();
 		const url = "https://4321-project-token.example.test/";

@@ -227,17 +227,21 @@ export function PreviewPanel({
 	const pausedFrameRef = useRef(pausedFrame);
 	pausedFrameRef.current = pausedFrame;
 	const unloadedForPause = useRef(false);
+	/** A target first opened while paused: its first load, which signs in to Admin, waits. */
+	const pendingFirstLoad = useRef<string | undefined>(undefined);
 	useEffect(() => {
 		if (!frameKey || !frameBase) return;
-		if (pausedFrameRef.current) {
-			unloadedForPause.current = true;
-			return;
-		}
-		loadFrame(
+		const firstLoad =
 			tab === "preview"
 				? new URL(sitePathRef.current, frameBase).href
-				: `${url}_emdash/api/auth/dev-bypass?redirect=/_emdash/admin`,
-		);
+				: `${url}_emdash/api/auth/dev-bypass?redirect=/_emdash/admin`;
+		if (pausedFrameRef.current) {
+			unloadedForPause.current = true;
+			pendingFirstLoad.current = firstLoad;
+			return;
+		}
+		pendingFirstLoad.current = undefined;
+		loadFrame(firstLoad);
 		// Only a frame target change (tab, draft/live, project) reloads here.
 	}, [frameKey]);
 
@@ -252,7 +256,9 @@ export function PreviewPanel({
 		}
 		if (!unloadedForPause.current) return;
 		unloadedForPause.current = false;
-		if (currentHrefRef.current) loadFrame(currentHrefRef.current);
+		const href = pendingFirstLoad.current ?? currentHrefRef.current;
+		pendingFirstLoad.current = undefined;
+		if (href) loadFrame(href);
 	}, [pausedFrame, loadFrame]);
 
 	// Agent mutations broadcast a reload; coalesce bursts from consecutive
