@@ -278,6 +278,7 @@ const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
 /** How long opening a site waits in the queue for a sandbox slot before giving up. */
 const SANDBOX_WAIT_MAX_MS = 10 * 60_000;
 const SLOTS_BUSY = "Every build slot is still busy. Try again in a few minutes.";
+const SITE_BEING_DELETED = "The site is being deleted.";
 const PRODUCTION_SNAPSHOT_PORT = 4322;
 const SNAPSHOT_PREPARATION_TIMEOUT_MS = 6 * 60_000;
 type PublishRunPhase =
@@ -1644,6 +1645,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
+	/** Deletion ends a recovery's wait for a slot: the site is going, and its place goes to the next. */
+	private recoverySlotWait?: AbortController;
 	/** An idle-stop check under way, which later asks share. */
 	private stopCheck?: Promise<{ busy: boolean }>;
 	private recoveryReconnectMcp = false;
@@ -2161,6 +2164,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (hasBuildWork) {
 				this.abortAllRequests();
 				await this.requestStop(this.state.initialGeneration?.id);
+			}
+			// A recovery still queued for a slot would start a container for a site being deleted.
+			const slotWait = this.recoverySlotWait;
+			if (slotWait) {
+				slotWait.abort();
+				await this.recoveryPromise?.catch(() => undefined);
 			}
 			const stable = await this.waitUntilStable({ timeout: 10_000 });
 			if (stable) {
@@ -3522,8 +3531,19 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async doRecoverSite(hostname: string): Promise<SiteRecoveryResult> {
 		// A build under way when the container stopped may be stopped while this waits.
 		const duringBuild = this.activeBuildConvergences.size > 0;
-		const started = await this.waitForSandbox();
+		const slotWait = new AbortController();
+		this.recoverySlotWait = slotWait;
+		const started = await this.waitForSandbox(slotWait.signal)
+			.catch((error: unknown) => {
+				if (!slotWait.signal.aborted) throw error;
+				return { ok: false as const, error: SITE_BEING_DELETED };
+			})
+			.finally(() => {
+				if (this.recoverySlotWait === slotWait) this.recoverySlotWait = undefined;
+			});
 		if (!started.ok) return { ready: false, error: started.error };
+		// Deletion can end the wait just as a slot is granted: it destroys that container.
+		if (slotWait.signal.aborted) return { ready: false, error: SITE_BEING_DELETED };
 		let sandbox = this.sandboxOps();
 
 		// Probe the listening socket, not `/`. A warm Astro process can spend

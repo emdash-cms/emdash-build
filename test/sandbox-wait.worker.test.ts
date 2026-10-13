@@ -211,6 +211,39 @@ describe("waiting for a sandbox slot", () => {
 		});
 	});
 
+	it("gives a restore up when deletion ends its wait as a slot is granted", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ab");
+		await runInDurableObject(agent, async (instance) => {
+			let grant!: () => void;
+			const granted = new Promise<void>((resolve) => (grant = resolve));
+			const execRecoveryCommand = vi.fn(async () => ({ success: true, exitCode: 0 }));
+			const harness = instance as unknown as Harness & {
+				recoverySlotWait?: AbortController;
+			};
+			harness.sandboxOps = () => ({
+				// The start that grants the slot is still under way when the deletion lands.
+				ensureRunning: async () => {
+					await granted;
+					return { ok: true };
+				},
+				cancelStart: async () => {},
+			});
+			Object.assign(instance, { execRecoveryCommand });
+
+			const recovery = harness.doRecoverSite("build.example.test");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			harness.recoverySlotWait?.abort();
+			grant();
+
+			// Deletion waits for this, so a full restore would hold it for minutes.
+			await expect(recovery).resolves.toEqual({
+				ready: false,
+				error: "The site is being deleted.",
+			});
+			expect(execRecoveryCommand).not.toHaveBeenCalled();
+		});
+	});
+
 	it("tells the owner when a follow-up stopped waiting for a slot", async () => {
 		const id = "99999999-9999-4999-8999-000000000005";
 		const guestKey = "slot-guest";
