@@ -16,7 +16,7 @@ export function isSandboxNotRunning(error: unknown): boolean {
 
 /** What a tool's container call throws once the site it found stopped was restored. */
 export const RESTORED =
-	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and redo them.";
+	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and CMS content and redo them.";
 
 /**
  * The site under the call is gone or was just replaced by its last

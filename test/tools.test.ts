@@ -2136,6 +2136,11 @@ describe("a restore under a tool", () => {
 	// What the builder's sandbox throws once it has restored the site from its last checkpoint.
 	const restored = () => new Error(RESTORED);
 
+	it("says CMS content may be missing too", () => {
+		// Schema, entries and media live in .wrangler, which the checkpoint restores with the files.
+		expect(RESTORED).toMatch(/files and CMS content/);
+	});
+
 	it("reports a restore found by write_file's first read, and writes nothing", async () => {
 		const sandbox = {
 			readFile: vi.fn(async () => {
