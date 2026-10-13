@@ -757,6 +757,73 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("end a CMS call at its first failed recovery instead of starting one per probe", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a6");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			harness.sandboxOps = () => ({
+				exec: async () => Promise.reject(new Error(NOT_RUNNING)),
+			});
+			// Every slot stayed busy for the whole wait.
+			const recoverSite = vi.fn(async () => ({
+				ready: false,
+				error: "Every build slot is still busy. Try again in a few minutes.",
+			}));
+			harness.recoverSite = recoverSite;
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				NOT_RUNNING,
+			);
+			// Each recovery can wait ten minutes and gives the queue place up when it fails.
+			expect(recoverSite).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("keep a CMS call polling through a Sandbox error that passes", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a9");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			// The Sandbox object restarts under the first probe, as during a deploy.
+			const probes = [
+				() =>
+					Promise.reject(Object.assign(new Error("Network connection lost."), { retryable: true })),
+				async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+			];
+			harness.sandboxOps = () => ({ exec: () => probes.shift()!() });
+			const answers = [
+				() => Promise.reject(new Error("Error POSTing to endpoint (HTTP 503)")),
+				async () => ({ content: [{ type: "text", text: "[]" }] }),
+			];
+			harness.mcp.callTool = () => answers.shift()!();
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).resolves.toMatchObject({
+				status: "ok",
+			});
+		});
+	});
+
 	it("restore the site when a CMS call finds the container stopped, and say so", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a4");
 		await runInDurableObject(agent, async (instance) => {

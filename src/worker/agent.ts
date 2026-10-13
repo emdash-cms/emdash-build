@@ -203,6 +203,7 @@ import {
 
 import {
 	DEV_SERVER_PROCESS_PREFIX,
+	isSandboxInterruption,
 	isSandboxNotRunning,
 	RESTORED,
 	type SandboxOps,
@@ -2955,10 +2956,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/**
 	 * Wait for the dev listener after HMR/restart without forcing a slow SSR render.
-	 * Through the model's view of the Sandbox, a stopped container is restored, and
-	 * the call that waited says so.
+	 * A CMS call waits through the tools' view of the Sandbox, which restores a
+	 * stopped container: a restore, or a recovery that failed, ends the wait, since
+	 * asking again would start another recovery. Other errors pass, as they do here.
 	 */
-	private async waitForDevServer(signal?: AbortSignal, sandbox = this.sandboxOps()): Promise<void> {
+	private async waitForDevServer(signal?: AbortSignal, tools?: SandboxOps): Promise<void> {
+		const sandbox = tools ?? this.sandboxOps();
 		for (let i = 0; i < 20; i++) {
 			signal?.throwIfAborted();
 			try {
@@ -2968,7 +2971,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				});
 				if (check.success) return;
 			} catch (error) {
-				if (error instanceof Error && error.message.startsWith(RESTORED)) throw error;
+				if (tools && isSandboxInterruption(error)) throw error;
 				// Server is mid-restart; keep polling.
 			}
 			await new Promise((r) => setTimeout(r, 500));
