@@ -418,7 +418,7 @@ describe("tool calls that find the container stopped", () => {
 			});
 			const recoverSite = vi.fn(async () => {
 				running = true;
-				return { ready: true };
+				return { ready: true, restored: true };
 			});
 			harness.recoverSite = recoverSite;
 
@@ -723,6 +723,37 @@ describe("tool calls that find the container stopped", () => {
 			const restarted = await harness.doRecoverSite("localhost:5173");
 			expect(restarted.ready).toBe(true);
 			expect(restarted.restored).toBeUndefined();
+		});
+	});
+
+	it("run a refused call again, with no restore to report, when recovery found the site there", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a5");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				restoreUnreported: boolean;
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () =>
+					running ? { success: true, content: "intact" } : Promise.reject(new Error(NOT_RUNNING)),
+			});
+			// Refused while a stop was under way that then failed: the container and site are there.
+			harness.recoverSite = async () => {
+				running = true;
+				return { ready: true };
+			};
+
+			// The refused call ran nothing, and nothing was replaced, so there is nothing to redo.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "intact",
+			});
+			expect(harness.restoreUnreported).toBe(false);
 		});
 	});
 

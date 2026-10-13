@@ -2581,6 +2581,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						this.sendConsole("The site's container had stopped; restoring it...");
 						const recovered = await this.recoverSite(this.recoveryHostname(), true);
 						if (!recovered.ready) throw error;
+						// The site was still there: the refused call ran nothing, and nothing is lost.
+						if (!recovered.restored) return await call(target, property, args);
 						this.restoreUnreported = true;
 						throw new Error(RESTORED);
 					}
