@@ -276,6 +276,7 @@ const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
 /** How long opening a site waits in the queue for a sandbox slot before giving up. */
 const SANDBOX_WAIT_MAX_MS = 10 * 60_000;
+const SLOTS_BUSY = "Every build slot is still busy. Try again in a few minutes.";
 const PRODUCTION_SNAPSHOT_PORT = 4322;
 const SNAPSHOT_PREPARATION_TIMEOUT_MS = 6 * 60_000;
 type PublishRunPhase =
@@ -767,6 +768,8 @@ function isTransientDevServerError(text: string): boolean {
  */
 function friendlyTurnError(error: unknown): string {
 	const m = error instanceof Error ? error.message : String(error);
+	// The owner can act on this one as it stands.
+	if (m === SLOTS_BUSY) return m;
 	if (
 		/rollout|signalled the container to exit|container .*(exit|not ready|unavailable|starting)|no container instance|failed to start|container is not running|network connection lost|blockConcurrencyWhile|durable object.*reset|internal error/i.test(
 			m,
@@ -3613,10 +3616,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				const remaining = deadline - Date.now();
 				if (remaining <= 0) {
 					gaveUp = true;
-					return {
-						ok: false,
-						error: "Every build slot is still busy. Try again in a few minutes.",
-					};
+					return { ok: false, error: SLOTS_BUSY };
 				}
 				waited = true;
 				const ahead = start.position === undefined ? undefined : Math.max(0, start.position - 1);

@@ -148,6 +148,34 @@ describe("waiting for a sandbox slot", () => {
 			finishRecovery({ ready: true });
 		});
 	});
+
+	it("tells the owner when a follow-up stopped waiting for a slot", async () => {
+		const id = "99999999-9999-4999-8999-000000000005";
+		const guestKey = "slot-guest";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(guestKey);
+		await testEnv.ProjectCatalog.getByName(guestKey).registerProject(
+			guestKey,
+			{ id, title: "Slots", status: "draft" as const, updatedAt: 1 },
+			10,
+		);
+		const reply = await runInDurableObject(agent, async (instance) => {
+			Object.assign(instance, {
+				provisionSite: async () => ({
+					ready: false,
+					error: "Every build slot is still busy. Try again in a few minutes.",
+				}),
+			});
+			instance.setState({ ...instance.state, siteReady: true });
+			instance.messages = [
+				{ id: "next", role: "user", parts: [{ type: "text", text: "Add an events page" }] },
+			];
+			const response = await instance.onChatMessage(async () => {}, { requestId: "follow-up" });
+			return response.text();
+		});
+
+		expect(reply).toContain("Every build slot is still busy. Try again in a few minutes.");
+	});
 });
 
 describe("stopping an idle container", () => {
