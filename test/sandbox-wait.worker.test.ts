@@ -725,6 +725,45 @@ describe("tool calls that find the container stopped", () => {
 			expect(restarted.restored).toBeUndefined();
 		});
 	});
+
+	it("restore the site when a CMS call finds the container stopped, and say so", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a4");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			harness.sandboxOps = () => ({
+				exec: async () =>
+					running
+						? { success: true, exitCode: 0, stdout: "", stderr: "" }
+						: Promise.reject(new Error(NOT_RUNNING)),
+			});
+			const recoverSite = vi.fn(async () => {
+				running = true;
+				return { ready: true, restored: true };
+			});
+			harness.recoverSite = recoverSite;
+			// The preview answers for a stopped container that it is paused.
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			// A turn of CMS calls alone would otherwise retry for a minute and restore nothing.
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
+		});
+	});
 });
 
 describe("installing dependencies", () => {

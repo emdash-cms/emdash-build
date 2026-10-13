@@ -2938,9 +2938,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			: context;
 	}
 
-	/** Wait for the dev listener after HMR/restart without forcing a slow SSR render. */
-	private async waitForDevServer(signal?: AbortSignal): Promise<void> {
-		const sandbox = this.sandboxOps();
+	/**
+	 * Wait for the dev listener after HMR/restart without forcing a slow SSR render.
+	 * Through the model's view of the Sandbox, a stopped container is restored, and
+	 * the call that waited says so.
+	 */
+	private async waitForDevServer(signal?: AbortSignal, sandbox = this.sandboxOps()): Promise<void> {
 		for (let i = 0; i < 20; i++) {
 			signal?.throwIfAborted();
 			try {
@@ -2949,7 +2952,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					signal,
 				});
 				if (check.success) return;
-			} catch {
+			} catch (error) {
+				if (error instanceof Error && error.message.startsWith(RESTORED)) throw error;
 				// Server is mid-restart; keep polling.
 			}
 			await new Promise((r) => setTimeout(r, 500));
@@ -5004,7 +5008,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			} catch (err) {
 				abortSignal?.throwIfAborted();
 				if (attempt < MAX_ATTEMPTS - 1) {
-					await this.waitForDevServer(abortSignal);
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps());
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
@@ -5014,7 +5018,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (mcpResult?.isError) {
 				const text = mcpResultText(result) || `${name} failed`;
 				if (attempt < MAX_ATTEMPTS - 1 && isTransientDevServerError(text)) {
-					await this.waitForDevServer(abortSignal);
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps());
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
