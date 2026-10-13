@@ -205,6 +205,7 @@ import {
 	DEV_SERVER_PROCESS_PREFIX,
 	isSandboxInterruption,
 	isSandboxNotRunning,
+	NOT_RESTORED,
 	RESTORED,
 	type SandboxOps,
 } from "./sandbox-ops.js";
@@ -453,6 +454,8 @@ interface SiteRecoveryResult {
 	error?: string;
 	/** The site came back from its last checkpoint, so changes since then may be gone. */
 	restored?: boolean;
+	/** It failed with the site left as it was, serving on a container that kept running. */
+	untouched?: boolean;
 }
 
 interface ProvisionResult extends SiteRecoveryResult {
@@ -618,9 +621,6 @@ export interface BuilderState extends BuilderReadinessState {
 	/** The idle container was stopped; the saved site starts again when it is opened or used. */
 	sandboxPaused?: boolean;
 }
-
-const SANDBOX_NOT_RESTORED =
-	"The site's container had stopped and the site could not be restored from its last checkpoint.";
 
 /** A Workers RPC failure that the platform says may succeed if repeated. */
 function isRetryableObjectError(error: unknown): boolean {
@@ -2591,8 +2591,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							restore.catch((): SiteRecoveryResult => ({ ready: false })),
 							signal,
 						);
-						// A failed one can leave a running container with no site, or part of one.
-						if (!recovered.ready) throw new Error(recovered.error ?? SANDBOX_NOT_RESTORED);
+						// A failed one can leave a running container with no site, or part of one;
+						// one that left the site as it was leaves this call to run on it.
+						if (!recovered.ready && !recovered.untouched) {
+							throw new Error(
+								recovered.error ? `${NOT_RESTORED} ${recovered.error}` : NOT_RESTORED,
+							);
+						}
 						// This call's tool may have written before it, as for the call that found the stop.
 						if (recovered.restored) this.restoreUnreported = true;
 					}
@@ -2608,8 +2613,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						const recovered = await abortableWait(
 							this.recoverSite(this.recoveryHostname(), true),
 							signal,
-						);
-						if (!recovered.ready) throw error;
+						).catch((recoveryError: unknown) => {
+							// A recovery that failed outright failed all the same: nothing ran.
+							if (signal?.aborted) throw recoveryError;
+							this.sendConsole(
+								`Warning: the site could not be restored: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+							);
+							throw error;
+						});
+						if (!recovered.ready && !recovered.untouched) throw error;
 						// The site was still there: the refused call ran nothing, and nothing is lost.
 						if (!recovered.restored) return await call(target, property, args);
 						this.restoreUnreported = true;
@@ -3578,7 +3590,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (this.recoveryReconnectMcp) {
 				const token = this.getApiToken();
 				if (token && !(await this.connectMcp(exposed.url, token))) {
-					return { ready: false, error: "The CMS connection did not recover." };
+					return { ready: false, error: "The CMS connection did not recover.", untouched: true };
 				}
 			}
 			this.setState({

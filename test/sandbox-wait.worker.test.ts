@@ -586,6 +586,95 @@ describe("tool calls that find the container stopped", () => {
 		});
 	});
 
+	it("run a call that waited on a recovery that failed but left the site as it was", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ad");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; error?: string; untouched?: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// The container answered with the site; only the CMS connection did not come back.
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+
+			// The site is there, so a batch of writes need not stop and leave half of it behind.
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).resolves.toEqual({ success: true });
+			expect(written).toEqual(["/home/user/site/b.astro"]);
+		});
+	});
+
+	it("say a recovery that found the site serving left it as it was, though the CMS did not reconnect", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ae");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			Object.assign(instance, {
+				// The dev server answers its probe, so the site is there.
+				execRecoveryCommand: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+				stopDevServer: async () => {},
+				refreshPreviewCache: async () => {},
+				getApiToken: () => "token",
+				connectMcp: async () => false,
+				recoveryReconnectMcp: true,
+			});
+			const harness = instance as unknown as RestoreHarness;
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toEqual({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+		});
+	});
+
+	it("run the refused call again when its recovery left the site as it was", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000af");
+		await runInDurableObject(agent, async (instance) => {
+			let refused = true;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<unknown>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				restoreUnreported: boolean;
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => {
+					if (!refused) return { success: true, content: "intact" };
+					refused = false;
+					throw new Error(NOT_RUNNING);
+				},
+			});
+			harness.recoverSite = async () => ({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+
+			// Not "not running": the container runs with the site, so a batch need not stop half done.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "intact",
+			});
+			expect(harness.restoreUnreported).toBe(false);
+		});
+	});
+
 	it("report a restore from the checkpoint to a call that waited on it", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000a");
 		await runInDurableObject(agent, async (instance) => {
@@ -761,9 +850,10 @@ describe("tool calls that find the container stopped", () => {
 			});
 			const harness = instance as unknown as RestoreHarness;
 
-			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
-				ready: false,
-			});
+			const recovered = await harness.doRecoverSite("localhost:5173");
+			expect(recovered.ready).toBe(false);
+			// A freshly started container's disk may be empty: calls that waited must not write there.
+			expect(recovered).not.toHaveProperty("untouched");
 			// The site may be newer than its checkpoint; cloning would delete that work.
 			expect(commands.some((command) => command.includes("git clone"))).toBe(false);
 		});
@@ -917,6 +1007,56 @@ describe("tool calls that find the container stopped", () => {
 			);
 			// Each recovery can wait ten minutes and gives the queue place up when it fails.
 			expect(recoverSite).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("end a CMS call at a restore that failed outright, or one it waited on", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ac");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				recoveryPromise: Promise<{ ready: boolean; error?: string }> | null;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			const probe = vi.fn(async () => Promise.reject(new Error(NOT_RUNNING)));
+			harness.sandboxOps = () => ({ exec: probe });
+			const consoleLines: string[] = [];
+			Object.assign(instance, { sendConsole: (text: string) => consoleLines.push(text) });
+			// A start that keeps failing rejects rather than answering not ready.
+			const recoverSite = vi.fn(async () => {
+				throw new Error("The container did not become ready in time.");
+			});
+			harness.recoverSite = recoverSite;
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				NOT_RUNNING,
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
+			// The call says only that the container is not running; the console says why.
+			expect(consoleLines.join("\n")).toContain("did not become ready in time");
+
+			// Another call's restore gave up: this call says why, rather than starting one of its own.
+			recoverSite.mockClear();
+			probe.mockClear();
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "Every build slot is still busy. Try again in a few minutes.",
+			});
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				/could not be restored.*Every build slot is still busy/,
+			);
+			expect(recoverSite).not.toHaveBeenCalled();
+			expect(probe).not.toHaveBeenCalled();
 		});
 	});
 

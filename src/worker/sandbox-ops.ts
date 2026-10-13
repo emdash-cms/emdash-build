@@ -18,15 +18,20 @@ export function isSandboxNotRunning(error: unknown): boolean {
 export const RESTORED =
 	"The site's container had stopped and the site was restored from its last checkpoint. Changes made since then, including this tool's earlier steps, may be missing: check the affected files and CMS content and redo them.";
 
+/** What a tool's container call throws when the restore it waited on failed, before why. */
+export const NOT_RESTORED =
+	"The site's container had stopped and the site could not be restored from its last checkpoint.";
+
 /**
- * The site under the call is gone or was just replaced by its last
- * checkpoint. A tool passes it on rather than catching it: the restore
- * message is said once, and the model has to hear it.
+ * The site under the call is gone, was just replaced by its last checkpoint,
+ * or could not be restored. A tool passes it on rather than catching it: the
+ * restore message is said once, and the model has to hear it; and asking a
+ * container again would only start another recovery.
  */
 export function isSandboxInterruption(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
 	return (
-		isSandboxNotRunning(error) ||
-		(error instanceof Error ? error.message : String(error)).startsWith(RESTORED)
+		isSandboxNotRunning(error) || message.startsWith(RESTORED) || message.startsWith(NOT_RESTORED)
 	);
 }
 
