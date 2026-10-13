@@ -1,7 +1,17 @@
-import { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
 import { describe, expect, it, vi } from "vitest";
 import { injectPreviewBridge } from "../src/worker/preview-bridge.js";
-import { Sandbox } from "../src/worker/sandbox.js";
+import { PreviewSnapshots, type PreviewSnapshotHost } from "../src/worker/preview-snapshots.js";
+
+/** Snapshots with a stubbed host; tests replace private methods to steer each path. */
+function snapshots(host: Partial<PreviewSnapshotHost> = {}): PreviewSnapshots {
+	const previews = Object.create(PreviewSnapshots.prototype) as PreviewSnapshots;
+	Reflect.set(previews, "host", {
+		validatePortToken: async () => true,
+		waitUntil: () => undefined,
+		...host,
+	});
+	return previews;
+}
 
 describe("editor preview documents", () => {
 	it("rejects ordinary top-level preview navigations for every request method", async () => {
@@ -166,7 +176,14 @@ describe("editor preview documents", () => {
 	});
 
 	it("serves anonymous snapshots but renders cookie and bearer requests privately", async () => {
-		const sandbox = Object.create(Sandbox.prototype) as Sandbox;
+		const live = vi.fn(
+			async () =>
+				new Response("<html>editor toolbar</html>", {
+					headers: { "Content-Type": "text/html", "Cache-Control": "private, no-store" },
+				}),
+		);
+		const waitUntil = vi.fn();
+		const sandbox = snapshots({ forwardLive: live, waitUntil });
 		Reflect.set(sandbox, "readCachedPreview", () => ({
 			status: 200,
 			status_text: "OK",
@@ -175,13 +192,6 @@ describe("editor preview documents", () => {
 			generation: 0,
 		}));
 		Reflect.set(sandbox, "currentGeneration", () => 0);
-		Reflect.set(sandbox, "validatePortToken", async () => true);
-		const live = vi.spyOn(CloudflareSandbox.prototype, "fetch").mockImplementation(
-			async () =>
-				new Response("<html>editor toolbar</html>", {
-					headers: { "Content-Type": "text/html", "Cache-Control": "private, no-store" },
-				}),
-		);
 		const request = (headers: Record<string, string> = {}) =>
 			new Request("https://4321-project-token.example.test/about", {
 				headers: {
@@ -192,42 +202,33 @@ describe("editor preview documents", () => {
 					...headers,
 				},
 			});
-		try {
-			expect(await (await sandbox.fetch(request())).text()).toBe("<html>public snapshot</html>");
-			expect(await (await sandbox.fetch(request({ Cookie: "astro-session=editor" }))).text()).toBe(
-				"<html>editor toolbar</html>",
-			);
-			expect(await (await sandbox.fetch(request({ Authorization: "Bearer editor" }))).text()).toBe(
-				"<html>editor toolbar</html>",
-			);
-			expect(await (await sandbox.fetch(request())).text()).toBe("<html>public snapshot</html>");
-			expect(live).toHaveBeenCalledTimes(2);
+		expect(await (await sandbox.fetch(request())).text()).toBe("<html>public snapshot</html>");
+		expect(await (await sandbox.fetch(request({ Cookie: "astro-session=editor" }))).text()).toBe(
+			"<html>editor toolbar</html>",
+		);
+		expect(await (await sandbox.fetch(request({ Authorization: "Bearer editor" }))).text()).toBe(
+			"<html>editor toolbar</html>",
+		);
+		expect(await (await sandbox.fetch(request())).text()).toBe("<html>public snapshot</html>");
+		expect(live).toHaveBeenCalledTimes(2);
 
-			Reflect.set(sandbox, "readCachedPreview", () => undefined);
-			const refresh = vi.fn(async () => ({ success: true }));
-			const waitUntil = vi.fn();
-			Reflect.set(sandbox, "refreshPreview", refresh);
-			Reflect.set(sandbox, "ctx", { waitUntil });
-			expect(await (await sandbox.fetch(request({ Cookie: "astro-session=editor" }))).text()).toBe(
-				"<html>editor toolbar</html>",
-			);
-			expect(refresh).toHaveBeenCalledOnce();
-			expect(refresh).toHaveBeenCalledWith("/about");
-			expect(waitUntil).toHaveBeenCalledOnce();
-		} finally {
-			live.mockRestore();
-		}
+		Reflect.set(sandbox, "readCachedPreview", () => undefined);
+		const refresh = vi.fn(async () => ({ success: true }));
+		Reflect.set(sandbox, "refreshPreview", refresh);
+		expect(await (await sandbox.fetch(request({ Cookie: "astro-session=editor" }))).text()).toBe(
+			"<html>editor toolbar</html>",
+		);
+		expect(refresh).toHaveBeenCalledOnce();
+		expect(refresh).toHaveBeenCalledWith("/about");
+		expect(waitUntil).toHaveBeenCalledOnce();
 	});
 });
 
 describe("malformed public preview responses", () => {
 	it("retains the last good snapshot when a fresh 200 HTML render is empty", async () => {
-		const sandbox = Object.create(Sandbox.prototype) as Sandbox;
-		Reflect.set(
-			sandbox,
-			"renderCanonical",
-			async () => new Response("", { headers: { "Content-Type": "text/html" } }),
-		);
+		const sandbox = snapshots({
+			renderCanonical: async () => new Response("", { headers: { "Content-Type": "text/html" } }),
+		});
 		Reflect.set(sandbox, "storePreview", async () => "invalid");
 		const deleted = vi.fn();
 		Reflect.set(sandbox, "deleteCachedPreview", deleted);
@@ -262,36 +263,30 @@ describe("malformed public preview responses", () => {
 	});
 
 	it("returns an error instead of an empty document on a cache miss", async () => {
-		const sandbox = Object.create(Sandbox.prototype) as Sandbox;
+		const sandbox = snapshots({
+			forwardLive: async () => new Response("", { headers: { "Content-Type": "text/html" } }),
+		});
 		Reflect.set(sandbox, "readCachedPreview", () => undefined);
 		Reflect.set(sandbox, "currentGeneration", () => 0);
-		Reflect.set(sandbox, "validatePortToken", async () => true);
 		Reflect.set(sandbox, "storePreview", async () => "invalid");
-		const live = vi
-			.spyOn(CloudflareSandbox.prototype, "fetch")
-			.mockResolvedValue(new Response("", { headers: { "Content-Type": "text/html" } }));
-		try {
-			const response = await sandbox.fetch(
-				new Request("https://4321-project-token.example.test/", {
-					headers: {
-						"x-sandbox-preview-proxy": "1",
-						"x-sandbox-preview-port": "4321",
-						"x-sandbox-preview-token": "token",
-						Accept: "text/html",
-					},
-				}),
-			);
-			expect(response.status).toBe(503);
-			expect(response.headers.get("Cache-Control")).toBe("no-store");
-		} finally {
-			live.mockRestore();
-		}
+		const response = await sandbox.fetch(
+			new Request("https://4321-project-token.example.test/", {
+				headers: {
+					"x-sandbox-preview-proxy": "1",
+					"x-sandbox-preview-port": "4321",
+					"x-sandbox-preview-token": "token",
+					Accept: "text/html",
+				},
+			}),
+		);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("Cache-Control")).toBe("no-store");
 	});
 
 	it("rejects empty HTML even when Vary prevents shared caching", async () => {
-		const sandbox = Object.create(Sandbox.prototype) as Sandbox;
 		const response = () =>
 			new Response("", { headers: { "Content-Type": "text/html", Vary: "Origin" } });
+		const sandbox = snapshots({ forwardLive: async () => response() });
 		const store = Reflect.get(sandbox, "storePreview") as (
 			path: string,
 			response: Response,
@@ -311,29 +306,20 @@ describe("malformed public preview responses", () => {
 
 		Reflect.set(sandbox, "readCachedPreview", () => undefined);
 		Reflect.set(sandbox, "currentGeneration", () => 0);
-		Reflect.set(sandbox, "validatePortToken", async () => true);
-		const live = vi
-			.spyOn(CloudflareSandbox.prototype, "fetch")
-			.mockImplementation(async () => response());
-		try {
-			const result = await sandbox.fetch(
-				new Request("https://4321-project-token.example.test/", {
-					headers: {
-						"x-sandbox-preview-proxy": "1",
-						"x-sandbox-preview-port": "4321",
-						"x-sandbox-preview-token": "token",
-						Accept: "text/html",
-					},
-				}),
-			);
-			expect(result.status).toBe(503);
-		} finally {
-			live.mockRestore();
-		}
+		const result = await sandbox.fetch(
+			new Request("https://4321-project-token.example.test/", {
+				headers: {
+					"x-sandbox-preview-proxy": "1",
+					"x-sandbox-preview-port": "4321",
+					"x-sandbox-preview-token": "token",
+					Accept: "text/html",
+				},
+			}),
+		);
+		expect(result.status).toBe(503);
 	});
 
 	it("drops a malformed snapshot left by an older version", () => {
-		const sandbox = Object.create(Sandbox.prototype) as Sandbox;
 		const row = {
 			status: 200,
 			status_text: "OK",
@@ -347,8 +333,8 @@ describe("malformed public preview responses", () => {
 				toArray: () => (statement.startsWith("SELECT") ? [row] : []),
 			})),
 		};
+		const sandbox = snapshots({ sql: sql as unknown as SqlStorage });
 		Reflect.set(sandbox, "verifiedPreviewRows", new Map());
-		Reflect.set(sandbox, "ctx", { storage: { sql } });
 		const read = Reflect.get(sandbox, "readCachedPreview") as (path: string) => unknown;
 		expect(read.call(sandbox, "/")).toBeUndefined();
 		expect(sql.exec).toHaveBeenCalledWith(

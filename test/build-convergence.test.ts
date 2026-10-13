@@ -7,6 +7,7 @@ import {
 	promoteLatestPreviewImage,
 	prunePreviewImages,
 	releaseStepPreviewImages,
+	type MutationScope,
 } from "../src/worker/build-convergence.js";
 
 function recordCompleteEvidence(convergence: BuildConvergence) {
@@ -161,6 +162,26 @@ describe("build convergence evidence", () => {
 		expect(convergence.hasCompleteEvidence()).toBe(false);
 	});
 
+	it("runs a repeated change again and wants new evidence once the site is replaced", async () => {
+		const convergence = new BuildConvergence();
+		const key = mutationKey("write_file", { path: "src/pages/index.astro", content: "x" });
+		const write = vi.fn(async () => ({ success: true, changed: true }));
+		await convergence.runMutation(write, { key });
+		recordCompleteEvidence(convergence);
+
+		// A restore put the site back to its last checkpoint, without that write.
+		convergence.noteSiteReplaced();
+
+		// The validation was of the site before the restore.
+		expect(convergence.hasCurrentValidation()).toBe(false);
+		expect(convergence.hasCompleteEvidence()).toBe(false);
+		await expect(convergence.runMutation(write, { key })).resolves.toEqual({
+			success: true,
+			changed: true,
+		});
+		expect(write).toHaveBeenCalledTimes(2);
+	});
+
 	it("rejects a check that started before an overlapping mutation", () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
@@ -288,18 +309,18 @@ describe("build loop convergence", () => {
 		convergence.finishStep(failedPreview);
 		expect(convergence.shouldForceText()).toBe(false);
 		expect(
-			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]).toolChoice,
-		).toEqual({ type: "tool", toolName: "view_preview" });
+			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]).allowedTools,
+		).toEqual({ toolNames: ["view_preview"], mode: "required" });
 
 		convergence.finishStep(failedPreview);
 		expect(convergence.shouldForceText()).toBe(true);
-		expect(
-			prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]),
-		).toMatchObject({ activeTools: [], toolChoice: "none" });
+		const textOnly = prepareBuildStep(convergence, [] as never, ["view_preview", "write_file"]);
+		expect(textOnly.toolChoice).toBe("none");
+		expect(textOnly.allowedTools).toBeUndefined();
 		expect(canCompleteBuild(convergence, "stop")).toBe(false);
 	});
 
-	it("removes shell access while validation is current", () => {
+	it("requires the final preview once validation is current", () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
 		convergence.recordValidation(observation, { success: true });
@@ -310,8 +331,300 @@ describe("build loop convergence", () => {
 			"view_preview",
 		]);
 
-		expect(prepared.activeTools).toEqual(["write_file", "view_preview"]);
-		expect(prepared.toolChoice).toEqual({ type: "tool", toolName: "view_preview" });
+		expect(prepared.allowedTools).toEqual({ toolNames: ["view_preview"], mode: "required" });
+		expect(prepared.toolChoice).toBeUndefined();
+	});
+
+	it("removes shell access while validation is current", () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+
+		const prepared = prepareBuildStep(convergence, [] as never, [
+			"exec",
+			"write_file",
+			"view_preview",
+		]);
+
+		expect(prepared.allowedTools).toEqual({
+			toolNames: ["write_file", "view_preview"],
+			mode: "auto",
+		});
+	});
+
+	it("never narrows the tools sent, so the cached prompt prefix survives", () => {
+		const toolNames = ["exec", "write_file", "view_preview", "content_create"] as const;
+		const validated = new BuildConvergence();
+		validated.recordValidation(validated.beginObservation()!, { success: true });
+		const converged = new BuildConvergence();
+		recordCompleteEvidence(converged);
+		converged.finishStep({});
+		converged.finishStep({});
+		const recovering = new BuildConvergence();
+		recovering.recordUnresolvedFailure({
+			key: "content:pages:home",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR]",
+		});
+
+		for (const convergence of [new BuildConvergence(), validated, converged, recovering]) {
+			expect(prepareBuildStep(convergence, [] as never, toolNames)).not.toHaveProperty(
+				"activeTools",
+			);
+		}
+	});
+
+	it("stops forcing a failure the model could not repair after three forced steps", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] body: required",
+		});
+		const tools = ["content_create", "view_preview"] as const;
+
+		for (let step = 0; step < 3; step++) {
+			expect(prepareBuildStep(convergence, [] as never, tools).allowedTools).toEqual({
+				toolNames: ["content_create"],
+				mode: "required",
+			});
+			// The retry used a new title, so the original key never resolves.
+			convergence.recordUnresolvedFailure({
+				key: "content:posts:rye",
+				toolName: "content_create",
+				error: "[VALIDATION_ERROR] body: required",
+			});
+		}
+
+		expect(prepareBuildStep(convergence, [] as never, tools).allowedTools).toBeUndefined();
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+		expect(convergence.abandonedFailures()).toEqual([
+			expect.objectContaining({ key: "content:posts:rye", toolName: "content_create" }),
+		]);
+		recordCompleteEvidence(convergence);
+		convergence.finishStep({});
+		convergence.finishStep({});
+		expect(canCompleteBuild(convergence, "stop")).toBe(true);
+	});
+
+	it("spends one forced-repair budget per tool, not per failed item", () => {
+		const convergence = new BuildConvergence();
+		for (const name of ["a", "b", "c", "d", "e"]) {
+			convergence.recordUnresolvedFailure({
+				key: `media\0${name}.jpg`,
+				toolName: "upload_media",
+				error: "HTTP 503",
+			});
+		}
+		let forced = 0;
+		for (let step = 0; step < 10; step++) {
+			const prepared = prepareBuildStep(convergence, [] as never, ["upload_media"]);
+			if (!prepared.allowedTools) break;
+			forced += 1;
+			// Each forced batch retries every image, and they all fail again.
+			for (const name of ["a", "b", "c", "d", "e"]) {
+				convergence.recordUnresolvedFailure({
+					key: `media\0${name}.jpg`,
+					toolName: "upload_media",
+					error: "HTTP 503",
+				});
+			}
+			convergence.finishStep({
+				toolResults: [{ toolName: "upload_media", output: { success: false } }],
+			});
+		}
+
+		expect(forced).toBe(3);
+		expect(convergence.abandonedFailures()).toHaveLength(5);
+	});
+
+	it("stops forcing a failure the forced call went around, and keeps it in front of the model", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] title",
+		});
+		prepareBuildStep(convergence, [] as never, ["content_create"]);
+		// The retry used a new title, so the tool resolved no key itself.
+		convergence.finishStep({
+			toolResults: [{ toolName: "content_create", output: { content: [{ type: "text" }] } }],
+		});
+
+		// Forcing it again could create a duplicate, so it no longer blocks...
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+		expect(convergence.abandonedFailures()).toEqual([]);
+		// ...but the model is still asked to check it.
+		const { messages } = prepareBuildStep(convergence, [] as never, ["content_create"]);
+		const note = JSON.stringify(messages.at(-1));
+		expect(note).toContain("[VALIDATION_ERROR] title");
+		// It may exist under another name, so the model must look before creating it again.
+		expect(note).toContain("before creating");
+
+		// A later success under its own key settles it.
+		convergence.resolveUnresolvedFailure("content:posts:rye");
+		expect(prepareBuildStep(convergence, [] as never, ["content_create"]).messages).toEqual([]);
+	});
+
+	it("keeps counting forced steps for a failure that was gone around and failed again", () => {
+		const convergence = new BuildConvergence();
+		const failure = {
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] title",
+		};
+		convergence.recordUnresolvedFailure(failure);
+		let forced = 0;
+		for (let step = 0; step < 20; step++) {
+			if (!prepareBuildStep(convergence, [] as never, ["content_create"]).allowedTools) break;
+			forced += 1;
+			// Each forced call creates some other entry; the model then retries rye, which fails again.
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { content: [] } }],
+			});
+			convergence.recordUnresolvedFailure(failure);
+		}
+
+		expect(forced).toBe(3);
+		expect(convergence.abandonedFailures()).toEqual([expect.objectContaining(failure)]);
+	});
+
+	it("does not count an unrelated success of the forced tool as the repair", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "media\0hero.jpg",
+			toolName: "upload_media",
+			error: "hero.jpg: HTTP 404",
+		});
+		prepareBuildStep(convergence, [] as never, ["upload_media", "view_preview"]);
+		// The forced call uploaded a different image, which the tool resolved on its own.
+		convergence.resolveUnresolvedFailure("media\0gallery.jpg");
+		convergence.finishStep({
+			toolResults: [{ toolName: "upload_media", output: { success: true, uploaded: 1 } }],
+		});
+
+		const { messages } = prepareBuildStep(convergence, [] as never, [
+			"upload_media",
+			"view_preview",
+		]);
+		expect(JSON.stringify(messages.at(-1))).toContain("hero.jpg: HTTP 404");
+	});
+
+	it("forces one-entry repairs each on its own budget, so none is abandoned untried", () => {
+		const convergence = new BuildConvergence();
+		const names = ["a", "b", "c", "d", "e"];
+		for (const name of names) {
+			convergence.recordUnresolvedFailure({
+				key: `content:posts:${name}`,
+				toolName: "content_create",
+				error: `[VALIDATION_ERROR] ${name}`,
+			});
+		}
+		const shown: string[] = [];
+		for (let step = 0; step < 10; step++) {
+			const next = convergence.nextUnresolvedFailure();
+			const prepared = prepareBuildStep(convergence, [] as never, ["content_create"]);
+			if (!prepared.allowedTools) break;
+			shown.push(next!.key);
+			// The model fixes exactly the entry it is shown, and the tool resolves it.
+			convergence.resolveUnresolvedFailure(next!.key);
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { content: [] } }],
+			});
+		}
+
+		expect(shown).toEqual(names.map((name) => `content:posts:${name}`));
+		expect(convergence.abandonedFailures()).toEqual([]);
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("tells the model which failure a forced repair step is for", () => {
+		const convergence = new BuildConvergence();
+		for (const name of ["rye", "sourdough"]) {
+			convergence.recordUnresolvedFailure({
+				key: `content\0posts\0\0${name}`,
+				toolName: "content_create",
+				error: "[VALIDATION_ERROR] body: required",
+			});
+		}
+
+		const { messages, allowedTools } = prepareBuildStep(convergence, [] as never, [
+			"content_create",
+		]);
+
+		// Both failed the same way: without the entry, a retry of either looks like the repair.
+		expect(allowedTools).toEqual({ toolNames: ["content_create"], mode: "required" });
+		const note = JSON.stringify(messages.at(-1));
+		expect(note).toContain("Repair this failure now with content_create, for posts / rye");
+		expect(note).toContain("body: required");
+		expect(note).not.toContain("sourdough");
+	});
+
+	it("keeps a forced failure the same step recorded again, even when the call partly succeeded", () => {
+		const convergence = new BuildConvergence();
+		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
+		convergence.recordUnresolvedFailure(failure);
+		prepareBuildStep(convergence, [] as never, ["upload_media"]);
+		convergence.recordUnresolvedFailure(failure);
+		convergence.finishStep({
+			toolResults: [{ toolName: "upload_media", output: { success: true, uploaded: 2 } }],
+		});
+
+		expect(convergence.hasUnresolvedFailures()).toBe(true);
+	});
+
+	it("tells the model which repairs it stopped being made to attempt", () => {
+		const convergence = new BuildConvergence();
+		convergence.recordUnresolvedFailure({
+			key: "content:posts:rye",
+			toolName: "content_create",
+			error: "[VALIDATION_ERROR] body: required",
+		});
+		for (let step = 0; step < 3; step++) {
+			prepareBuildStep(convergence, [] as never, ["content_create"]);
+			convergence.finishStep({
+				toolResults: [{ toolName: "content_create", output: { success: false } }],
+			});
+		}
+
+		const { messages } = prepareBuildStep(convergence, [] as never, ["content_create"]);
+		const note = JSON.stringify(messages.at(-1));
+		expect(messages.at(-1)?.role).toBe("user");
+		expect(note).toContain("body: required");
+		expect(note).toContain("summary");
+	});
+
+	it("forces a new failure again after an earlier one is resolved", () => {
+		const convergence = new BuildConvergence();
+		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
+		convergence.recordUnresolvedFailure(failure);
+		prepareBuildStep(convergence, [] as never, ["upload_media"]);
+		convergence.resolveUnresolvedFailure(failure.key);
+		convergence.recordUnresolvedFailure(failure);
+
+		// Resolution resets the budget: a later failure of the same slot is forced again.
+		for (let step = 0; step < 3; step++) {
+			expect(prepareBuildStep(convergence, [] as never, ["upload_media"]).allowedTools).toEqual({
+				toolNames: ["upload_media"],
+				mode: "required",
+			});
+		}
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("allows one more step after a refused shell command, then forces text", () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+		// The evidence reached the model; its next step called exec anyway.
+		convergence.finishStep({});
+		const refusedExec = { toolResults: [{ toolName: "exec", output: { success: false } }] };
+
+		convergence.finishStep(refusedExec);
+		expect(convergence.shouldForceText()).toBe(false);
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+
+		convergence.finishStep(refusedExec);
+		expect(convergence.shouldForceText()).toBe(true);
+		expect(canCompleteBuild(convergence, "stop")).toBe(true);
 	});
 
 	it("makes the step text-only after unchanged evidence converges", () => {
@@ -322,8 +635,8 @@ describe("build loop convergence", () => {
 
 		const prepared = prepareBuildStep(convergence, [] as never, ["exec", "write_file"]);
 
-		expect(prepared.activeTools).toEqual([]);
 		expect(prepared.toolChoice).toBe("none");
+		expect(prepared.allowedTools).toBeUndefined();
 	});
 
 	it("does not mark a non-error finish complete without final evidence", () => {
@@ -357,7 +670,7 @@ describe("build loop convergence", () => {
 		expect(
 			prepareBuildStep(convergence, [] as never, ["content_create", "view_preview"]),
 		).toMatchObject({
-			toolChoice: { type: "tool", toolName: "content_create" },
+			allowedTools: { toolNames: ["content_create"], mode: "required" },
 		});
 
 		convergence.resolveUnresolvedFailure("content:pages:submit");
@@ -497,5 +810,139 @@ describe("stopped build mutations", () => {
 		await expect(first).resolves.toBe("first finished");
 		await expect(second).rejects.toThrow();
 		expect(secondAction).not.toHaveBeenCalled();
+	});
+});
+
+describe("script mutation windows", () => {
+	it("leaves a read-only program's revision and evidence alone", async () => {
+		const convergence = new BuildConvergence();
+		recordCompleteEvidence(convergence);
+
+		const result = await convergence.runScript(async () => ({ success: true, read: 3 }));
+
+		expect(result).toEqual({ success: true, read: 3 });
+		expect(convergence.currentRevision()).toBe(0);
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+	});
+
+	it("advances the revision once for a program's mutations and blocks observations until it ends", async () => {
+		const convergence = new BuildConvergence();
+		let observedDuring: unknown = "unset";
+
+		await convergence.runScript(async (scope) => {
+			await scope.runMutation(async () => ({ success: true }));
+			await scope.runConditionalMutation(async () => ({
+				changed: true as const,
+				operation: async () => ({ success: true }),
+			}));
+			await scope.runMutation(async () => ({ success: true }));
+			observedDuring = convergence.beginObservation();
+			return { success: true };
+		});
+
+		expect(convergence.currentRevision()).toBe(1);
+		expect(observedDuring).toBeUndefined();
+		expect(convergence.beginObservation()).toEqual({ revision: 1 });
+	});
+
+	it("queues a direct mutation behind a running program without deadlocking inner calls", async () => {
+		const convergence = new BuildConvergence();
+		const order: string[] = [];
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+
+		const script = convergence.runScript(async (scope) => {
+			await scope.runMutation(async () => order.push("inner-1"));
+			await gate;
+			await scope.runMutation(async () => order.push("inner-2"));
+			expect(await scope.reusedMutationResultQueued("any")).toEqual({ hit: false });
+			return { success: true };
+		});
+		const direct = convergence.runMutation(async () => {
+			order.push("direct");
+			return { success: true };
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		release();
+		await Promise.all([script, direct]);
+
+		expect(order).toEqual(["inner-1", "inner-2", "direct"]);
+		expect(convergence.currentRevision()).toBe(2);
+	});
+
+	it("runs a program's parallel mutations one at a time, as direct calls run", async () => {
+		const convergence = new BuildConvergence();
+		const order: string[] = [];
+		const mutation = (name: string) => async () => {
+			order.push(`${name}:start`);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			order.push(`${name}:end`);
+			return { success: true };
+		};
+
+		await convergence.runScript(async (scope) => {
+			await Promise.all([
+				scope.runMutation(mutation("a")),
+				scope.runConditionalMutation(async () => ({
+					changed: true as const,
+					operation: mutation("b"),
+				})),
+				scope.runMutation(mutation("c")),
+			]);
+			return { success: true };
+		});
+
+		expect(order).toEqual(["a:start", "a:end", "b:start", "b:end", "c:start", "c:end"]);
+		expect(convergence.currentRevision()).toBe(1);
+	});
+
+	it("keeps running a program's queued mutations after one rejects", async () => {
+		const convergence = new BuildConvergence();
+
+		const outcomes = await convergence.runScript(async (scope) =>
+			Promise.allSettled([
+				scope.runMutation(async () => {
+					throw new Error("CMS unavailable");
+				}),
+				scope.runMutation(async () => "second"),
+			]),
+		);
+
+		expect(outcomes).toEqual([
+			{ status: "rejected", reason: new Error("CMS unavailable") },
+			{ status: "fulfilled", value: "second" },
+		]);
+	});
+
+	it("reuses an identical successful program and never a failed one", async () => {
+		const convergence = new BuildConvergence();
+		const runs: string[] = [];
+		const program = (outcome: boolean) => async (scope: MutationScope) => {
+			await scope.runMutation(async () => runs.push("ran"));
+			return { success: outcome };
+		};
+
+		await convergence.runScript(program(true), { key: "script-a" });
+		await expect(convergence.runScript(program(true), { key: "script-a" })).resolves.toMatchObject({
+			cached: true,
+			changed: false,
+		});
+		await convergence.runScript(program(false), { key: "script-b" });
+		await convergence.runScript(program(false), { key: "script-b" });
+
+		expect(runs).toHaveLength(3);
+	});
+
+	it("refuses to start a program after Stop", async () => {
+		const controller = new AbortController();
+		const convergence = new BuildConvergence(controller.signal);
+		controller.abort();
+
+		await expect(
+			convergence.runScript(async (scope) => scope.runMutation(async () => "ran")),
+		).rejects.toThrow();
+		expect(convergence.currentRevision()).toBe(0);
 	});
 });

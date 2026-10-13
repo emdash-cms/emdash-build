@@ -2,7 +2,7 @@ import { stepCountIs, streamText, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { TurnMetrics, timeSync } from "../src/worker/turn-metrics.js";
+import { TurnMetrics, timeSync, turnMetricsForState } from "../src/worker/turn-metrics.js";
 
 type StreamPart = Record<string, unknown>;
 
@@ -427,5 +427,164 @@ describe("turn metrics", () => {
 		expect(twoSteps().finish("finished", { finishReason: "stop" })?.stepCapReached).toBe(false);
 		const failed = twoSteps().finish("error", { error: new Error("x".repeat(1_000)) });
 		expect(failed?.error?.length).toBe(300);
+	});
+});
+
+describe("step timing", () => {
+	const stepUsage = (reasoning: number) => ({
+		inputTokens: 1_000,
+		inputTokenDetails: { noCacheTokens: 200, cacheReadTokens: 800, cacheWriteTokens: 0 },
+		outputTokens: 300,
+		outputTokenDetails: { textTokens: 300 - reasoning, reasoningTokens: reasoning },
+		totalTokens: 1_300,
+	});
+
+	it("times each step's wait for its first chunk and first output", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({ effort: "high" });
+		time.advance(300);
+		metrics.noteModelResponse(200, { step: true });
+		time.advance(1_700);
+		metrics.observeChunk("reasoning-delta");
+		time.advance(9_000);
+		metrics.observeChunk("reasoning-delta");
+		metrics.observeChunk("tool-input-start");
+		time.advance(1_000);
+		metrics.observeChunk("tool-call");
+		time.advance(3_000);
+		// Tool results stream after the model finished; they are not model output.
+		metrics.observeChunk("tool-result");
+		metrics.onStep({ usage: stepUsage(250) });
+
+		metrics.stepStarted({ effort: "medium" });
+		// A retried attempt: its backoff is part of the wait, and `attempts` says so.
+		metrics.noteModelResponse(429, { step: true });
+		time.advance(400);
+		metrics.noteModelResponse(200, { step: true });
+		time.advance(100);
+		metrics.observeChunk("text-delta");
+		metrics.onStep({ usage: stepUsage(20) });
+
+		const record = metrics.finish("finished");
+		expect(record?.stepTimings).toEqual([
+			{
+				effort: "high",
+				attempts: 1,
+				firstByteMs: 300,
+				firstChunkMs: 2_000,
+				firstOutputMs: 11_000,
+				ms: 15_000,
+				tokens: { input: 1_000, cachedInput: 800, output: 300, reasoning: 250 },
+			},
+			{
+				effort: "medium",
+				attempts: 2,
+				firstByteMs: 400,
+				firstChunkMs: 500,
+				firstOutputMs: 500,
+				ms: 500,
+				tokens: { input: 1_000, cachedInput: 800, output: 300, reasoning: 20 },
+			},
+		]);
+		expect(record?.modelWaitMs).toBe(11_500);
+	});
+
+	it("records a step that streamed nothing and one whose start was not observed", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({});
+		time.advance(700);
+		metrics.onStep({ usage: stepUsage(0) });
+		// Tool results before a step starts belong to no step.
+		metrics.observeChunk("text-delta");
+		metrics.onStep({ usage: stepUsage(0) });
+
+		expect(metrics.finish("finished")?.stepTimings).toEqual([
+			{
+				attempts: 0,
+				firstByteMs: null,
+				firstChunkMs: null,
+				firstOutputMs: null,
+				ms: 700,
+				tokens: { input: 1_000, cachedInput: 800, output: 300, reasoning: 0 },
+			},
+		]);
+	});
+
+	it("records a step that never finished, such as one stopped or out of retries", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({ effort: "medium" });
+		metrics.noteModelResponse(503, { step: true });
+		time.advance(8_000);
+		metrics.noteModelResponse(503, { step: true });
+
+		expect(metrics.finish("error")?.stepTimings).toEqual([
+			{
+				effort: "medium",
+				attempts: 2,
+				firstByteMs: null,
+				firstChunkMs: null,
+				firstOutputMs: null,
+				ms: 8_000,
+				incomplete: true,
+				tokens: { input: 0, cachedInput: 0, output: 0, reasoning: 0 },
+			},
+		]);
+	});
+
+	it("keeps sub-call responses out of the current step", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({});
+		time.advance(100);
+		metrics.noteModelResponse(200);
+		metrics.noteModelResponse(429);
+		time.advance(100);
+		metrics.onStep({ usage: stepUsage(0) });
+		const record = metrics.finish("finished");
+
+		expect(record?.stepTimings[0]).toMatchObject({ attempts: 0, firstByteMs: null });
+		expect(record?.modelHttp).toEqual({ requests: 2, failures: { "429": 1 } });
+	});
+
+	it("leaves per-step timing out of the copy kept in agent state", () => {
+		const metrics = newMetrics();
+		metrics.stepStarted({ effort: "high" });
+		metrics.onStep({ usage: stepUsage(0) });
+		const record = metrics.finish("finished")!;
+		const stored = turnMetricsForState(record);
+
+		expect(stored).not.toHaveProperty("stepTimings");
+		expect(stored).toMatchObject({ turnId: "turn-1", steps: 1, modelWaitMs: 0 });
+		expect(record.stepTimings).toHaveLength(1);
+	});
+
+	it("keeps only the first steps of a long turn and counts the rest", () => {
+		const metrics = newMetrics();
+		for (let step = 0; step < 70; step++) {
+			metrics.stepStarted({ effort: "medium" });
+			metrics.onStep({ usage: stepUsage(0) });
+		}
+		const record = metrics.finish("finished");
+
+		expect(record?.steps).toBe(70);
+		expect(record?.stepTimings).toHaveLength(64);
+		expect(record?.stepTimingsOmitted).toBe(6);
+	});
+
+	it("counts model HTTP attempts and failed statuses, including retried ones", () => {
+		const metrics = newMetrics();
+		metrics.noteModelResponse(429);
+		metrics.noteModelResponse(429);
+		metrics.noteModelResponse(503);
+		metrics.noteModelResponse(0);
+		metrics.noteModelResponse(200);
+
+		expect(metrics.finish("finished")?.modelHttp).toEqual({
+			requests: 5,
+			failures: { "0": 1, "429": 2, "503": 1 },
+		});
 	});
 });

@@ -141,6 +141,38 @@ describe("recent-site actions", () => {
 		expect(await catalog.listProjects()).toEqual([]);
 	});
 
+	it("ends a restore's wait for a slot before deleting the site", async () => {
+		const { cookie, catalog, agent } = await setup();
+		const erased = vi.fn();
+		const cancelStart = vi.fn(async () => {});
+		await runInDurableObject(agent, (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string) => Promise<unknown>;
+				eraseProjectData: () => Promise<void>;
+			};
+			// Every slot stays taken, as after a follow-up was stopped while its site waited.
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => ({
+					ok: false,
+					reason: "capacity",
+					position: 3,
+					retryAfterMs: 60_000,
+				}),
+				cancelStart,
+			});
+			harness.eraseProjectData = async () => erased();
+			void harness.recoverSite("build.example.test");
+		});
+
+		expect((await request("DELETE", cookie)).status).toBe(200);
+		// The site would otherwise get a container once a slot freed, and its place goes to the next.
+		expect(cancelStart).toHaveBeenCalledOnce();
+		expect(erased).toHaveBeenCalledOnce();
+		expect(await catalog.listProjects()).toEqual([]);
+	});
+
 	it("deletes after an interrupted chat leaves only stale activity", async () => {
 		const { cookie, catalog, agent } = await setup();
 		await runInDurableObject(agent, (instance) => {

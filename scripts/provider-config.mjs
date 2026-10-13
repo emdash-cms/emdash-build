@@ -116,9 +116,9 @@ export function renderStudioWrangler(config) {
 		containers: [
 			{
 				class_name: "Sandbox",
-				image: "./Dockerfile",
-				instance_type: { vcpu: 4, memory_mib: 12288, disk_mb: 10240 },
-				max_instances: config.sandboxMaxInstances,
+				name: `${config.providerId}-emdash-build-sandbox-do`,
+				scheduling_policy: "durable_object",
+				images: { sandbox: { dockerfile: "./Dockerfile" } },
 			},
 		],
 		durable_objects: {
@@ -128,15 +128,20 @@ export function renderStudioWrangler(config) {
 				{ name: "ProjectCatalog", class_name: "ProjectCatalog" },
 				{ name: "ProviderControlPlane", class_name: "ProviderControlPlane" },
 				...(siteServiceConfigured ? [{ name: "SiteService", class_name: "SiteService" }] : []),
+				{ name: "SandboxCapacity", class_name: "SandboxCapacity" },
 			],
 		},
 		migrations: [
 			{ tag: "v1", new_sqlite_classes: ["BuilderAgent", "Sandbox"] },
 			{ tag: "v2", new_sqlite_classes: ["ProjectCatalog"] },
 			{ tag: "v3", new_sqlite_classes: ["ProviderControlPlane"] },
-			...(siteServiceConfigured ? [{ tag: "v4", new_sqlite_classes: ["SiteService"] }] : []),
+			// Every version migrates every class, so moving to a later config version
+			// never needs a migration earlier than the last one applied.
+			{ tag: "v4", new_sqlite_classes: ["SiteService"] },
+			{ tag: "v5", new_sqlite_classes: ["SandboxCapacity"] },
 		],
 		ai: { binding: "AI", remote: true },
+		worker_loaders: [{ binding: "LOADER" }],
 		artifacts: [{ binding: "ARTIFACTS", namespace: config.artifactsNamespace, remote: true }],
 		...(identityConfigured
 			? {
@@ -173,6 +178,8 @@ export function renderStudioWrangler(config) {
 					}
 				: {}),
 			SITES_HOSTNAME: config.sitesHostname,
+			ENABLE_CMS_SCRIPTS: "true",
+			SANDBOX_MAX_CONCURRENT: String(config.sandboxMaxInstances),
 			WFP_DISPATCH_NAMESPACE: config.dispatchNamespace,
 			WFP_ACCOUNT_ID: config.accountId,
 		},

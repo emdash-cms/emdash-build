@@ -1,0 +1,1285 @@
+import { env, evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { BuilderAgent, BuilderState } from "../src/worker/agent.js";
+import { BuildConvergence, mutationKey } from "../src/worker/build-convergence.js";
+import {
+	NOT_RUNNING,
+	RESTORED,
+	type SandboxOps,
+	type SandboxStart,
+} from "../src/worker/sandbox-ops.js";
+
+const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
+
+type Harness = {
+	sandboxOps: () => {
+		ensureRunning: () => Promise<SandboxStart>;
+		cancelStart: () => Promise<void>;
+	};
+	waitForSandbox: (signal?: AbortSignal) => Promise<{ ok: boolean; error?: string }>;
+	doRecoverSite: (hostname: string) => Promise<{ ready: boolean; error?: string }>;
+	state: BuilderState;
+};
+
+const queued = (position: number): SandboxStart => ({
+	ok: false,
+	reason: "capacity",
+	position,
+	retryAfterMs: 1,
+});
+
+describe("waiting for a sandbox slot", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("shows the site's place in the queue until a slot frees up", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000001");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as Harness;
+			const seen: Array<{ wait: BuilderState["sandboxWait"]; status?: string }> = [];
+			// Unchanged positions are not written again.
+			const results = [queued(3), queued(1), { ok: true } as const];
+			const cancelStart = vi.fn(async () => {});
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => {
+					seen.push({ wait: harness.state.sandboxWait, status: harness.state.status });
+					return results.shift()!;
+				},
+				cancelStart,
+			});
+			instance.setState({ ...instance.state, status: "Restoring preview..." });
+
+			await expect(harness.waitForSandbox()).resolves.toEqual({ ok: true });
+
+			expect(seen[1]).toEqual({
+				wait: { ahead: 2 },
+				status: "Waiting for a free build slot (2 ahead)...",
+			});
+			expect(seen[2]).toEqual({
+				wait: { ahead: 0 },
+				status: "Waiting for a free build slot...",
+			});
+			// A site that got its container has no place in the queue to give up.
+			expect(cancelStart).not.toHaveBeenCalled();
+			// The queue entry and its status line go once the container runs.
+			expect(harness.state.sandboxWait).toBeUndefined();
+			expect(harness.state.status).toBe("Restoring preview...");
+		});
+	});
+
+	it("gives up after the longest wait, and recovery reports it without touching the site", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000002");
+		await runInDurableObject(agent, async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			vi.setSystemTime(1_000_000);
+			const harness = instance as unknown as Harness;
+			let calls = 0;
+			const cancelStart = vi.fn(async () => {});
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => {
+					calls += 1;
+					vi.setSystemTime(1_000_000 + calls * 4 * 60_000);
+					return queued(5);
+				},
+				cancelStart,
+			});
+
+			await expect(harness.doRecoverSite("build.example.test")).resolves.toEqual({
+				ready: false,
+				error: "Every build slot is still busy. Try again in a few minutes.",
+			});
+			expect(calls).toBe(3);
+			// The place in the queue goes to the next site, and the preview says why it stopped.
+			expect(cancelStart).toHaveBeenCalledOnce();
+			expect(harness.state.sandboxWait).toEqual({ gaveUp: true });
+		});
+	});
+
+	it("stops waiting on Stop", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000003");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as Harness;
+			const controller = new AbortController();
+			const cancelStart = vi.fn(async () => {});
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => ({ ...queued(2), retryAfterMs: 60_000 }),
+				cancelStart,
+			});
+
+			const waiting = harness.waitForSandbox(controller.signal);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			controller.abort();
+
+			await expect(waiting).rejects.toThrow();
+			expect(cancelStart).toHaveBeenCalledOnce();
+			expect(harness.state.sandboxWait).toBeUndefined();
+		});
+	});
+
+	it("stops saying every slot is busy as soon as a retry asks again", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000006");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as Harness;
+			const seen: Array<BuilderState["sandboxWait"]> = [];
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => {
+					seen.push(harness.state.sandboxWait);
+					return { ok: true };
+				},
+				cancelStart: async () => {},
+			});
+			instance.setState({ ...instance.state, sandboxWait: { gaveUp: true } });
+
+			await expect(harness.waitForSandbox()).resolves.toEqual({ ok: true });
+			// A granted start can take half a minute, under a message that it was refused.
+			expect(seen).toEqual([undefined]);
+		});
+	});
+
+	it("lets Stop end a follow-up whose site waits for a slot", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				doRecoverSite: (hostname: string) => Promise<{ ready: boolean }>;
+				provisionSite: (hostname: string, signal?: AbortSignal) => Promise<unknown>;
+				activeProvisionPromise: Promise<unknown> | null;
+			};
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			// The saved site's recovery is queued behind sites holding every slot.
+			let finishRecovery!: (result: { ready: boolean }) => void;
+			harness.doRecoverSite = () => new Promise((resolve) => (finishRecovery = resolve));
+			instance.setState({ ...instance.state, siteReady: true });
+			const controller = new AbortController();
+			const provision = harness.provisionSite("build.example.test", controller.signal);
+			harness.activeProvisionPromise = provision;
+
+			// The client's Stop cancels the turn's request, then asks the agent to stop.
+			controller.abort();
+			const stopped = instance.stopGeneration();
+
+			await expect(within(provision)).resolves.toEqual({ ready: false, stopped: true });
+			await expect(within(stopped)).resolves.toBe(true);
+			finishRecovery({ ready: true });
+		});
+	});
+
+	it("lets Stop from a tab that did not send the follow-up end it", async () => {
+		const id = "99999999-9999-4999-8999-0000000000a7";
+		const guestKey = "stop-guest";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(guestKey);
+		await testEnv.ProjectCatalog.getByName(guestKey).registerProject(
+			guestKey,
+			{ id, title: "Stop", status: "draft" as const, updatedAt: 1 },
+			10,
+		);
+		await runInDurableObject(agent, async (instance) => {
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			// The saved site's recovery waits for a slot until the turn is stopped.
+			Object.assign(instance, {
+				provisionSite: (_hostname: string, signal: AbortSignal) =>
+					new Promise((resolve) =>
+						signal.addEventListener("abort", () => resolve({ ready: false, stopped: true })),
+					),
+			});
+			instance.setState({ ...instance.state, siteReady: true });
+			instance.messages = [
+				{ id: "next", role: "user", parts: [{ type: "text", text: "Add an events page" }] },
+			];
+			// The chat SDK aborts the turn's signal for its request id.
+			const controller = new AbortController();
+			Object.assign(instance, {
+				abortRequest: (requestId: string) => {
+					if (requestId === "follow-up") controller.abort();
+				},
+			});
+			const turn = instance.onChatMessage(async () => {}, {
+				requestId: "follow-up",
+				abortSignal: controller.signal,
+			});
+
+			// A reloaded or second tab has no request of its own to cancel before asking.
+			await expect(within(instance.stopGeneration())).resolves.toBe(true);
+			await expect(within(turn)).resolves.toBeInstanceOf(Response);
+		});
+	});
+
+	it("gives a restore up when deletion ends its wait as a slot is granted", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ab");
+		await runInDurableObject(agent, async (instance) => {
+			let grant!: () => void;
+			const granted = new Promise<void>((resolve) => (grant = resolve));
+			const execRecoveryCommand = vi.fn(async () => ({ success: true, exitCode: 0 }));
+			const harness = instance as unknown as Harness & {
+				recoverySlotWait?: AbortController;
+			};
+			harness.sandboxOps = () => ({
+				// The start that grants the slot is still under way when the deletion lands.
+				ensureRunning: async () => {
+					await granted;
+					return { ok: true };
+				},
+				cancelStart: async () => {},
+			});
+			Object.assign(instance, { execRecoveryCommand });
+
+			const recovery = harness.doRecoverSite("build.example.test");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			harness.recoverySlotWait?.abort();
+			grant();
+
+			// Deletion waits for this, so a full restore would hold it for minutes.
+			await expect(recovery).resolves.toEqual({
+				ready: false,
+				error: "The site is being deleted.",
+			});
+			expect(execRecoveryCommand).not.toHaveBeenCalled();
+		});
+	});
+
+	it("tells the owner when a follow-up stopped waiting for a slot", async () => {
+		const id = "99999999-9999-4999-8999-000000000005";
+		const guestKey = "slot-guest";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(guestKey);
+		await testEnv.ProjectCatalog.getByName(guestKey).registerProject(
+			guestKey,
+			{ id, title: "Slots", status: "draft" as const, updatedAt: 1 },
+			10,
+		);
+		const reply = await runInDurableObject(agent, async (instance) => {
+			Object.assign(instance, {
+				provisionSite: async () => ({
+					ready: false,
+					error: "Every build slot is still busy. Try again in a few minutes.",
+				}),
+			});
+			instance.setState({ ...instance.state, siteReady: true });
+			instance.messages = [
+				{ id: "next", role: "user", parts: [{ type: "text", text: "Add an events page" }] },
+			];
+			const response = await instance.onChatMessage(async () => {}, { requestId: "follow-up" });
+			return response.text();
+		});
+
+		expect(reply).toContain("Every build slot is still busy. Try again in a few minutes.");
+	});
+});
+
+describe("stopping an idle container", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	type StopHarness = {
+		prepareSandboxStop: (idleForMs?: number) => Promise<{ busy: boolean }>;
+		markSandboxStopped: () => Promise<void>;
+		backupSite: (options?: unknown) => Promise<string | undefined>;
+		beginOwnerActivity: (id: string, kind: string) => void;
+		finishOwnerActivity: (id: string) => void;
+		waitForSandbox: () => Promise<{ ok: boolean }>;
+		sandboxOps: () => {
+			ensureRunning: () => Promise<SandboxStart>;
+			cancelStart: () => Promise<void>;
+		};
+		state: BuilderState;
+	};
+
+	it("keeps it while work is under way, and otherwise saves the site first", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			const backupSite = vi.fn(async (_options?: unknown) => undefined as string | undefined);
+			harness.backupSite = backupSite;
+
+			harness.beginOwnerActivity("chat:1", "chat");
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			expect(backupSite).not.toHaveBeenCalled();
+			harness.finishOwnerActivity("chat:1");
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			expect(backupSite).toHaveBeenCalledWith({ quiet: true, skipIfUnchanged: true });
+			// The Sandbox may still find the owner back, so only its stop pauses the preview.
+			expect(harness.state.sandboxPaused).toBeUndefined();
+			await harness.markSandboxStopped();
+			expect(harness.state.sandboxPaused).toBe(true);
+
+			// Starting again clears the pause.
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => ({ ok: true }),
+				cancelStart: async () => {},
+			});
+			await harness.waitForSandbox();
+			expect(harness.state.sandboxPaused).toBeUndefined();
+		});
+	});
+
+	it("keeps it when work starts during the save", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000010");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			harness.backupSite = async () => {
+				// The owner sends a message while the checkpoint uploads.
+				harness.beginOwnerActivity("chat:2", "chat");
+				return undefined;
+			};
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			harness.finishOwnerActivity("chat:2");
+		});
+	});
+
+	it("runs one stop check at a time, so slow saves do not pile up", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000011");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			let finish!: () => void;
+			const saved = new Promise<undefined>((resolve) => (finish = () => resolve(undefined)));
+			const backupSite = vi.fn(async () => saved);
+			harness.backupSite = backupSite;
+
+			// An alarm gave up waiting and asks again while the first save still runs.
+			const first = harness.prepareSandboxStop(20 * 60_000);
+			const second = harness.prepareSandboxStop(21 * 60_000);
+			finish();
+
+			await expect(Promise.all([first, second])).resolves.toEqual([
+				{ busy: false },
+				{ busy: false },
+			]);
+			expect(backupSite).toHaveBeenCalledOnce();
+			// Once it settles, the next check runs afresh.
+			await harness.prepareSandboxStop(22 * 60_000);
+			expect(backupSite).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	it("holds it while the save fails, for at most an hour", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000005");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness;
+			harness.backupSite = async () => "The latest session checkpoint could not be saved.";
+
+			await expect(harness.prepareSandboxStop(30 * 60_000)).resolves.toEqual({ busy: true });
+			await expect(harness.prepareSandboxStop(61 * 60_000)).resolves.toEqual({ busy: false });
+
+			// A save skipped during the failure cooldown is no save either.
+			harness.backupSite = async () => undefined;
+			instance.setState({ ...instance.state, persistenceError: "Not saved." });
+			await expect(harness.prepareSandboxStop(30 * 60_000)).resolves.toEqual({ busy: true });
+		});
+	});
+
+	it("keeps a container through a long turn, and makes the next turn recover after a stop", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000008");
+		await runInDurableObject(agent, async (instance) => {
+			instance.setState({ ...instance.state, siteReady: true });
+			const harness = instance as unknown as StopHarness & {
+				sql: <T>(strings: TemplateStringsArray, ...values: unknown[]) => T[];
+				provisionPromise: Promise<unknown> | null;
+				settledProvision: Promise<unknown> | null;
+			};
+			harness.backupSite = async () => undefined;
+			// This instance is still running a turn that started over an hour ago.
+			harness.beginOwnerActivity("chat:long", "chat");
+			harness.sql`UPDATE owner_activity SET started_at = ${Date.now() - 2 * 60 * 60_000}`;
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: true });
+			harness.finishOwnerActivity("chat:long");
+
+			// A provision that finished before the questions were answered.
+			const provision = Promise.resolve({ ready: true });
+			harness.provisionPromise = provision;
+			harness.settledProvision = provision;
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			await harness.markSandboxStopped();
+			expect(harness.provisionPromise).toBeNull();
+		});
+	});
+
+	it("ignores work rows left from long ago, and pauses only a site that exists", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000006");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as StopHarness & {
+				sql: <T>(strings: TemplateStringsArray, ...values: unknown[]) => T[];
+				ensureOwnerActivityTable: () => void;
+			};
+			harness.ensureOwnerActivityTable();
+			harness.sql`INSERT INTO owner_activity (id, kind, started_at) VALUES ('chat:hung', 'chat', ${Date.now() - 2 * 60 * 60_000})`;
+
+			await expect(harness.prepareSandboxStop(20 * 60_000)).resolves.toEqual({ busy: false });
+			await harness.markSandboxStopped();
+			expect(harness.state.sandboxPaused).toBeUndefined();
+		});
+	});
+});
+
+interface RestoreHarness {
+	doRecoverSite: (hostname: string) => Promise<{ ready: boolean; restored?: boolean }>;
+	recoverSite: (hostname: string) => Promise<{ ready: boolean }>;
+	activeBuildConvergences: Map<string, unknown>;
+	toolSandboxOps: () => {
+		readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+	};
+	noteToolCallReported: (event: { success: boolean; output?: unknown; error?: unknown }) => void;
+}
+
+/** A finished tool call whose error carries the restore message, as the model then sees it. */
+const reportedRestore = (wrap = (message: string) => message) => ({
+	success: false,
+	error: new Error(wrap(RESTORED)),
+});
+
+/** A container whose site is gone, or still there, for a recovery to bring back. */
+function restorableSite(instance: object, site: { present: boolean; installCode: number }) {
+	Object.assign(instance, {
+		waitForSandbox: async () => ({ ok: true }),
+		// No dev server answers.
+		execRecoveryCommand: async (command: string) => {
+			const success = command.includes("package.json") && site.present;
+			return { success, exitCode: success ? 0 : 1 };
+		},
+		sandboxOps: () => ({
+			exec: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+			readFile: async () => ({ success: true, content: "restored" }),
+		}),
+		getArtifactsRepoForRead: async () => ({
+			remote: "https://artifacts.example/site.git",
+			token: "token",
+		}),
+		restoreDependencies: async () => site.installCode,
+		exposePreview: async () => ({ url: "http://4321-site-tok.localhost:5173/" }),
+		startDevServer: async () => {},
+		refreshPreviewSnapshots: async () => true,
+		getApiToken: () => undefined,
+	});
+	return site;
+}
+
+describe("tool calls that find the container stopped", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("restore the site and report every call that may need redoing, a read included", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000007");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const notRunning = () => Promise.reject(new Error(NOT_RUNNING));
+			const writeFile = vi.fn(async (_path: string, _content: string) => ({ success: true }));
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => (running ? { success: true, content: "restored" } : notRunning()),
+				writeFile: async (...args: [string, string]) =>
+					running ? writeFile(...args) : notRunning(),
+			});
+			const recoverSite = vi.fn(async () => {
+				running = true;
+				return { ready: true, restored: true };
+			});
+			harness.recoverSite = recoverSite;
+
+			// What it reads now may be older than changes the model was told were saved.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
+			// Until a tool result carries the message, every call is told.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			harness.noteToolCallReported(
+				reportedRestore((message) => `Could not read a.astro: ${message}`),
+			);
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "restored",
+			});
+
+			running = false;
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("restored from its last checkpoint");
+			// The write is not repeated on its own: earlier steps of the tool may be gone.
+			expect(writeFile).not.toHaveBeenCalled();
+		});
+	});
+
+	it("wait for a restore under way instead of running on the half-restored site", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000008");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			let finishRestore!: () => void;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// Another tool's call found the container stopped; its restore is still cloning.
+			harness.recoveryPromise = new Promise((resolve) => {
+				finishRestore = () => resolve({ ready: true });
+			});
+
+			const write = harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(written).toEqual([]);
+			finishRestore();
+
+			await expect(write).resolves.toEqual({ success: true });
+			expect(written).toEqual(["/home/user/site/b.astro"]);
+		});
+	});
+
+	it("do not run a call on what a failed restore left", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000009");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; error?: string }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// Another call's restore got a container but could not clone the site onto it.
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "The saved site snapshot could not be restored.",
+			});
+
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("could not be restored");
+			expect(written).toEqual([]);
+		});
+	});
+
+	it("run a call that waited on a recovery that failed but left the site as it was", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ad");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; error?: string; untouched?: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// The container answered with the site; only the CMS connection did not come back.
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+
+			// The site is there, so a batch of writes need not stop and leave half of it behind.
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).resolves.toEqual({ success: true });
+			expect(written).toEqual(["/home/user/site/b.astro"]);
+		});
+	});
+
+	it("say a recovery that found the site serving left it as it was, though the CMS did not reconnect", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ae");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			Object.assign(instance, {
+				// The dev server answers its probe, so the site is there.
+				execRecoveryCommand: async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+				stopDevServer: async () => {},
+				refreshPreviewCache: async () => {},
+				getApiToken: () => "token",
+				connectMcp: async () => false,
+				recoveryReconnectMcp: true,
+			});
+			const harness = instance as unknown as RestoreHarness;
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toEqual({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+		});
+	});
+
+	it("run the refused call again when its recovery left the site as it was", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000af");
+		await runInDurableObject(agent, async (instance) => {
+			let refused = true;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<unknown>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				restoreUnreported: boolean;
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => {
+					if (!refused) return { success: true, content: "intact" };
+					refused = false;
+					throw new Error(NOT_RUNNING);
+				},
+			});
+			harness.recoverSite = async () => ({
+				ready: false,
+				error: "The CMS connection did not recover.",
+				untouched: true,
+			});
+
+			// Not "not running": the container runs with the site, so a batch need not stop half done.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "intact",
+			});
+			expect(harness.restoreUnreported).toBe(false);
+		});
+	});
+
+	it("report a restore from the checkpoint to a call that waited on it", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000a");
+		await runInDurableObject(agent, async (instance) => {
+			const written: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; restored?: boolean }> | null;
+				toolSandboxOps: () => {
+					writeFile: (path: string, content: string) => Promise<{ success: boolean }>;
+				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
+			};
+			harness.sandboxOps = () => ({
+				writeFile: async (path: string) => {
+					written.push(path);
+					return { success: true };
+				},
+			});
+			// The tool's earlier write was never saved, so the restore took it away.
+			harness.recoveryPromise = Promise.resolve({ ready: true, restored: true });
+
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).rejects.toThrow("restored from its last checkpoint");
+			expect(written).toEqual([]);
+			harness.recoveryPromise = null;
+			harness.noteToolCallReported(reportedRestore());
+			await expect(
+				harness.toolSandboxOps().writeFile("/home/user/site/b.astro", "x"),
+			).resolves.toEqual({ success: true });
+		});
+	});
+
+	it("keep reporting a restore to later calls until a tool result carries it to the model", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000f");
+		await runInDurableObject(agent, async (instance) => {
+			let finishRestore!: () => void;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoveryPromise: Promise<{ ready: boolean; restored?: boolean }> | null;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				noteToolCallReported: RestoreHarness["noteToolCallReported"];
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () => ({ success: true, content: "restored" }),
+			});
+			harness.recoveryPromise = new Promise((resolve) => {
+				finishRestore = () => resolve({ ready: true, restored: true });
+			});
+			const read = () => harness.toolSandboxOps().readFile("/home/user/site/a.astro");
+
+			// read_files gives up on a file after 5 s, long before a clone and install finish.
+			const abandoned = read().catch((error: Error) => error.message);
+			finishRestore();
+			await abandoned;
+			harness.recoveryPromise = null;
+
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			// A result without the message, such as a timed-out read, does not count.
+			harness.noteToolCallReported({
+				success: true,
+				output: { success: false, error: "timed out" },
+			});
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			harness.noteToolCallReported({
+				success: true,
+				output: { success: false, error: `Could not write a.astro: ${RESTORED}` },
+			});
+			await expect(read()).resolves.toMatchObject({ success: true });
+		});
+	});
+
+	it("report a restore during a build that no call waited on", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000b");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			const read = () => harness.toolSandboxOps().readFile("/home/user/site/a.astro");
+
+			// Before a build, as when the project is opened: nothing the model made is lost.
+			await harness.recoverSite("localhost:5173");
+			await expect(read()).resolves.toMatchObject({ success: true });
+
+			// The preview's Resume restored the site while the model was building.
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
+			await harness.recoverSite("localhost:5173");
+			await expect(read()).rejects.toThrow("restored from its last checkpoint");
+			harness.noteToolCallReported(reportedRestore());
+			await expect(read()).resolves.toMatchObject({ success: true });
+		});
+	});
+
+	it("report a restore before a build when the last save failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000010");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			// The last turn's changes never reached the checkpoint, and the idle container
+			// was stopped after an hour of failing saves.
+			instance.setState({
+				...instance.state,
+				persistenceError: "The latest session checkpoint could not be saved.",
+			});
+
+			await harness.recoverSite("localhost:5173");
+
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
+	it("make the turn redo and revalidate what a restore replaced", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000012");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			const convergence = new BuildConvergence();
+			harness.activeBuildConvergences.set("request", convergence);
+			const key = mutationKey("write_file", { path: "src/pages/index.astro", content: "x" });
+			const write = vi.fn(async () => ({ success: true }));
+			await convergence.runMutation(write, { key });
+			const revision = convergence.currentRevision();
+
+			await harness.recoverSite("localhost:5173");
+
+			// "Redo them": the same write must run again, and the site be validated again.
+			expect(convergence.currentRevision()).toBeGreaterThan(revision);
+			await convergence.runMutation(write, { key });
+			expect(write).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	it("keep an unheard restore across the object's eviction", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000011");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
+			await harness.recoverSite("localhost:5173");
+		});
+		// The owner reads the preview a while before the next message.
+		await evictDurableObject(agent);
+
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
+	it("never replaces a site whose probe did not answer", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000e");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: true, installCode: 0 });
+			const commands: string[] = [];
+			Object.assign(instance, {
+				// A loaded container: the probe's timeout ends it (GNU timeout exits 124).
+				execRecoveryCommand: async (command: string) =>
+					command.includes("package.json")
+						? { success: false, exitCode: 124, stdout: "", stderr: "" }
+						: { success: false, exitCode: 1, stdout: "", stderr: "" },
+				sandboxOps: () => ({
+					exec: async (command: string) => {
+						commands.push(command);
+						return { success: true, exitCode: 0, stdout: "", stderr: "" };
+					},
+				}),
+			});
+			const harness = instance as unknown as RestoreHarness;
+
+			const recovered = await harness.doRecoverSite("localhost:5173");
+			expect(recovered.ready).toBe(false);
+			// A freshly started container's disk may be empty: calls that waited must not write there.
+			expect(recovered).not.toHaveProperty("untouched");
+			// The site may be newer than its checkpoint; cloning would delete that work.
+			expect(commands.some((command) => command.includes("git clone"))).toBe(false);
+		});
+	});
+
+	it("report a restore that replaced the site, though the rest of it failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000d");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 1 });
+			const harness = instance as unknown as RestoreHarness;
+			harness.activeBuildConvergences.set("request", new BuildConvergence());
+
+			await expect(harness.recoverSite("localhost:5173")).resolves.toMatchObject({ ready: false });
+			// The container runs on, with the checkpoint's files in place of the model's.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+		});
+	});
+
+	it("say when a recovery brought the site back from its checkpoint", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-00000000000c");
+		await runInDurableObject(agent, async (instance) => {
+			const site = restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness;
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
+				ready: true,
+				restored: true,
+			});
+			site.present = true;
+			const restarted = await harness.doRecoverSite("localhost:5173");
+			expect(restarted.ready).toBe(true);
+			expect(restarted.restored).toBeUndefined();
+		});
+	});
+
+	it("run a refused call again, with no restore to report, when recovery found the site there", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a5");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				toolSandboxOps: () => {
+					readFile: (path: string) => Promise<{ success: boolean; content: string }>;
+				};
+				restoreUnreported: boolean;
+			};
+			harness.sandboxOps = () => ({
+				readFile: async () =>
+					running ? { success: true, content: "intact" } : Promise.reject(new Error(NOT_RUNNING)),
+			});
+			// Refused while a stop was under way that then failed: the container and site are there.
+			harness.recoverSite = async () => {
+				running = true;
+				return { ready: true };
+			};
+
+			// The refused call ran nothing, and nothing was replaced, so there is nothing to redo.
+			await expect(harness.toolSandboxOps().readFile("/home/user/site/a.astro")).resolves.toEqual({
+				success: true,
+				content: "intact",
+			});
+			expect(harness.restoreUnreported).toBe(false);
+		});
+	});
+
+	it("let Stop end a call that waits on a restore queued for a slot", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a8");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				recoveryPromise: Promise<unknown> | null;
+				toolSandboxOps: (signal?: AbortSignal) => {
+					readFile: (path: string) => Promise<unknown>;
+				};
+			};
+			const within = (promise: Promise<unknown>) =>
+				Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 1000, "waiting"))]);
+			harness.sandboxOps = () => ({ readFile: async () => Promise.reject(new Error(NOT_RUNNING)) });
+			// Every slot is taken, so the restore waits in the queue.
+			harness.recoverSite = () => new Promise(() => {});
+
+			const ownStop = new AbortController();
+			const finding = harness.toolSandboxOps(ownStop.signal).readFile("/home/user/site/a.astro");
+			ownStop.abort();
+			await expect(within(finding)).rejects.toThrow();
+
+			harness.recoveryPromise = new Promise(() => {});
+			const waiterStop = new AbortController();
+			const waiting = harness.toolSandboxOps(waiterStop.signal).readFile("/home/user/site/b.astro");
+			waiterStop.abort();
+			// Stop waits for the turn's calls, so a call parked here would hold it.
+			await expect(within(waiting)).rejects.toThrow();
+		});
+	});
+
+	it("report a restore to the next turn though the call that waited on it was stopped", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000aa");
+		await runInDurableObject(agent, async (instance) => {
+			restorableSite(instance, { present: false, installCode: 0 });
+			const harness = instance as unknown as RestoreHarness & { restoreUnreported: boolean };
+			harness.activeBuildConvergences.set("stopped-turn", new BuildConvergence());
+			// Stop ends the turn while its call waits for a slot for the restore.
+			Object.assign(instance, {
+				waitForSandbox: async () => {
+					harness.activeBuildConvergences.clear();
+					return { ok: true };
+				},
+			});
+
+			await expect(harness.doRecoverSite("localhost:5173")).resolves.toMatchObject({
+				restored: true,
+			});
+			// What the stopped turn changed since its last checkpoint is gone.
+			expect(harness.restoreUnreported).toBe(true);
+		});
+	});
+
+	it("end a CMS call at its first failed recovery instead of starting one per probe", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a6");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			harness.sandboxOps = () => ({
+				exec: async () => Promise.reject(new Error(NOT_RUNNING)),
+			});
+			// Every slot stayed busy for the whole wait.
+			const recoverSite = vi.fn(async () => ({
+				ready: false,
+				error: "Every build slot is still busy. Try again in a few minutes.",
+			}));
+			harness.recoverSite = recoverSite;
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				NOT_RUNNING,
+			);
+			// Each recovery can wait ten minutes and gives the queue place up when it fails.
+			expect(recoverSite).toHaveBeenCalledOnce();
+		});
+	});
+
+	it("end a CMS call at a restore that failed outright, or one it waited on", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000ac");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				recoveryPromise: Promise<{ ready: boolean; error?: string }> | null;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			const probe = vi.fn(async () => Promise.reject(new Error(NOT_RUNNING)));
+			harness.sandboxOps = () => ({ exec: probe });
+			const consoleLines: string[] = [];
+			Object.assign(instance, { sendConsole: (text: string) => consoleLines.push(text) });
+			// A start that keeps failing rejects rather than answering not ready.
+			const recoverSite = vi.fn(async () => {
+				throw new Error("The container did not become ready in time.");
+			});
+			harness.recoverSite = recoverSite;
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				NOT_RUNNING,
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
+			// The call says only that the container is not running; the console says why.
+			expect(consoleLines.join("\n")).toContain("did not become ready in time");
+
+			// Another call's restore gave up: this call says why, rather than starting one of its own.
+			recoverSite.mockClear();
+			probe.mockClear();
+			harness.recoveryPromise = Promise.resolve({
+				ready: false,
+				error: "Every build slot is still busy. Try again in a few minutes.",
+			});
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				/could not be restored.*Every build slot is still busy/,
+			);
+			expect(recoverSite).not.toHaveBeenCalled();
+			expect(probe).not.toHaveBeenCalled();
+		});
+	});
+
+	it("keep a CMS call polling through a Sandbox error that passes", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a9");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			// The Sandbox object restarts under the first probe, as during a deploy.
+			const probes = [
+				() =>
+					Promise.reject(Object.assign(new Error("Network connection lost."), { retryable: true })),
+				async () => ({ success: true, exitCode: 0, stdout: "", stderr: "" }),
+			];
+			harness.sandboxOps = () => ({ exec: () => probes.shift()!() });
+			const answers = [
+				() => Promise.reject(new Error("Error POSTing to endpoint (HTTP 503)")),
+				async () => ({ content: [{ type: "text", text: "[]" }] }),
+			];
+			harness.mcp.callTool = () => answers.shift()!();
+
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).resolves.toMatchObject({
+				status: "ok",
+			});
+		});
+	});
+
+	it("restore the site when a CMS call finds the container stopped, and say so", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000a4");
+		await runInDurableObject(agent, async (instance) => {
+			let running = false;
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				recoverSite: (hostname: string, reconnect: boolean) => Promise<{ ready: boolean }>;
+				mcp: { callTool: (call: unknown) => Promise<unknown> };
+				callMcpTool: (
+					name: string,
+					serverId: string,
+					inputSchema: unknown,
+					args: Record<string, unknown>,
+				) => Promise<unknown>;
+			};
+			harness.sandboxOps = () => ({
+				exec: async () =>
+					running
+						? { success: true, exitCode: 0, stdout: "", stderr: "" }
+						: Promise.reject(new Error(NOT_RUNNING)),
+			});
+			const recoverSite = vi.fn(async () => {
+				running = true;
+				return { ready: true, restored: true };
+			});
+			harness.recoverSite = recoverSite;
+			// The preview answers for a stopped container that it is paused.
+			harness.mcp.callTool = async () => {
+				throw new Error("Error POSTing to endpoint (HTTP 503): Preview paused");
+			};
+
+			// A turn of CMS calls alone would otherwise retry for a minute and restore nothing.
+			await expect(harness.callMcpTool("content_list", "emdash", {}, {})).rejects.toThrow(
+				"restored from its last checkpoint",
+			);
+			expect(recoverSite).toHaveBeenCalledOnce();
+		});
+	});
+});
+
+describe("installing dependencies", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("stops an install that outlives its wait instead of following it forever", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000020");
+		await runInDurableObject(agent, async (instance) => {
+			let endLogs!: () => void;
+			const stopped: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				installDeps: () => Promise<number>;
+			};
+			harness.sandboxOps = () => ({
+				startProcess: async () => undefined,
+				// The output stream lasts as long as the install does.
+				followProcessLogs: async () =>
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							endLogs = () => controller.close();
+						},
+					}),
+				waitForProcessExit: async (id: string) => {
+					throw new Error(`Process ${id} did not exit within 300000ms.`);
+				},
+				stopProcess: async (id: string) => {
+					stopped.push(id);
+					endLogs();
+				},
+			});
+
+			await expect(harness.installDeps()).rejects.toThrow("did not exit");
+			expect(stopped).toHaveLength(1);
+			expect(stopped[0]).toMatch(/^install-/);
+		});
+	});
+
+	it("stops an install whose output cannot be followed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000021");
+		await runInDurableObject(agent, async (instance) => {
+			const stopped: string[] = [];
+			const harness = instance as unknown as {
+				sandboxOps: () => unknown;
+				installDeps: () => Promise<number>;
+			};
+			harness.sandboxOps = () => ({
+				startProcess: async () => undefined,
+				followProcessLogs: async () => {
+					throw new Error("The container did not answer.");
+				},
+				stopProcess: async (id: string) => {
+					stopped.push(id);
+				},
+			});
+
+			await expect(harness.installDeps()).rejects.toThrow("did not answer");
+			// Left running, it would race the next install in the same directory.
+			expect(stopped).toEqual([expect.stringMatching(/^install-/)]);
+		});
+	});
+});
+
+describe("the tools' view of the Sandbox", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("calls the Sandbox's own stub, which has no apply, bind or call", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000030");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as { toolSandboxOps(): SandboxOps };
+
+			// An RPC stub answers every property with a remote method, apply included.
+			const exposed = await harness
+				.toolSandboxOps()
+				.exposePort(4321, { hostname: "localhost:5173", token: "tok" });
+
+			expect(exposed.url).toBe(
+				"http://4321-99999999-9999-4999-8999-000000000030-tok.localhost:5173/",
+			);
+		});
+	});
+});
+
+describe("the owner's heartbeat", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("keeps the Sandbox's container from its idle stop once the site exists", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000040");
+		await runInDurableObject(agent, async (instance) => {
+			const touch = vi.fn(async () => undefined);
+			Reflect.set(Reflect.get(instance, "env") as object, "Sandbox", {
+				getByName: () => ({ touch }),
+			});
+			const harness = instance as unknown as { keepSandboxAwake(): Promise<void> };
+
+			await harness.keepSandboxAwake();
+			expect(touch).not.toHaveBeenCalled();
+
+			instance.setState({ ...instance.state, siteReady: true });
+			await harness.keepSandboxAwake();
+			expect(touch).toHaveBeenCalledOnce();
+		});
+	});
+});
+
+describe("container commands the builder runs to start a site", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it("all have a deadline, so a container that stops answering cannot hold a start", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-0000000000d1");
+		await runInDurableObject(agent, async (instance) => {
+			const commands: { command: string; timeout?: number }[] = [];
+			const harness = instance as unknown as {
+				waitForSandbox: () => Promise<{ ok: boolean }>;
+				sandboxOps: () => unknown;
+				waitForDevServerPort: () => Promise<void>;
+				provisionSite: (hostname: string) => Promise<{ ready: boolean }>;
+				startDevServer: (previewUrl: string, configurationReady: boolean) => Promise<void>;
+			};
+			harness.waitForSandbox = async () => ({ ok: true });
+			harness.sandboxOps = () => ({
+				exec: async (command: string, options?: { timeout?: number }) => {
+					commands.push({ command, timeout: options?.timeout });
+					return { success: false, exitCode: 1, stdout: "", stderr: "" };
+				},
+				writeFile: async () => ({ success: true }),
+				startProcess: async () => {},
+				stopProcess: async () => {},
+				followProcessLogs: async () =>
+					new ReadableStream<Uint8Array>({ start: (controller) => controller.close() }),
+			});
+			harness.waitForDevServerPort = async () => {};
+
+			// The image's template check fails, so provisioning stops there.
+			await expect(harness.provisionSite("localhost")).resolves.toMatchObject({ ready: false });
+			await harness.startDevServer("http://4321-site-tok.localhost:5173/", true);
+
+			expect(commands.map(({ command }) => command)).toEqual([
+				expect.stringContaining("test -f"),
+				expect.stringContaining("modules.yaml"),
+			]);
+			for (const { command, timeout } of commands) expect(timeout, command).toBeGreaterThan(0);
+		});
+	});
+});

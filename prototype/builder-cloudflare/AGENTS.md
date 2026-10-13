@@ -61,9 +61,9 @@ Good collection candidates include products, services, posts, projects, people, 
 
 Start with the smallest schema that represents the real organisation. Field slugs are lowercase snake_case. Every field must have a useful admin label and a corresponding renderer. Add `drafts`, `revisions`, `search`, and `seo` only where editors benefit from them.
 
-Schema must be created through `apply_schema_plan`, which applies subject-specific block definitions, collections, and fields in one idempotent pass with one persistence checkpoint. After it succeeds, run `refresh_types` and read `emdash-env.d.ts` before writing typechecked queries or block renderers.
+Schema must be created through `apply_schema_plan`, which applies subject-specific block definitions, collections, and fields in one idempotent pass with one persistence checkpoint. A successful plan regenerates `emdash-env.d.ts` and returns its declarations; write typechecked queries and block renderers from those names. After other schema changes, run `refresh_types`, which returns them too.
 
-When several independent whole-file sources are ready together, use `write_files`. When several exact targeted corrections are ready together, read every affected current file with `read_files` and apply them with `edit_files`, including multiple replacements in the same file. Each batch gets one preview reload and one Artifacts checkpoint. Use `write_file` or `edit_file` for one change, and keep dependent mutations in order.
+When several independent whole-file sources are ready together, use `write_files`. When several exact targeted corrections are ready together, apply them with `edit_files`, including multiple replacements in the same file; read first any affected file you have not read or written in this turn. Each batch gets one preview reload and one Artifacts checkpoint. Use `write_file` or `edit_file` for one change, and keep dependent mutations in order.
 
 ## EmDash rendering patterns
 
@@ -163,11 +163,11 @@ When changing a primitive, preserve native semantics, labels, keyboard behaviour
 1. Infer the site's real content entities and routes from the brief.
 2. Create all block definitions, collections, and fields in one `apply_schema_plan` call.
 3. Update settings and create menus.
-4. Refresh and read generated types; create exhaustive block dispatchers/maps before block content.
+4. From the generated types the plan returns, create exhaustive block dispatchers/maps before block content.
 5. Create the shared layout and homepage using real CMS queries.
 6. Create and publish representative content for the requested views. Add media when the subject needs it, and taxonomy terms only when classification is part of the site.
 7. Add the list/detail and narrative routes the brief requires. Keep navigation free of dead links.
 8. Run `validate_site`.
-9. Inspect the live preview, correct the design, validate again, and inspect the final result.
+9. Review the preview a passing `validate_site` returns, correct the design, and validate again after any change.
 
 Never expose credentials to the sandbox or place secrets in source files.

@@ -9,3 +9,11 @@ reference
 
 # Local implementation specifications
 .tech-specs/
+
+# Documentation and specifications stay local
+/docs/
+/SPEC.md
+/PLATFORM-ARCHITECTURE.md
+
+# A pnpm store created inside the project
+.pnpm-store/

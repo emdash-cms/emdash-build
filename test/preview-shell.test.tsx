@@ -146,6 +146,119 @@ describe("preview shell", () => {
 		expect(toolbar?.nextElementSibling?.classList.contains("p-3")).toBe(true);
 	});
 
+	it("says when a new or saved site waits for a free build slot", () => {
+		const { rerender } = render(<PreviewPanel slotWait={{ ahead: 2 }} />);
+		expect(screen.getByText("Waiting for a free build slot")).toBeTruthy();
+		expect(screen.getByText(/2 sites ahead of yours/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{ ahead: 0 }} />);
+		expect(screen.getByText(/Yours is next/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{}} />);
+		expect(screen.getByText(/Every build slot is in use/)).toBeTruthy();
+		rerender(<PreviewPanel slotWait={{ gaveUp: true }} />);
+		expect(screen.getByText("Every build slot is busy")).toBeTruthy();
+
+		const url = "https://4321-project-token.example.test/";
+		rerender(
+			<PreviewPanel
+				url={url}
+				cmsReady
+				buildComplete
+				reopenState="waking"
+				slotWait={{ ahead: 1 }}
+			/>,
+		);
+		expect(screen.getByRole("status").textContent).toContain("Waiting for a free build slot");
+		expect(screen.getByRole("status").textContent).toContain("1 site ahead of yours");
+		rerender(<PreviewPanel url={url} cmsReady buildComplete reopenState="waking" />);
+		expect(screen.getByRole("status").textContent).toContain("Opening your site");
+		rerender(
+			<PreviewPanel
+				url={url}
+				cmsReady
+				buildComplete
+				reopenState="failed"
+				slotWait={{ gaveUp: true }}
+			/>,
+		);
+		expect(screen.getByRole("alert").textContent).toContain("Every build slot is busy");
+		expect(screen.getByRole("alert").textContent).not.toContain("Couldn't restore");
+	});
+
+	it("unloads a paused preview and offers to resume it", async () => {
+		const user = userEvent.setup();
+		const url = "https://4321-project-token.example.test/";
+		const onRetryRecovery = vi.fn();
+		const { rerender } = render(
+			<PreviewPanel url={url} cmsReady buildComplete onRetryRecovery={onRetryRecovery} />,
+		);
+		const frame = screen.getByTitle("Site preview") as HTMLIFrameElement;
+		expect(frame.src).toBe(url);
+
+		rerender(
+			<PreviewPanel url={url} cmsReady buildComplete paused onRetryRecovery={onRetryRecovery} />,
+		);
+		// No dev server answers a paused preview, so its HMR client must stop polling.
+		expect(frame.src).toBe("about:blank");
+		expect(screen.getByRole("status").textContent).toContain("Preview paused");
+		await user.click(screen.getByRole("button", { name: "Resume" }));
+		expect(onRetryRecovery).toHaveBeenCalledOnce();
+
+		rerender(<PreviewPanel url={url} cmsReady buildComplete reopenState="waking" />);
+		expect(frame.src).toBe(url);
+		expect(screen.queryByText("Preview paused")).toBeNull();
+	});
+
+	it("keeps the live site while the editor is paused, and pauses Admin with the draft", async () => {
+		const user = userEvent.setup();
+		const url = "https://4321-project-token.example.test/";
+		const liveUrl = "https://site.example.test/";
+		const { rerender } = render(
+			<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />,
+		);
+		await user.click(screen.getByRole("button", { name: "live" }));
+		const frame = screen.getByTitle("Site preview") as HTMLIFrameElement;
+		expect(frame.src).toBe(liveUrl);
+
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete paused />);
+		expect(frame.src).toBe(liveUrl);
+		expect(screen.queryByText("Preview paused")).toBeNull();
+
+		// Admin needs the editor even while the site toggle shows Live.
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />);
+		await user.click(screen.getByRole("tab", { name: "Admin" }));
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete paused />);
+		expect((screen.getByTitle("Admin") as HTMLIFrameElement).src).toBe("about:blank");
+		expect(screen.getByRole("status").textContent).toContain("Preview paused");
+
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />);
+		await user.click(screen.getByRole("tab", { name: "Site" }));
+		await user.click(screen.getByRole("button", { name: "draft" }));
+		await user.click(screen.getByRole("tab", { name: "Admin" }));
+		expect(screen.getByTitle("Admin")).toBeTruthy();
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete paused />);
+		expect((screen.getByTitle("Admin") as HTMLIFrameElement).src).toBe("about:blank");
+		expect(screen.getByRole("status").textContent).toContain("Preview paused");
+	});
+
+	it("signs in to Admin on resume when Admin was first opened while paused", async () => {
+		const user = userEvent.setup();
+		const url = "https://4321-project-token.example.test/";
+		const liveUrl = "https://site.example.test/";
+		const { rerender } = render(
+			<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />,
+		);
+		await user.click(screen.getByRole("button", { name: "live" }));
+		// The live site needs no editor, so Admin can be chosen while the editor is paused.
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete paused />);
+		await user.click(screen.getByRole("tab", { name: "Admin" }));
+
+		rerender(<PreviewPanel url={url} liveUrl={liveUrl} cmsReady buildComplete />);
+		// The cross-origin frame has no editor session yet, so Admin alone shows a login.
+		expect((screen.getByTitle("Admin") as HTMLIFrameElement).src).toBe(
+			`${url}_emdash/api/auth/dev-bypass?redirect=/_emdash/admin`,
+		);
+	});
+
 	it("keeps the saved preview visible while its editor wakes", async () => {
 		const user = userEvent.setup();
 		const url = "https://4321-project-token.example.test/";

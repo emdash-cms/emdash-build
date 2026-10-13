@@ -1,17 +1,39 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NOT_RUNNING, RESTORED } from "../src/worker/sandbox-ops.js";
 import { createOpenAI } from "@ai-sdk/openai";
-import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai";
+import { generateText, simulateReadableStream, stepCountIs, streamText, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
+import { z } from "zod";
 import {
 	BuildConvergence,
+	canCompleteBuild,
 	prepareBuildStep,
 	releaseStepPreviewImages,
 } from "../src/worker/build-convergence.js";
-import { createTools, ensurePreviewHmr, guardProtectedFiles } from "../src/worker/tools.js";
+import { ImageSources } from "../src/worker/image-sources.js";
+import { capturedPreviewShotId } from "../src/worker/readiness.js";
+import {
+	createTools,
+	ensurePreviewHmr,
+	reportingRestores,
+	guardProtectedFiles,
+	MODEL_COMMAND_TIMEOUT_MS,
+	modelCommand,
+	previewScreenshotCommand,
+	typecheckInputsFingerprintCommand,
+} from "../src/worker/tools.js";
 
 function toolCallbacks(capturePreview = vi.fn()) {
 	return {
@@ -29,7 +51,7 @@ function validatingSandbox(
 ) {
 	return {
 		exec,
-		containerFetch: vi.fn(
+		fetchPort: vi.fn(
 			async () =>
 				new Response(body, {
 					status: 200,
@@ -38,6 +60,59 @@ function validatingSandbox(
 		),
 	};
 }
+
+describe("preview screenshot", () => {
+	/** Run the screenshot's wait condition against fake images, as agent-browser would in the page. */
+	function settled(
+		images: Array<{ complete: boolean; top: number; left?: number; hidden?: boolean }>,
+		waitedMs = 0,
+	) {
+		const condition = previewScreenshotCommand("preview-1", "/tmp/shot.png").match(
+			/'wait --fn "([^"]+)"'/,
+		)?.[1];
+		const document = {
+			images: images.map((image) => ({
+				complete: image.complete,
+				getBoundingClientRect: () => ({ top: image.top, left: image.left ?? 0 }),
+				getClientRects: () => (image.hidden ? [] : [{}]),
+			})),
+		};
+		const window: Record<string, number> = {};
+		const now = Date.now();
+		const clock = { now: () => now };
+		const check = new Function(
+			"document",
+			"innerHeight",
+			"innerWidth",
+			"window",
+			"Date",
+			`return (${condition});`,
+		);
+		check(document, 640, 1024, window, clock);
+		clock.now = () => now + waitedMs;
+		return Boolean(check(document, 640, 1024, window, clock));
+	}
+
+	it("waits for the images in view, which the viewport change makes fetch a new size", () => {
+		const steps = [
+			...previewScreenshotCommand("preview-1", "/tmp/shot.png").matchAll(/'([a-z]+)[^']*'/g),
+		];
+		expect(steps.map((step) => step[1])).toEqual(["open", "set", "wait", "screenshot", "close"]);
+
+		expect(settled([{ complete: false, top: 120 }])).toBe(false);
+		expect(
+			settled([
+				{ complete: true, top: 120 },
+				{ complete: false, top: 900 },
+			]),
+		).toBe(true);
+		// Nor does a lazy image that is hidden, or off to the side, which never loads.
+		expect(settled([{ complete: false, top: 0, hidden: true }])).toBe(true);
+		expect(settled([{ complete: false, top: 120, left: 1100 }])).toBe(true);
+		// An image that never loads holds the shot five seconds at most.
+		expect(settled([{ complete: false, top: 120 }], 5_001)).toBe(true);
+	});
+});
 
 describe("preview HMR configuration", () => {
 	const config = `import { defineConfig } from "astro/config";
@@ -67,7 +142,7 @@ describe("unchanged final checks", () => {
 		const types = `export interface PageLayoutHeroV1Block { _type: "hero"; _version: 1; _key: string; }
 declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLayoutHeroV1Block[] } } }`;
 		const sandbox = {
-			containerFetch: vi.fn(
+			fetchPort: vi.fn(
 				async () =>
 					new Response(types, {
 						status: 200,
@@ -81,24 +156,44 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const refresh = createTools(sandbox as never, { ...toolCallbacks(), checkpointSite } as never)
 			.refresh_types.execute as unknown as () => Promise<Record<string, unknown>>;
 
+		// The declarations come back with the result, so no separate read is needed.
 		await expect(refresh()).resolves.toMatchObject({
 			success: true,
 			generatedFile: "emdash-env.d.ts",
+			declarations: types,
 		});
-		expect(sandbox.containerFetch).toHaveBeenCalledWith(
+		expect(sandbox.fetchPort).toHaveBeenCalledWith(
+			4321,
 			"http://localhost:4321/_emdash/api/typegen",
 			{ redirect: "manual" },
-			4321,
 		);
 		expect(sandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 		expect(sandbox.exec).not.toHaveBeenCalled();
 		expect(checkpointSite).toHaveBeenCalledOnce();
 	});
 
+	it("shortens very large declarations and points at the file for the rest", async () => {
+		const types = `declare module "emdash" {}\n${"// generated\n".repeat(10_000)}`;
+		const sandbox = {
+			fetchPort: vi.fn(async () => new Response(types, { status: 200 })),
+			writeFile: vi.fn(async () => ({ success: true })),
+			exec: vi.fn(),
+		};
+		const refresh = createTools(sandbox as never, toolCallbacks() as never).refresh_types
+			.execute as unknown as () => Promise<Record<string, unknown>>;
+
+		const result = await refresh();
+
+		expect(result).toMatchObject({ success: true, declarationsTruncated: true });
+		expect(String(result.declarations).length).toBeLessThan(types.length);
+		expect(String(result.note)).toContain("emdash-env.d.ts");
+		expect(sandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
+	});
+
 	it("reports legacy typegen fallback and never checkpoints a failed refresh", async () => {
 		const checkpointSite = vi.fn(async () => {});
 		const sandbox = {
-			containerFetch: vi
+			fetchPort: vi
 				.fn()
 				.mockResolvedValueOnce(new Response("Not found", { status: 404 }))
 				.mockResolvedValueOnce(new Response("not generated types", { status: 200 })),
@@ -123,19 +218,16 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(checkpointSite).toHaveBeenCalledOnce();
 	});
 
-	it("retries live typegen with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries live typegen once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const types = 'declare module "emdash" { interface EmDashCollections {} }';
-		const oldSandbox = { containerFetch: vi.fn(async () => Promise.reject(interrupted)) };
+		const oldSandbox = { fetchPort: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
-			containerFetch: vi.fn(async () => new Response(types)),
+			fetchPort: vi.fn(async () => new Response(types)),
 			writeFile: vi.fn(async () => ({ success: true })),
 		};
 		let current: {
-			containerFetch: () => Promise<Response>;
+			fetchPort: () => Promise<Response>;
 			writeFile?: (path: string, content: string) => Promise<{ success: boolean }>;
 		} = oldSandbox;
 		const runSandboxRead = async <T>(operation: (sandbox: typeof current) => Promise<T>) => {
@@ -152,13 +244,13 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		} as never).refresh_types.execute as unknown as () => Promise<Record<string, unknown>>;
 
 		await expect(refresh()).resolves.toMatchObject({ success: true });
-		expect(oldSandbox.containerFetch).toHaveBeenCalledOnce();
+		expect(oldSandbox.fetchPort).toHaveBeenCalledOnce();
 		expect(newSandbox.writeFile).toHaveBeenCalledWith("/home/user/site/emdash-env.d.ts", types);
 	});
 
 	it("rejects chunked live typegen above the response bound without writing", async () => {
 		const sandbox = {
-			containerFetch: vi.fn(async () => new Response("x".repeat(2 * 1024 * 1024 + 1))),
+			fetchPort: vi.fn(async () => new Response("x".repeat(2 * 1024 * 1024 + 1))),
 			writeFile: vi.fn(),
 		};
 		const checkpointSite = vi.fn(async () => {});
@@ -188,11 +280,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(result.stderr).toContain("Unable to render RichText because it is undefined!");
 	});
 
-	it("retries a safe read with the current Sandbox after runtime replacement", async () => {
-		const interrupted = Object.assign(new Error("runtime replaced"), {
-			code: "OPERATION_INTERRUPTED",
-			context: { reason: "runtime_replaced" },
-		});
+	it("retries a safe read once the stopped container is restored", async () => {
+		const interrupted = new Error(NOT_RUNNING);
 		const oldSandbox = { readFile: vi.fn(async () => Promise.reject(interrupted)) };
 		const newSandbox = {
 			readFile: vi.fn(async () => ({ success: true, content: "recovered" })),
@@ -218,6 +307,148 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 		expect(oldSandbox.readFile).toHaveBeenCalledOnce();
 		expect(newSandbox.readFile).toHaveBeenCalledOnce();
+	});
+
+	describe("typecheck reuse", () => {
+		const digest = (char: string) => char.repeat(64);
+		function fingerprintingSandbox(fingerprint: () => string, validate: () => unknown) {
+			const exec = vi.fn(async (command: string) =>
+				command.includes("sha256sum")
+					? { success: true, exitCode: 0, stdout: `${fingerprint()}\n`, stderr: "" }
+					: validate(),
+			);
+			return { exec, sandbox: validatingSandbox(exec) };
+		}
+		function cache(initial?: string) {
+			let passed = initial;
+			return {
+				lastPassed: vi.fn(() => passed),
+				recordPassed: vi.fn((fingerprint: string) => {
+					passed = fingerprint;
+				}),
+			};
+		}
+		const passing = () => ({ success: true, exitCode: 0, stdout: "typed", stderr: "" });
+		const validateCalls = (exec: ReturnType<typeof vi.fn>) =>
+			exec.mock.calls.filter(([command]) => command === "pnpm validate").length;
+
+		it("skips the typecheck in a later turn when the source is unchanged", async () => {
+			const typecheckCache = cache();
+			const { exec, sandbox } = fingerprintingSandbox(() => digest("a"), passing);
+			const turn = () =>
+				createTools(sandbox as never, { ...toolCallbacks(), typecheckCache } as never).validate_site
+					.execute as unknown as () => Promise<Record<string, unknown>>;
+
+			await expect(turn()()).resolves.toMatchObject({ success: true });
+			expect(typecheckCache.recordPassed).toHaveBeenCalledWith(digest("a"));
+			// A content-only follow-up: same source, new turn.
+			const second = await turn()();
+
+			expect(second).toMatchObject({ success: true, typecheckSkipped: true });
+			expect(String(second.stdout)).toContain("unchanged");
+			expect(validateCalls(exec)).toBe(1);
+			// The rendered crawl still runs: content may have changed.
+			expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
+		});
+
+		it("typechecks again when the source changed", async () => {
+			const typecheckCache = cache(digest("a"));
+			const { exec, sandbox } = fingerprintingSandbox(() => digest("b"), passing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as unknown as () => Promise<Record<string, unknown>>;
+
+			await expect(validate()).resolves.toMatchObject({ success: true });
+			expect(validateCalls(exec)).toBe(1);
+			expect(typecheckCache.recordPassed).toHaveBeenCalledWith(digest("b"));
+		});
+
+		it("does not record a pass when the source changed while it was being checked", async () => {
+			const typecheckCache = cache();
+			const digests = [digest("a"), digest("b")];
+			const { sandbox } = fingerprintingSandbox(() => digests.shift() ?? digest("b"), passing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as unknown as () => Promise<unknown>;
+
+			await expect(validate()).resolves.toMatchObject({ success: true });
+			expect(typecheckCache.recordPassed).not.toHaveBeenCalled();
+		});
+
+		it("fingerprints every source file outside dependencies, output and local state", () => {
+			const root = mkdtempSync(join(tmpdir(), "emdash-fingerprint-"));
+			try {
+				const write = (path: string, content: string) => {
+					mkdirSync(posix.dirname(join(root, path)), { recursive: true });
+					writeFileSync(join(root, path), content);
+				};
+				write("src/pages/index.astro", "home");
+				write("worker-configuration.d.ts", "declare const env: {}");
+				write("node_modules/pkg/index.js", "dependency");
+				write(".wrangler/state/db.sqlite", "content");
+				const fingerprint = () =>
+					spawnSync("bash", ["-c", typecheckInputsFingerprintCommand()], {
+						cwd: root,
+						encoding: "utf8",
+					}).stdout.trim();
+				const first = fingerprint();
+				write("node_modules/pkg/index.js", "changed dependency");
+				write(".wrangler/state/db.sqlite", "changed content");
+				expect(fingerprint()).toBe(first);
+				write("worker-configuration.d.ts", "declare const env: { DB: D1Database }");
+				expect(fingerprint()).not.toBe(first);
+				expect(first).toMatch(/^[0-9a-f]{64}$/);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("fingerprints what symlinks point to, and fails rather than skip a file it cannot read", () => {
+			const root = mkdtempSync(join(tmpdir(), "emdash-fingerprint-"));
+			try {
+				const site = join(root, "site");
+				mkdirSync(join(site, "src"), { recursive: true });
+				writeFileSync(join(site, "src/index.ts"), "export {}");
+				writeFileSync(join(root, "shared.ts"), "export const a = 1;");
+				symlinkSync(join(root, "shared.ts"), join(site, "src/shared.ts"));
+				const fingerprint = () =>
+					spawnSync("bash", ["-c", typecheckInputsFingerprintCommand()], {
+						cwd: site,
+						encoding: "utf8",
+					});
+				const first = fingerprint().stdout.trim();
+				writeFileSync(join(root, "shared.ts"), "export const a: number = 'broken';");
+				expect(fingerprint().stdout.trim()).not.toBe(first);
+
+				writeFileSync(join(site, "src/secret.ts"), "export {}");
+				chmodSync(join(site, "src/secret.ts"), 0o000);
+				expect(fingerprint().status).not.toBe(0);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("never records a failed typecheck and typechecks when fingerprinting fails", async () => {
+			const typecheckCache = cache();
+			const failing = () => ({ success: false, exitCode: 1, stdout: "", stderr: "Type error" });
+			const { sandbox } = fingerprintingSandbox(() => digest("c"), failing);
+			const validate = createTools(
+				sandbox as never,
+				{ ...toolCallbacks(), typecheckCache } as never,
+			).validate_site.execute as () => Promise<unknown>;
+			await expect(validate()).resolves.toMatchObject({ success: false });
+			expect(typecheckCache.recordPassed).not.toHaveBeenCalled();
+
+			const unreadable = fingerprintingSandbox(() => "not a digest", passing);
+			const again = createTools(
+				unreadable.sandbox as never,
+				{ ...toolCallbacks(), typecheckCache: cache(digest("c")) } as never,
+			).validate_site.execute as () => Promise<unknown>;
+			await expect(again()).resolves.toMatchObject({ success: true });
+			expect(validateCalls(unreadable.exec)).toBe(1);
+		});
 	});
 
 	it("coalesces overlapping successful validation calls", async () => {
@@ -293,7 +524,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 		await expect(validate()).resolves.toMatchObject({ success: false, cached: true });
 		expect(validateBlockContracts).toHaveBeenCalledOnce();
-		expect(sandbox.containerFetch).not.toHaveBeenCalled();
+		expect(sandbox.fetchPort).not.toHaveBeenCalled();
 	});
 
 	it("rejects a source-valid site that still renders the blank scaffold", async () => {
@@ -319,15 +550,11 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			},
 		});
 		await expect(validate()).resolves.toMatchObject({ success: false, cached: true });
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(1);
-		expect(sandbox.containerFetch).toHaveBeenCalledWith(
-			"http://localhost:4321/",
-			{
-				headers: { Accept: "text/html" },
-				redirect: "manual",
-			},
-			4321,
-		);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(1);
+		expect(sandbox.fetchPort).toHaveBeenCalledWith(4321, "http://localhost:4321/", {
+			headers: { Accept: "text/html" },
+			redirect: "manual",
+		});
 	});
 
 	it("retries one wholly truncated rendered crawl before failing validation", async () => {
@@ -338,7 +565,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch
+		sandbox.fetchPort
 			.mockResolvedValueOnce(
 				new Response("<!doctype html><html><body><main>Still streaming", {
 					headers: { "Content-Type": "text/html" },
@@ -354,7 +581,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			.execute as unknown as () => Promise<unknown>;
 
 		await expect(validate()).resolves.toMatchObject({ success: true });
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
 	});
 
 	it("fails after exactly one retry when rendered HTML stays truncated", async () => {
@@ -365,7 +592,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch.mockImplementation(
+		sandbox.fetchPort.mockImplementation(
 			async () =>
 				new Response("<!doctype html><html><body><main>Still streaming", {
 					headers: { "Content-Type": "text/html" },
@@ -378,7 +605,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			success: false,
 			publicSiteAudit: { issues: [{ reason: "truncated-html" }] },
 		});
-		expect(sandbox.containerFetch).toHaveBeenCalledTimes(2);
+		expect(sandbox.fetchPort).toHaveBeenCalledTimes(2);
 	});
 
 	it("returns rendered server errors to the model", async () => {
@@ -389,7 +616,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 			stderr: "",
 		}));
 		const sandbox = validatingSandbox(exec);
-		sandbox.containerFetch.mockResolvedValue(
+		sandbox.fetchPort.mockResolvedValue(
 			new Response("<pre>TypeError: cannot read project.title</pre>", {
 				status: 500,
 				headers: { "Content-Type": "text/html" },
@@ -457,7 +684,8 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 	it("treats every shell command as a potential site mutation", async () => {
 		const convergence = new BuildConvergence();
 		const observation = convergence.beginObservation()!;
-		convergence.recordValidation(observation, { success: true });
+		// A failed validation leaves shell access open for diagnosis.
+		convergence.recordValidationResult(observation, { success: false }, false);
 		const exec = vi.fn(async () => ({ success: true, exitCode: 0, stdout: "ok", stderr: "" }));
 		const tools = createTools({ exec } as never, toolCallbacks() as never, {
 			convergence,
@@ -469,7 +697,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		});
 
 		expect(convergence.currentRevision()).toBe(1);
-		expect(convergence.hasCurrentValidation()).toBe(false);
+		expect(convergence.currentValidationResult()).toBeUndefined();
 	});
 
 	it("does not advance the revision for an edit precondition miss", async () => {
@@ -916,14 +1144,332 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const finishMutation = convergence.beginMutation();
 		finishMutation();
 
-		await expect(validate()).resolves.toMatchObject({ success: true });
-		const finalPreview = await viewPreview();
+		// Passing validation captures the final preview itself, past the exploratory budget.
+		const validated = await validate();
+		const convertValidation = tools.validate_site.toModelOutput as (input: {
+			output: unknown;
+		}) => unknown;
 
-		expect(convert({ output: finalPreview })).toMatchObject({
+		expect(validated).toMatchObject({ success: true, preview: { shotId: expect.any(String) } });
+		expect(convertValidation({ output: validated })).toMatchObject({
 			type: "content",
 			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
+		expect(convergence.hasCurrentPreviewCapture()).toBe(true);
+		// A later view_preview of the same revision reuses that capture.
+		await expect(viewPreview()).resolves.toMatchObject({ success: true, cached: true });
+		expect(capturePreview).toHaveBeenCalledTimes(2);
+	});
+
+	it("finishes a build one step after validation by delivering the final preview with it", async () => {
+		const exec = vi.fn(async () => ({ success: true, exitCode: 0, stdout: "ok", stderr: "" }));
+		const convergence = new BuildConvergence();
+		const tools = createTools(
+			validatingSandbox(exec) as never,
+			toolCallbacks(
+				vi.fn(async () => ({
+					ok: true as const,
+					base64: "ZmluYWwtcHJldmlldw==",
+					mediaType: "image/png",
+				})),
+			) as never,
+			{ convergence, previewImagesEnabled: true },
+		);
+		const usage = {
+			inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+			outputTokens: { total: 1, text: 1, reasoning: 0 },
+		};
+		const model = new MockLanguageModelV3({
+			doStream: [
+				{
+					stream: simulateReadableStream({
+						chunks: [
+							{ type: "stream-start" as const, warnings: [] },
+							{
+								type: "tool-call" as const,
+								toolCallId: "validate-call",
+								toolName: "validate_site",
+								input: "{}",
+							},
+							{
+								type: "finish" as const,
+								finishReason: { unified: "tool-calls" as const, raw: "tool_calls" },
+								usage,
+							},
+						],
+					}),
+				},
+				{
+					stream: simulateReadableStream({
+						chunks: [
+							{ type: "stream-start" as const, warnings: [] },
+							{ type: "text-start" as const, id: "text-1" },
+							{ type: "text-delta" as const, id: "text-1", delta: "Done" },
+							{ type: "text-end" as const, id: "text-1" },
+							{
+								type: "finish" as const,
+								finishReason: { unified: "stop" as const, raw: "stop" },
+								usage,
+							},
+						],
+					}),
+				},
+			],
+		});
+		const toolNames = ["validate_site", "view_preview"] as const;
+
+		const result = streamText({
+			model,
+			prompt: "Finish the site",
+			tools: { validate_site: tools.validate_site, view_preview: tools.view_preview },
+			stopWhen: stepCountIs(4),
+			prepareStep: ({ messages }) => prepareBuildStep(convergence, messages, toolNames),
+			onStepFinish: (step) => {
+				convergence.finishStep(step);
+				releaseStepPreviewImages(step);
+			},
+		});
+		await result.text;
+		const steps = await result.steps;
+
+		// No separate view_preview step: the model saw the image right after validating.
+		expect(model.doStreamCalls).toHaveLength(2);
+		expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain("ZmluYWwtcHJldmlldw==");
+		expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain("Rendered public-site audit");
+		expect(JSON.stringify(steps[0]!.response.messages)).not.toContain("ZmluYWwtcHJldmlldw==");
+		expect(convergence.hasCompleteEvidence()).toBe(true);
+		expect(canCompleteBuild(convergence, await result.finishReason)).toBe(true);
+		expect(capturedPreviewShotId(steps, convergence.currentRevision())).toMatch(/^[0-9a-f-]{36}$/);
+	});
+
+	it("leaves the final preview to view_preview when validation fails", async () => {
+		const exec = vi.fn(async () => ({
+			success: false,
+			exitCode: 1,
+			stdout: "",
+			stderr: "Type error",
+		}));
+		const capturePreview = vi.fn();
+		const tools = createTools(
+			validatingSandbox(exec) as never,
+			toolCallbacks(capturePreview) as never,
+			{
+				previewImagesEnabled: true,
+			},
+		);
+
+		const failed = await (tools.validate_site.execute as () => Promise<unknown>)();
+
+		expect(failed).toMatchObject({ success: false });
+		expect(failed).not.toHaveProperty("preview");
+		expect(capturePreview).not.toHaveBeenCalled();
+	});
+});
+
+describe("photo search", () => {
+	it("is offered only with an Unsplash key, since every search fails without one", () => {
+		const options = { apiToken: "test-token", cmsBaseUrl: "https://site.example/" };
+		const keyless = createTools({} as never, toolCallbacks() as never, options);
+		const keyed = createTools({} as never, toolCallbacks() as never, {
+			...options,
+			unsplashAccessKey: "unsplash-key",
+		});
+
+		expect(Object.keys(keyless)).not.toContain("search_unsplash");
+		expect(Object.keys(keyless)).toContain("upload_media");
+		expect(Object.keys(keyed)).toContain("search_unsplash");
+	});
+});
+
+describe("image uploads", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	const uploadOf = (tools: ReturnType<typeof createTools>) =>
+		tools.upload_media.execute as (input: { images: Array<{ url: string }> }) => Promise<unknown>;
+
+	function serveImages(searchResults: string[] = []) {
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+			if (String(url).startsWith("https://api.unsplash.com/")) {
+				return Response.json({
+					results: searchResults.map((raw, index) => ({
+						id: `photo-${index}`,
+						description: "Basalt coast",
+						alt_description: null,
+						urls: { raw, regular: raw, small: raw },
+						user: { name: "A photographer", username: "photographer" },
+						links: { html: "https://unsplash.com/photos/x" },
+					})),
+				});
+			}
+			if (init?.method === "POST") return Response.json({ item: { id: "media-1" } });
+			return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		return fetchMock;
+	}
+
+	it("refuses a stock photo written from memory, and never fetches it", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://example.com/hero.jpg" },
+					{ url: "https://images.unsplash.com/photo-1530789253388-582c481c54b0?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			success: true,
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{
+					success: false,
+					// Refused here, the same URL must not reach the site some other way.
+					error: expect.stringMatching(
+						/images the user supplied.*page or an image field.*linked a photo's page, ask them for the image itself/,
+					),
+				},
+			],
+		});
+		expect(fetchMock.mock.calls.some(([url]) => String(url).includes("photo-153078"))).toBe(false);
+		// Not a failed upload to retry: the model has to find a real image first.
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("refuses a stock photo's page the user linked, asking for the image, so no repair is forced", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const page = "https://unsplash.com/photos/green-trees-abc123XYZ01";
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			unsplashAccessKey: "unsplash-key",
+			imageSources: new ImageSources([`Use this photo: ${page}`]),
+		});
+
+		const remembered = "https://www.pexels.com/photo/glacier-lagoon-2387873/";
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: page }, { url: remembered }] }),
+		).resolves.toMatchObject({
+			success: false,
+			results: [
+				{
+					success: false,
+					// Not "search instead": the user chose this photo.
+					error: expect.stringMatching(/web page.*not the image.*ask them for the image itself/),
+				},
+				// A page the user never linked is a guess like any remembered photo.
+				{ success: false, error: expect.stringMatching(/^Not a photo search_unsplash returned/) },
+			],
+		});
+		expect(fetchMock).not.toHaveBeenCalled();
+		// Uploading the page would fail on its HTML, and only the user can give the image.
+		expect(convergence.hasUnresolvedFailures()).toBe(false);
+	});
+
+	it("accepts a photo this turn's search returned, at any size", async () => {
+		serveImages(["https://images.unsplash.com/photo-found?ixid=abc"]);
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			unsplashAccessKey: "unsplash-key",
+			imageSources: new ImageSources(),
+		});
+		const search = (tools as Record<string, { execute?: unknown }>).search_unsplash!
+			.execute as (input: { query: string; count: number }) => Promise<unknown>;
+
+		await search({ query: "iceland coast", count: 1 });
+
+		await expect(
+			uploadOf(tools)({
+				images: [
+					{ url: "https://images.unsplash.com/photo-found?w=2200&fit=crop" },
+					{ url: "https://images.unsplash.com/photo-guessed?w=2200" },
+				],
+			}),
+		).resolves.toMatchObject({
+			uploaded: 1,
+			results: [
+				{ success: true },
+				{
+					success: false,
+					error: expect.stringMatching(
+						/Search for photos.*page or an image field.*linked a photo's page, ask them for the image itself\. If search fails, design without photography/,
+					),
+				},
+			],
+		});
+	});
+
+	it("opens no mutation for a call whose every image is refused", async () => {
+		const fetchMock = serveImages();
+		const convergence = new BuildConvergence();
+		const checkpointSite = vi.fn(async () => {});
+		const tools = createTools({} as never, { ...toolCallbacks(), checkpointSite } as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+		const revision = convergence.currentRevision();
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://images.unsplash.com/photo-guessed" }] }),
+		).resolves.toMatchObject({ success: false, changed: false, uploaded: 0 });
+		// The site did not change, so its validation and preview evidence still hold.
+		expect(convergence.currentRevision()).toBe(revision);
+		expect(checkpointSite).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("reports an address that is not absolute as a failed fetch to repair", async () => {
+		// Like the platform's fetch, which takes only absolute URLs.
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => {
+				new URL(url);
+				return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+			}),
+		);
+		const convergence = new BuildConvergence();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			convergence,
+			imageSources: new ImageSources(),
+		});
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "//images.example.com/hero.jpg" }] }),
+		).resolves.toMatchObject({
+			success: false,
+			results: [{ success: false, error: expect.stringContaining("Could not fetch image") }],
+		});
+		expect(convergence.hasUnresolvedFailures()).toBe(true);
+	});
+
+	it("refuses stock photos without a source when the turn names none", async () => {
+		const fetchMock = serveImages();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+		});
+
+		await expect(
+			uploadOf(tools)({ images: [{ url: "https://images.pexels.com/photos/1/photo.jpeg" }] }),
+		).resolves.toMatchObject({ success: false, uploaded: 0 });
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
 
@@ -1008,7 +1554,7 @@ describe("stopped media batch", () => {
 		expect(convergence.hasUnresolvedFailures()).toBe(true);
 		expect(
 			prepareBuildStep(convergence, [] as never, ["upload_media", "view_preview"]),
-		).toMatchObject({ toolChoice: { type: "tool", toolName: "upload_media" } });
+		).toMatchObject({ allowedTools: { toolNames: ["upload_media"], mode: "required" } });
 
 		await expect(
 			upload({
@@ -1058,7 +1604,7 @@ describe("stopped server restart", () => {
 describe("write_files", () => {
 	function batchHarness(
 		initial: Record<string, string>,
-		writeFailure?: (path: string) => boolean,
+		writeFailure?: (path: string) => boolean | Error,
 		readFailure?: (path: string) => boolean | Error | undefined,
 	) {
 		const store = new Map(Object.entries(initial));
@@ -1072,7 +1618,9 @@ describe("write_files", () => {
 			}),
 			writeFile: vi.fn(async (path: string, content: string) => {
 				store.set(posix.normalize(path), content);
-				if (writeFailure?.(path)) throw new Error("write failed");
+				const failure = writeFailure?.(path);
+				if (failure instanceof Error) throw failure;
+				if (failure) throw new Error("write failed");
 				return { success: true };
 			}),
 			deleteFile: vi.fn(async (path: string) => {
@@ -1279,7 +1827,7 @@ describe("write_files", () => {
 describe("edit_files", () => {
 	function batchEditHarness(
 		initial: Record<string, string>,
-		writeFailure?: (path: string, content: string) => boolean,
+		writeFailure?: (path: string, content: string) => boolean | Error,
 	) {
 		const store = new Map(Object.entries(initial));
 		const sandbox = {
@@ -1289,7 +1837,9 @@ describe("edit_files", () => {
 			}),
 			writeFile: vi.fn(async (path: string, content: string) => {
 				store.set(posix.normalize(path), content);
-				if (writeFailure?.(path, content)) throw new Error("write failed");
+				const failure = writeFailure?.(path, content);
+				if (failure instanceof Error) throw failure;
+				if (failure) throw new Error("write failed");
 				return { success: true };
 			}),
 		};
@@ -1721,9 +2271,25 @@ describe("protected site files", () => {
 		await expect(run({ command: "sed -i s/a/b/ wrangler.jsonc" })).resolves.toMatchObject({
 			protectedFiles: ["restored protected file wrangler.jsonc"],
 		});
-		const [command] = exec.mock.calls[0] as unknown as [string];
-		expect(command.startsWith("( guard=$(mktemp -d")).toBe(true);
-		expect(command).toContain("timeout --signal=TERM --kill-after=2s 12s bash -lc");
+		const [command, options] = exec.mock.calls[0] as unknown as [string, { timeout: number }];
+		expect(command).toBe(modelCommand("sed -i s/a/b/ wrangler.jsonc"));
+		expect(command.startsWith("{ guard=$(mktemp -d")).toBe(true);
+		expect(options.timeout).toBe(MODEL_COMMAND_TIMEOUT_MS);
+	});
+
+	it("refuses shell commands while validation is current, so a diagnostic cannot void it", async () => {
+		const exec = vi.fn();
+		const convergence = new BuildConvergence();
+		convergence.recordValidation(convergence.beginObservation()!, { success: true });
+		const tools = createTools({ exec } as never, toolCallbacks() as never, { convergence });
+		const run = tools.exec.execute as unknown as (input: { command: string }) => Promise<unknown>;
+
+		await expect(run({ command: "curl -s localhost:4321" })).resolves.toMatchObject({
+			success: false,
+			error: expect.stringContaining("passed validation"),
+		});
+		expect(exec).not.toHaveBeenCalled();
+		expect(convergence.hasCurrentValidation()).toBe(true);
 	});
 
 	it("passes Stop to an active sandbox command", async () => {
@@ -1755,5 +2321,136 @@ describe("protected site files", () => {
 			write({ path: ".dev.vars.production", content: "SECRET=1" }),
 		).resolves.toMatchObject({ success: false, error: expect.stringMatching(/protected/) });
 		expect(sandbox.writeFile).not.toHaveBeenCalled();
+	});
+});
+
+describe("a restore under a tool", () => {
+	// What the builder's sandbox throws once it has restored the site from its last checkpoint.
+	const restored = () => new Error(RESTORED);
+
+	it("says CMS content may be missing too", () => {
+		// Schema, entries and media live in .wrangler, which the checkpoint restores with the files.
+		expect(RESTORED).toMatch(/files and CMS content/);
+	});
+
+	it("reports a restore found by write_file's first read, and writes nothing", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => {
+				throw restored();
+			}),
+			writeFile: vi.fn(async () => ({ success: true })),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_file
+			.execute as unknown as (input: { path: string; content: string }) => Promise<unknown>;
+
+		await expect(write({ path: "src/pages/index.astro", content: "new" })).rejects.toThrow(
+			RESTORED,
+		);
+		expect(sandbox.writeFile).not.toHaveBeenCalled();
+	});
+
+	it("reports a restore found while waiting for the dev server after a write", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: false })),
+			writeFile: vi.fn(async () => ({ success: true })),
+			exec: vi.fn(async () => {
+				throw restored();
+			}),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_file
+			.execute as unknown as (input: { path: string; content: string }) => Promise<unknown>;
+
+		await expect(write({ path: "src/data/site.json", content: "{}" })).resolves.toMatchObject({
+			success: false,
+			error: expect.stringContaining(RESTORED),
+		});
+	});
+
+	it("reports a restore found by validate_site's source fingerprint", async () => {
+		const exec = vi.fn(async (command: string) => {
+			if (command.includes("sha256sum")) throw restored();
+			return { success: true, exitCode: 0, stdout: "typed", stderr: "" };
+		});
+		const typecheckCache = { lastPassed: vi.fn(() => undefined), recordPassed: vi.fn() };
+		const validate = createTools(
+			validatingSandbox(exec) as never,
+			{ ...toolCallbacks(), typecheckCache } as never,
+		).validate_site.execute as unknown as () => Promise<unknown>;
+
+		await expect(validate()).rejects.toThrow(RESTORED);
+		expect(exec.mock.calls.some(([command]) => command === "pnpm validate")).toBe(false);
+	});
+});
+
+describe("tools while a restore is unheard", () => {
+	it("report it before running, though a CMS or media call never reaches the container", async () => {
+		let unreported = true;
+		const execute = vi.fn(async () => ({ success: true }));
+		const tools = reportingRestores(
+			{ content_update: tool({ inputSchema: z.object({}), execute }) },
+			() => unreported,
+		);
+		const update = () =>
+			tools.content_update.execute!({}, { toolCallId: "call", messages: [] }) as Promise<unknown>;
+
+		await expect(update()).rejects.toThrow(RESTORED);
+		expect(execute).not.toHaveBeenCalled();
+		unreported = false;
+		await expect(update()).resolves.toEqual({ success: true });
+	});
+});
+
+describe("a restore during a batch", () => {
+	it("does not try to undo a write batch on the restored site", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: false })),
+			writeFile: vi.fn(async (path: string) => {
+				if (path.endsWith("b.astro")) throw new Error(RESTORED);
+				return { success: true };
+			}),
+			deleteFile: vi.fn(async () => ({ success: true })),
+		};
+		const write = createTools(sandbox as never, toolCallbacks() as never).write_files
+			.execute as unknown as (input: {
+			files: Array<{ path: string; content: string }>;
+		}) => Promise<{ success: boolean; error?: string }>;
+
+		const result = await write({
+			files: [
+				{ path: "src/pages/a.astro", content: "a" },
+				{ path: "src/pages/b.astro", content: "b" },
+			],
+		});
+
+		// The site is its checkpoint now: nothing of the batch is left to undo.
+		expect(result).toMatchObject({ success: false, error: expect.stringContaining(RESTORED) });
+		expect(result.error).not.toMatch(/roll/i);
+		expect(sandbox.writeFile).toHaveBeenCalledTimes(2);
+		expect(sandbox.deleteFile).not.toHaveBeenCalled();
+	});
+
+	it("does not try to undo an edit batch on the restored site", async () => {
+		const sandbox = {
+			readFile: vi.fn(async () => ({ success: true, content: "old" })),
+			writeFile: vi.fn(async (path: string) => {
+				if (path.endsWith("b.astro")) throw new Error(RESTORED);
+				return { success: true };
+			}),
+		};
+		const edit = createTools(sandbox as never, toolCallbacks() as never).edit_files
+			.execute as unknown as (input: {
+			edits: Array<{ path: string; oldText: string; newText: string }>;
+		}) => Promise<{ success: boolean; error?: string }>;
+
+		const result = await edit({
+			edits: [
+				{ path: "src/pages/a.astro", oldText: "old", newText: "new" },
+				{ path: "src/pages/b.astro", oldText: "old", newText: "new" },
+			],
+		});
+
+		expect(result).toMatchObject({ success: false, error: expect.stringContaining(RESTORED) });
+		expect(result.error).not.toMatch(/roll/i);
+		expect(sandbox.writeFile).toHaveBeenCalledTimes(2);
 	});
 });

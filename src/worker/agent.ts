@@ -22,7 +22,6 @@ import {
 	type ConnectionContext,
 	type WSMessage,
 } from "agents";
-import { getSandbox, streamFile } from "@cloudflare/sandbox";
 import { artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
 import {
 	isAdminPreviewPath,
@@ -40,21 +39,27 @@ import {
 	stepCountIs,
 	jsonSchema,
 	tool,
+	type ToolSet,
 } from "ai";
 import { z } from "zod";
 import {
+	createMediaTools,
 	createTools,
 	mapLimit,
 	SITE_PATH,
 	CANONICAL_WORKER_TS,
 	CANONICAL_WRANGLER_JSONC,
 	stripSandboxFromAstroConfig,
-	scrubAuthFromSnapshot,
+	scrubStagedContentCommand,
 	stripStorageFromAstroConfig,
 	stripR2FromWrangler,
 	ensureSsrOptimizeDep,
 	ensurePreviewHmr,
+	previewScreenshotCommand,
 	readFilesFromSandbox,
+	refreshLiveTypes,
+	reportingRestores,
+	typeDeclarationsForModel,
 	type DeployResult,
 } from "./tools.js";
 import { buildInterviewPrompt, buildHoldingPrompt, buildBuildPrompt } from "./prompts.js";
@@ -72,12 +77,7 @@ import {
 } from "./readiness.js";
 import { equalTokenDigest } from "./project-auth.js";
 import type { ClientRecoveryState } from "../shared/client-recovery.js";
-import {
-	isSandboxRuntimeReplacement,
-	isSandboxWakeReset,
-	previewTokenForRoute,
-	previewTokenFromUrl,
-} from "./recovery.js";
+import { previewTokenForRoute, previewTokenFromUrl } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 import {
 	createAskQuestionsTool,
@@ -96,6 +96,7 @@ import {
 	markChatTurnFinished,
 	markChatTurnStarted,
 	planChatRecovery,
+	replyErrors,
 	replyStreamOptions,
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
@@ -104,6 +105,7 @@ import {
 import { AccountAuthStore, type IdentityBindings } from "./account-auth.js";
 import { readVerifiedAgentAuth, type VerifiedAgentAuth } from "./agent-authorization.js";
 import { BUILD_ACTIVITY_TTL_MS, type ProjectCatalogItem } from "./project-catalog-contract.js";
+import { imageSourcesFrom, type ImageSources } from "./image-sources.js";
 import { suggestNextSteps, suggestionContext, type Suggestion } from "./suggestions.js";
 import {
 	INITIAL_SCAFFOLD_PATHS,
@@ -112,15 +114,34 @@ import {
 	emptyInitialScaffoldContext,
 	type InitialScaffoldContext,
 } from "./initial-scaffold.js";
-import { drainProvisionTasks } from "./provisioning.js";
+import { drainProvisionTasks, preparedDependenciesCommand } from "./provisioning.js";
+import {
+	CMS_SCRIPT_TOOL,
+	CMS_SCRIPT_TOOLS,
+	CmsScriptRun,
+	DeferredSiteSync,
+	cmsScriptOutput,
+	createCmsScriptExecutor,
+	createCmsScriptTool,
+	type CmsScriptTarget,
+} from "./cms-script.js";
+import type { Executor } from "@cloudflare/codemode";
 import {
 	BuildConvergence,
 	canCompleteBuild,
 	mutationKey,
 	prepareBuildStep,
 	releaseStepPreviewImages,
+	type MutationScope,
 } from "./build-convergence.js";
-import { BUILDER_MODEL_ID, BUILDER_PROVIDER_OPTIONS, createBuilderModel } from "./model.js";
+import {
+	BUILDER_MODEL_ID,
+	BUILDER_REASONING_EFFORT,
+	builderProviderOptions,
+	createBuilderModel,
+	prepareBuildTurnStep,
+	requestedReasoningEffort,
+} from "./model.js";
 import {
 	McpToolFailureGuard,
 	ToolInputWhitespaceGuard,
@@ -133,9 +154,13 @@ import {
 	stagedLiveUpdate,
 } from "./mcp-tool-guard.js";
 import {
+	snapshotCloneCommand,
 	canReuseFinalSnapshotForTurn,
 	canSkipFinalSnapshot,
 	publishStagingCommand,
+	SNAPSHOT_GIT_DIR,
+	snapshotCommitCommand,
+	snapshotPushCommand,
 	snapshotStagingCommand,
 } from "./session-snapshot.js";
 import { renderErrorSummary } from "./render-diagnostics.js";
@@ -168,6 +193,7 @@ import {
 	timeSync,
 	type TurnMetricsInit,
 	type TurnMetricsRecord,
+	turnMetricsForState,
 } from "./turn-metrics.js";
 import {
 	validateBlockRendererContract,
@@ -176,9 +202,14 @@ import {
 	type ValidatedBlocksField,
 } from "./block-renderer-validation.js";
 
-import type { getSandbox as GetSandbox, Process as SandboxProcess } from "@cloudflare/sandbox";
-
-type SandboxInstance = ReturnType<typeof GetSandbox>;
+import {
+	DEV_SERVER_PROCESS_PREFIX,
+	isSandboxInterruption,
+	isSandboxNotRunning,
+	NOT_RESTORED,
+	RESTORED,
+	type SandboxOps,
+} from "./sandbox-ops.js";
 
 interface PublicationEnv {
 	WFP_RELEASES?: R2Bucket;
@@ -240,14 +271,18 @@ const PREPARED_TEMPLATES_PATH = "/home/user/.prepared";
 const BUILDER_TEMPLATE_DIR = "builder-cloudflare";
 const SNAPSHOT_PATH = "/tmp/emdash-build-session-snapshot";
 const PUBLISH_PATH = "/tmp/emdash-build-publish";
+const DEPLOY_PATH = "/tmp/emdash-build-deploy";
+const DEPLOY_HOME = "/tmp/emdash-build-deploy-home";
 const SNAPSHOT_PUSH_TIMEOUT_SECONDS = 45;
+const ARTIFACTS_WRITE_TOKEN_TTL_SECONDS = 900;
 const PUBLISH_STAGING_TIMEOUT_SECONDS = 110;
 const BACKUP_FAILURE_COOLDOWN_MS = 60_000;
+/** How long opening a site waits in the queue for a sandbox slot before giving up. */
+const SANDBOX_WAIT_MAX_MS = 10 * 60_000;
+const SLOTS_BUSY = "Every build slot is still busy. Try again in a few minutes.";
+const SITE_BEING_DELETED = "The site is being deleted.";
 const PRODUCTION_SNAPSHOT_PORT = 4322;
 const SNAPSHOT_PREPARATION_TIMEOUT_MS = 6 * 60_000;
-const QUICK_TUNNEL_SESSION_ID = "builder-tunnel";
-const DEV_SERVER_SESSION_ID = "builder-dev";
-const QUICK_TUNNEL_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 type PublishRunPhase =
 	| "checkpoint"
 	| "build"
@@ -299,6 +334,13 @@ const SSR_OPTIMIZE_EXCLUDES = ["astro/app/manifest"];
 const CLONE_TOKEN_TTL_SECONDS = 3600;
 /** Step cap for one build turn; see the streamText call in onChatMessage. */
 const BUILD_STEP_CAP = 256;
+/**
+ * Entry bodies are independent model calls with no tools, so they draft in
+ * parallel; publishing them through the dev server stays serial.
+ */
+const ENTRY_BODY_CONCURRENCY = 6;
+/** Reasoning counts against the limit, so leave room for it on top of 3-6 paragraphs. */
+const ENTRY_BODY_MAX_OUTPUT_TOKENS = 4096;
 
 /** Max console lines retained in memory for reload rehydration. */
 const CONSOLE_BUFFER_MAX = 500;
@@ -386,7 +428,7 @@ const MUTATING_MCP_TOOLS = new Set([
 ]);
 
 async function withBuildMutation<T>(
-	convergence: BuildConvergence,
+	convergence: MutationScope,
 	operation: () => Promise<T>,
 	key?: string,
 	cacheResult: (result: T) => boolean = () => true,
@@ -394,10 +436,27 @@ async function withBuildMutation<T>(
 	return convergence.runMutation(operation, { key, cacheResult });
 }
 
+/** What a mutation syncs afterwards; a CMS program defers it to the program's end. */
+export interface SiteSync {
+	refreshPreview(): Promise<void>;
+	checkpoint(): Promise<void>;
+}
+
+interface BackupOptions {
+	quiet?: boolean;
+	skipIfUnchanged?: boolean;
+	/** Return once the snapshot is committed; upload it in the background. */
+	background?: boolean;
+}
+
 interface SiteRecoveryResult {
 	ready: boolean;
 	previewUrl?: string;
 	error?: string;
+	/** The site came back from its last checkpoint, so changes since then may be gone. */
+	restored?: boolean;
+	/** It failed with the site left as it was, serving on a container that kept running. */
+	untouched?: boolean;
 }
 
 interface ProvisionResult extends SiteRecoveryResult {
@@ -409,10 +468,29 @@ function shellQuote(s: string): string {
 	return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function decodeBase64(value: string): Uint8Array {
-	const decoded = atob(value);
-	const bytes = new Uint8Array(decoded.length);
-	for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+/** The stream's first `limit` bytes, or all of it if shorter; the rest is not read. */
+async function readAtMost(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	try {
+		while (length < limit) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+			length += value.byteLength;
+		}
+	} finally {
+		await reader.cancel().catch(() => undefined);
+	}
+	const bytes = new Uint8Array(Math.min(length, limit));
+	let offset = 0;
+	for (const chunk of chunks) {
+		const part = chunk.subarray(0, bytes.length - offset);
+		bytes.set(part, offset);
+		offset += part.byteLength;
+		if (offset === bytes.length) break;
+	}
 	return bytes;
 }
 
@@ -496,7 +574,7 @@ export interface BuilderState extends BuilderReadinessState {
 	/** Quality-filtered metrics for the completed first build. */
 	initialBuildBenchmark?: InitialBuildBenchmark;
 	/** Cost and timing of the most recent model turn, for smoke runs. */
-	lastTurnMetrics?: TurnMetricsRecord;
+	lastTurnMetrics?: Omit<TurnMetricsRecord, "stepTimings">;
 	previewUrl?: string;
 	provisionError?: string;
 	/** A visible warning when the latest site checkpoint could not be persisted. */
@@ -536,6 +614,62 @@ export interface BuilderState extends BuilderReadinessState {
 	appHost?: string;
 	/** Next-step prompts for the composer, from a small model after the latest successful build. */
 	suggestions?: Suggestion[];
+	/**
+	 * Every sandbox slot is taken: the site waits behind `ahead` others (unknown
+	 * when the platform is full), or `gaveUp` waiting until it is retried.
+	 */
+	sandboxWait?: { ahead?: number; gaveUp?: boolean };
+	/** The idle container was stopped; the saved site starts again when it is opened or used. */
+	sandboxPaused?: boolean;
+}
+
+/** A Workers RPC failure that the platform says may succeed if repeated. */
+function isRetryableObjectError(error: unknown): boolean {
+	const flags = error as { retryable?: unknown; overloaded?: unknown } | null;
+	return Boolean(flags && flags.retryable === true && flags.overloaded !== true);
+}
+
+/** Resolve after `ms`, or reject with the abort reason as soon as `signal` aborts. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(signal.reason);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal!.reason);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/** `promise`'s value, or undefined as soon as `signal` aborts; the work itself goes on. */
+function unlessAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+	if (!signal) return promise;
+	return new Promise((resolve, reject) => {
+		const onAbort = () => resolve(undefined);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
+}
+
+/** `promise`, or its abort reason as soon as `signal` aborts; the work itself goes on. */
+async function abortableWait<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	const value = await unlessAborted(promise, signal);
+	signal?.throwIfAborted();
+	return value as T;
 }
 
 /** True for hosts that resolve to the local machine (dev servers). */
@@ -644,6 +778,8 @@ function isTransientDevServerError(text: string): boolean {
  */
 function friendlyTurnError(error: unknown): string {
 	const m = error instanceof Error ? error.message : String(error);
+	// The owner can act on this one as it stands.
+	if (m === SLOTS_BUSY) return m;
 	if (
 		/rollout|signalled the container to exit|container .*(exit|not ready|unavailable|starting)|no container instance|failed to start|container is not running|network connection lost|blockConcurrencyWhile|durable object.*reset|internal error/i.test(
 			m,
@@ -729,7 +865,7 @@ const schemaSlug = z
 	.min(1)
 	.max(63)
 	.regex(/^[a-z][a-z0-9_]*$/);
-// Mirrors EmDash 0.40's RESERVED_FIELD_SLUGS for collection-plan preflight.
+// Mirrors EmDash 1.1's RESERVED_FIELD_SLUGS for collection-plan preflight.
 // Core remains authoritative; this prevents an otherwise-valid batch from
 // partially mutating before schema_create_field reports the reserved name.
 const RESERVED_COLLECTION_FIELD_SLUGS = new Set([
@@ -758,6 +894,19 @@ const collectionFieldSlug = schemaSlug
 	.describe(
 		"Field slug. Do not declare built-in entry fields: id, slug, status, timestamps, terms, or bylines.",
 	);
+// Mirrors EmDash 1.1's RESERVED_COLLECTION_SLUGS, names its own routes shadow, so a
+// plan cannot create its earlier collections and then fail on this one.
+const RESERVED_COLLECTION_SLUGS = new Set([
+	"content",
+	"media",
+	"users",
+	"revisions",
+	"taxonomies",
+	"options",
+	"audit_logs",
+	"reorder",
+	"relations",
+]);
 const stringOptions = z.array(z.string().min(1)).min(1);
 const mimeTypes = z.array(z.string().min(1)).min(1).max(64);
 const blockFieldBase = z.object({
@@ -840,22 +989,27 @@ const blockFieldSchema = z.discriminatedUnion("type", [
 const ordinaryFieldSchema = z.object({
 	slug: collectionFieldSlug,
 	label: z.string().min(1),
-	type: z.enum([
-		"string",
-		"text",
-		"number",
-		"integer",
-		"boolean",
-		"datetime",
-		"select",
-		"multiSelect",
-		"portableText",
-		"image",
-		"file",
-		"reference",
-		"json",
-		"slug",
-	]),
+	// Block fields have a url type and collection fields do not, so the model
+	// mixes them up: a collection's link field is a string.
+	type: z
+		.enum([
+			"string",
+			"text",
+			"number",
+			"integer",
+			"boolean",
+			"datetime",
+			"select",
+			"multiSelect",
+			"portableText",
+			"image",
+			"file",
+			"reference",
+			"json",
+			"slug",
+			"url",
+		])
+		.transform((type) => (type === "url" ? "string" : type)),
 	required: z.boolean().optional(),
 	unique: z.boolean().optional(),
 	defaultValue: z.unknown().optional(),
@@ -892,11 +1046,14 @@ const blocksFieldSchema = z
 	.strict();
 
 const collectionPlanSchema = z.object({
-	slug: schemaSlug,
+	slug: schemaSlug.refine(
+		(slug) => !RESERVED_COLLECTION_SLUGS.has(slug),
+		`Collection slugs cannot be ${[...RESERVED_COLLECTION_SLUGS].join(", ")}`,
+	),
 	label: z.string().min(1),
 	labelSingular: z.string().optional(),
 	description: z.string().optional(),
-	icon: z.string().optional(),
+	icon: z.string().trim().max(64).optional(),
 	supports: z
 		.array(z.enum(["drafts", "revisions", "preview", "scheduling", "search", "seo"]))
 		.optional(),
@@ -905,11 +1062,19 @@ const collectionPlanSchema = z.object({
 	urlPattern: z
 		.string()
 		.regex(/^\/(?!\/)[^{}]*(?:\{(?:slug|id)\}[^{}]*)+$/)
+		// EmDash 1.1 refuses two in one segment, and only once it has created the collection.
+		.refine(
+			(pattern) =>
+				pattern
+					.split("/")
+					.every((segment) => (segment.match(/\{(?:slug|id)\}/g) ?? []).length <= 1),
+			"Use at most one placeholder per path segment, e.g. /journal/{slug}, not /journal/{slug}-{id}. To keep an existing collection's URLs, leave urlPattern out",
+		)
 		.optional()
 		.describe(
 			'Public URL of one entry, matching its Astro detail route, e.g. "/{slug}" for ' +
 				'pages or "/journal/{slug}". Menus and the sitemap link entries here; without ' +
-				"it they use /{collection}/{slug}. Placeholders: {slug}, {id}.",
+				"it they use /{collection}/{slug}. Placeholders: {slug}, {id}, at most one per path segment.",
 		),
 	fields: z
 		.array(z.union([ordinaryFieldSchema, blocksFieldSchema]))
@@ -930,7 +1095,15 @@ const schemaPlanInput = z
 						description: z.string().optional(),
 						icon: z.string().optional(),
 						category: z.string().optional(),
-						fields: z.array(blockFieldSchema),
+						// EmDash takes only absolute URLs in a url field, and the model fills
+						// its link fields with internal paths such as "/events": a string.
+						fields: z
+							.array(blockFieldSchema)
+							.transform((fields) =>
+								fields.map((field) =>
+									field.type === "url" ? { ...field, type: "string" as const } : field,
+								),
+							),
 					})
 					.strict(),
 			)
@@ -1021,10 +1194,16 @@ function comparableBlockField(field: unknown): unknown {
 	return canonicalContract(record);
 }
 
+/** A live block field as a plan would declare it now: plans make url fields strings. */
+function asPlanned(field: unknown): unknown {
+	const record = recordValue(field);
+	return comparableBlockField(record?.type === "url" ? { ...record, type: "string" } : field);
+}
+
 function inspectBlockType(
 	parsed: unknown,
 	plan?: BlockTypePlan,
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true; urlFields: string[] } | { ok: false; reason: string } {
 	const item = extractedBlockType(parsed);
 	if (!item) return { ok: false, reason: "the block type response was incomplete" };
 	const versions = item.versions as unknown[];
@@ -1039,7 +1218,7 @@ function inspectBlockType(
 	if (!Array.isArray(active.fields)) {
 		return { ok: false, reason: "its active fields are missing" };
 	}
-	if (!plan) return { ok: true };
+	if (!plan) return { ok: true, urlFields: [] };
 	if (item.slug !== plan.slug || item.label !== plan.label) {
 		return { ok: false, reason: "its slug or label differs from the plan" };
 	}
@@ -1049,12 +1228,16 @@ function inspectBlockType(
 		}
 	}
 	if (
-		JSON.stringify((active.fields as unknown[]).map(comparableBlockField)) !==
+		JSON.stringify((active.fields as unknown[]).map(asPlanned)) !==
 		JSON.stringify(plan.fields.map(comparableBlockField))
 	) {
 		return { ok: false, reason: "its active fields differ from the plan" };
 	}
-	return { ok: true };
+	const urlFields = (active.fields as unknown[])
+		.map(recordValue)
+		.filter((field) => field?.type === "url")
+		.map((field) => String(field?.slug));
+	return { ok: true, urlFields };
 }
 
 function collectionFieldMap(
@@ -1274,13 +1457,37 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * work is live; only work begun here can.
 	 */
 	private liveBuildWork = new Map<string, { kind: string; startedAt: number }>();
+	/** Every kind of owner work this instance is running; it cannot outlive the instance. */
+	private readonly liveOwnerWork = new Set<string>();
 	/** What this instance last told the owner's catalogue about building. */
 	private reportedBuilding = false;
 	private lastBuildReportAt = 0;
 	private buildActivityChain: Promise<void> = Promise.resolve();
 
+	/** Before this instance writes state, its progress describes work an evicted instance ran. */
+	private resetProgressLeftByEviction(): void {
+		if (this.stateWrittenHere || !this.hasProgressInState()) return;
+		// A recovered turn marks itself active again when it resumes.
+		this.setState({
+			...this.state,
+			status: "",
+			previewRestarting: false,
+			turnActive: false,
+			...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
+		});
+	}
+
 	private hasProgressInState(): boolean {
-		return Boolean(this.state.status || this.state.previewRestarting || this.state.turnActive);
+		return Boolean(
+			this.state.status ||
+			this.state.previewRestarting ||
+			this.state.turnActive ||
+			this.isWaitingForSandbox(),
+		);
+	}
+
+	private isWaitingForSandbox(): boolean {
+		return Boolean(this.state.sandboxWait && !this.state.sandboxWait.gaveUp);
 	}
 
 	override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
@@ -1288,16 +1495,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		super.broadcast(message, [...new Set([...(without ?? []), ...invalid])]);
 	}
 
-	private sandbox: SandboxInstance | null = null;
-
 	/** Bounded in-memory console history, for reload/late-connect rehydration. */
 	private consoleBuffer: string[] = [];
 	private devServerErrors: Array<{ at: number; text: string }> = [];
 
 	/** Process id of the running `pnpm dev` server, for a clean restart. */
 	private devServerProcessId?: string;
-	private devServerProcess?: SandboxProcess;
-	private quickTunnelProcess?: SandboxProcess;
 
 	/**
 	 * Set when a build turn actually runs. Guards the auto-started build turn
@@ -1311,6 +1514,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private buildStarted = false;
 	private activeInitialRequestId?: string;
 	private activeInitialUserMessageId?: string;
+	/** The running chat turn's request, which Stop cancels from any tab. */
+	private activeTurnRequestId?: string;
 	private activeBuildConvergences = new Map<string, BuildConvergence>();
 	private stopPromise: Promise<void> | null = null;
 	/** Set by restartInterruptedTurn for the one turn it enqueues. */
@@ -1417,6 +1622,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	async stopGeneration(generationId?: string): Promise<boolean> {
+		// A tab that did not send the running turn's request, after a reload or on
+		// another device, has none to cancel, so the turn is stopped here.
+		if (this.activeTurnRequestId) this.abortRequest(this.activeTurnRequestId);
 		await this.requestStop(generationId);
 		return true;
 	}
@@ -1443,21 +1651,41 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * before provision is durable in this.state.
 	 */
 	private provisionPromise: Promise<ProvisionResult> | null = null;
+	/** The provision that last finished, so a stopped container can make the next turn recover. */
+	private settledProvision: Promise<ProvisionResult> | null = null;
 	private activeProvisionPromise: Promise<ProvisionResult> | null = null;
 	private provisionController: AbortController | null = null;
 
 	/** Serialize checkpoints so every caller waits for a snapshot containing its mutation. */
 	private backupChain: Promise<void> = Promise.resolve();
+	/** The latest committed snapshot and the preview generation it was staged at. */
+	private committedSnapshot?: { seq: number; generation: number | undefined };
+	private pushedSnapshotSeq = 0;
+	private pushTail: Promise<void> = Promise.resolve();
+	/** The committed snapshot a later checkpoint failed after; uploads up to it do not clear the error. */
+	private unsavedAfterSeq?: number;
 	private deletionPromise?: Promise<"deleted" | "retry">;
 	private backupRetryAfter = 0;
 	private lastSavedPreviewGeneration?: number;
 
 	/** Coalesce sidebar, chat-recovery and restart requests for the same sleeping site. */
 	private recoveryPromise: Promise<SiteRecoveryResult> | null = null;
+	/** Deletion ends a recovery's wait for a slot: the site is going, and its place goes to the next. */
+	private recoverySlotWait?: AbortController;
+	/** An idle-stop check under way, which later asks share. */
+	private stopCheck?: Promise<{ busy: boolean }>;
 	private recoveryReconnectMcp = false;
 
 	/** Astro's Cloudflare dev runner becomes unresponsive under parallel MCP requests. */
 	private mcpCallQueue = new SerialTaskQueue();
+	/** The background preview render after mutations, and whether another is due. */
+	private previewRefreshRunning?: Promise<void>;
+	private previewRenderInFlight?: Promise<void>;
+	/** A render one CMS call already waited out; later calls go ahead beside it. */
+	private previewRenderOutwaited?: Promise<void>;
+	private previewRefreshQueued?: { initialBuild: boolean };
+	/** How long a CMS call waits for a background render before going ahead. */
+	private previewRenderWaitMs = 5_000;
 
 	/**
 	 * Cached template AGENTS.md (per-template body included). Populated
@@ -1507,6 +1735,34 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			base64: string;
 		}>`SELECT base64 FROM builder_preview_thumbnails WHERE shot_id = ${shotId}`[0];
 		return row ? { base64: row.base64, mediaType: "image/png" } : null;
+	}
+
+	/**
+	 * A restore no tool result has reported to the model yet. Kept in storage:
+	 * the object can be evicted between the restore and the turn that hears it.
+	 */
+	private get restoreUnreported(): boolean {
+		return this.readSecret("restoreUnreported") === "1";
+	}
+
+	private set restoreUnreported(unreported: boolean) {
+		if (unreported) {
+			this.writeSecret("restoreUnreported", "1");
+		} else {
+			this.ensureSecretsTable();
+			this.sql`DELETE FROM builder_secrets WHERE k = 'restoreUnreported'`;
+		}
+	}
+
+	/** A server-only value that is not broadcast with state. */
+	private readSecret(key: string): string | undefined {
+		this.ensureSecretsTable();
+		return this.sql<{ v: string }>`SELECT v FROM builder_secrets WHERE k = ${key}`[0]?.v;
+	}
+
+	private writeSecret(key: string, value: string): void {
+		this.ensureSecretsTable();
+		this.sql`INSERT OR REPLACE INTO builder_secrets (k, v) VALUES (${key}, ${value})`;
 	}
 
 	private persistApiToken(token: string) {
@@ -1605,6 +1861,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private beginOwnerActivity(id: string, kind: string) {
+		this.liveOwnerWork.add(id);
 		this.ensureOwnerActivityTable();
 		this.sql`INSERT OR IGNORE INTO owner_activity (id, kind, started_at)
 			VALUES (${id}, ${kind}, ${Date.now()})`;
@@ -1622,6 +1879,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private finishOwnerActivity(id: string) {
+		this.liveOwnerWork.delete(id);
 		this.ensureOwnerActivityTable();
 		this.sql`DELETE FROM owner_activity WHERE id = ${id}`;
 		if (id.startsWith("chat:")) this.syncTurnActive();
@@ -1729,7 +1987,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!stale && Boolean(this.state.turnActive) === active) return;
 		this.setState({
 			...this.state,
-			...(stale && { status: "", previewRestarting: false }),
+			...(stale && {
+				status: "",
+				previewRestarting: false,
+				...(this.isWaitingForSandbox() && { sandboxWait: undefined }),
+			}),
 			turnActive: active,
 		});
 	}
@@ -1748,6 +2010,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private hasOwnerActivity(): boolean {
 		this.ensureOwnerActivityTable();
 		return this.sql<{ id: string }>`SELECT id FROM owner_activity LIMIT 1`.length > 0;
+	}
+
+	/** Work started within the longest any work should take; older rows are hung or left over. */
+	private hasRecentOwnerActivity(): boolean {
+		this.ensureOwnerActivityTable();
+		const since = Date.now() - BUILD_ACTIVITY_MAX_MS;
+		return (
+			this.sql<{ id: string }>`SELECT id FROM owner_activity WHERE started_at > ${since} LIMIT 1`
+				.length > 0
+		);
 	}
 
 	private hasOwnerActivityKind(kind: string): boolean {
@@ -1918,6 +2190,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				this.abortAllRequests();
 				await this.requestStop(this.state.initialGeneration?.id);
 			}
+			// A recovery still queued for a slot would start a container for a site being deleted.
+			const slotWait = this.recoverySlotWait;
+			if (slotWait) {
+				slotWait.abort();
+				await this.recoveryPromise?.catch(() => undefined);
+			}
 			const stable = await this.waitUntilStable({ timeout: 10_000 });
 			if (stable) {
 				for (const row of this.sql<{
@@ -1947,6 +2225,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		this.deletionPromise ??= (async () => {
 			await this.backupChain;
+			await this.pushTail;
 			try {
 				await this.eraseProjectData();
 				return "deleted" as const;
@@ -2110,8 +2389,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** Local validation hook: revoke forwarding without touching the site disk. */
 	async deactivatePreviewForValidation() {
 		return this.withOwnerActivity("validation-deactivate", async () => {
-			const sandbox = this.getOrCreateSandbox();
-			if (this.usesQuickTunnelPreview()) await this.stopQuickTunnel(sandbox);
+			const sandbox = this.sandboxOps();
+			if (this.usesQuickTunnelPreview()) await sandbox.closeTunnel(4321);
 			else await sandbox.unexposePort(4321);
 			return { success: true, previewUrl: this.state.previewUrl };
 		});
@@ -2122,74 +2401,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!mode || mode === "expose-port") return false;
 		if (mode === "quick-tunnel") return true;
 		throw new Error("SANDBOX_PREVIEW_MODE must be expose-port or quick-tunnel.");
-	}
-
-	private async quickTunnelUrl(process: SandboxProcess): Promise<string | undefined> {
-		const status = await process.getStatus().catch(() => process.status);
-		if (status !== "starting" && status !== "running") return;
-		const logs = await process.getLogs().catch(() => undefined);
-		const match = `${logs?.stdout ?? ""}\n${logs?.stderr ?? ""}`.match(QUICK_TUNNEL_URL);
-		return match ? `${match[0].replace(/\/$/, "")}/` : undefined;
-	}
-
-	private async getOrCreateProcessSession(sandbox: SandboxInstance, id: string) {
-		try {
-			return await sandbox.createSession({ id });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
-				return sandbox.getSession(id);
-			}
-			if (!/already exists/i.test(message)) throw error;
-			return sandbox.getSession(id);
-		}
-	}
-
-	private async stopQuickTunnel(sandbox = this.getOrCreateSandbox()): Promise<void> {
-		this.quickTunnelProcess = undefined;
-		const session = await this.getOrCreateProcessSession(sandbox, QUICK_TUNNEL_SESSION_ID);
-		const processes = await session.listProcesses().catch(() => []);
-		await Promise.all(
-			processes
-				.filter((process) => process.command.includes("cloudflared tunnel"))
-				.map((process) => process.kill("SIGTERM").catch(() => undefined)),
-		);
-	}
-
-	private async exposeQuickTunnel(sandbox: SandboxInstance): Promise<{ url: string }> {
-		if (this.quickTunnelProcess) {
-			const url = await this.quickTunnelUrl(this.quickTunnelProcess);
-			if (url) return { url };
-			this.quickTunnelProcess = undefined;
-		}
-		const session = await this.getOrCreateProcessSession(sandbox, QUICK_TUNNEL_SESSION_ID);
-		const processes = await session.listProcesses().catch(() => []);
-		for (const process of processes) {
-			if (!process.command.includes("cloudflared tunnel")) continue;
-			const url = await this.quickTunnelUrl(process);
-			if (url) {
-				this.quickTunnelProcess = process;
-				return { url };
-			}
-			await process.kill("SIGTERM").catch(() => undefined);
-		}
-
-		this.sendConsole("$ cloudflared tunnel (Worker Preview)");
-		const process = await session.startProcess(
-			"cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:4321",
-			{ cwd: SITE_PATH },
-		);
-		this.quickTunnelProcess = process;
-		try {
-			const ready = await process.waitForLog(QUICK_TUNNEL_URL, 30_000);
-			const url = ready.match?.[0] ?? ready.line.match(QUICK_TUNNEL_URL)?.[0];
-			if (!url) throw new Error("cloudflared did not report a public URL.");
-			return { url: `${url.replace(/\/$/, "")}/` };
-		} catch (error) {
-			await process.kill("SIGTERM").catch(() => undefined);
-			if (this.quickTunnelProcess === process) this.quickTunnelProcess = undefined;
-			throw error;
-		}
 	}
 
 	/**
@@ -2231,43 +2442,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Reactivate the stable preview URL for the Sandbox's current runtime. */
 	private async exposePreview(hostname: string): Promise<{ url: string }> {
-		// Authorization survives a container restart, but current Sandbox SDKs
-		// require exposePort() again to activate forwarding for the new runtime.
-		// getExposedPorts() returns only currently-active ports.
-		const sandbox = this.getOrCreateSandbox();
-		if (this.usesQuickTunnelPreview()) return this.exposeQuickTunnel(sandbox);
-		const existing = await sandbox
-			.getExposedPorts(hostname)
-			.then((ports) => ports.find((entry) => entry.port === 4321))
-			.catch(() => undefined);
-		if (existing) return { url: existing.url };
-
-		try {
-			return await sandbox.exposePort(4321, {
-				hostname,
-				name: "preview",
-				token: this.ensurePreviewToken(),
-			});
-		} catch (error) {
-			// Container startup restores persisted ports asynchronously. Close the
-			// race where it becomes exposed between the list and expose calls.
-			if (!/already exposed/i.test(error instanceof Error ? error.message : String(error))) {
-				throw error;
-			}
-			const restored = (await sandbox.getExposedPorts(hostname)).find(
-				(entry) => entry.port === 4321,
-			);
-			if (restored) return { url: restored.url };
-
-			// A stale container-side exposure can outlive the SDK token record.
-			// Clear that orphan and recreate it with our persisted preview token.
-			await sandbox.unexposePort(4321);
-			return await sandbox.exposePort(4321, {
-				hostname,
-				name: "preview",
-				token: this.ensurePreviewToken(),
-			});
-		}
+		const sandbox = this.sandboxOps();
+		if (this.usesQuickTunnelPreview()) return sandbox.openTunnel(4321);
+		return sandbox.exposePort(4321, { hostname, token: this.ensurePreviewToken() });
 	}
 
 	private persistArtifactsRemote(remote: string) {
@@ -2299,11 +2476,37 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * The repo name is the DO id; the namespace is the binding's. Returns the
 	 * git remote and a fresh write token.
 	 */
-	private async ensureArtifactsRepo(): Promise<{ remote: string; token: string }> {
+	/** A write token cached across checkpoints; minting one per checkpoint costs a round trip. */
+	private artifactsWriteAccess?: { remote: string; token: string; expiresAt: number };
+
+	private async writableArtifactsRepo(): Promise<{ remote: string; token: string }> {
+		const cached = this.artifactsWriteAccess;
+		if (cached && Date.now() < cached.expiresAt) return cached;
+		const access = await this.ensureArtifactsRepo();
+		// Only a token of known lifetime is reused, and renewed well before a long push outlives it.
+		if (access.ttlSeconds) {
+			this.artifactsWriteAccess = {
+				remote: access.remote,
+				token: access.token,
+				expiresAt: Date.now() + Math.min(10 * 60_000, (access.ttlSeconds * 1000) / 2),
+			};
+		}
+		return access;
+	}
+
+	private async ensureArtifactsRepo(): Promise<{
+		remote: string;
+		token: string;
+		ttlSeconds?: number;
+	}> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("write", 900);
-			return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
+			return {
+				remote: await this.resolveArtifactsRemote(repo),
+				token: tok.plaintext,
+				ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
+			};
 		} catch (err) {
 			if (!isArtifactsNotFound(err)) throw err;
 			// First save for this session: create the repo. `create` returns a
@@ -2377,48 +2580,133 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return { success: true };
 	}
 
-	private getOrCreateSandbox() {
-		if (!this.sandbox) {
-			this.sandbox = getSandbox(this.env.Sandbox, this.name, {
-				sleepAfter: this.usesQuickTunnelPreview() ? "30m" : "5m",
-			});
-		}
-		return this.sandbox;
+	/** The project's Sandbox. A stub is cheap, and a fresh one outlives the object restarting. */
+	private sandboxOps(): SandboxOps {
+		return this.env.Sandbox.getByName(this.name) as unknown as SandboxOps;
 	}
 
+	/**
+	 * The Sandbox as the model's tools reach it. A call that found the
+	 * container stopped ran nothing, so the site is restored from its last
+	 * checkpoint and the call fails with a message saying so: changes since
+	 * that checkpoint, earlier writes of the same tool or of tools whose upload
+	 * had not finished, may be gone, and a read would not show it. Recovery
+	 * itself uses `sandboxOps`.
+	 */
+	private toolSandboxOps(signal?: AbortSignal): SandboxOps {
+		const sandbox = this.sandboxOps();
+		// Methods are called as properties of the stub: an RPC stub answers every
+		// property, apply and call included, with a remote method.
+		const call = (target: SandboxOps, property: PropertyKey, args: unknown[]) =>
+			(target as unknown as Record<PropertyKey, (...a: unknown[]) => Promise<unknown>>)[property]!(
+				...args,
+			);
+		return new Proxy(sandbox, {
+			get: (target, property) => {
+				// Not a promise: awaiting the proxy must not call a remote then().
+				if (property === "then") return undefined;
+				const method = Reflect.get(target, property) as unknown;
+				if (typeof method !== "function") return method;
+				return async (...args: unknown[]) => {
+					// Another call's restore may still be cloning onto the new container's empty disk.
+					const restore = this.recoveryPromise;
+					if (restore) {
+						// A restore can wait minutes for a slot: a stopped turn's call goes on without it.
+						const recovered = await abortableWait(
+							restore.catch((): SiteRecoveryResult => ({ ready: false })),
+							signal,
+						);
+						// A failed one can leave a running container with no site, or part of one;
+						// one that left the site as it was leaves this call to run on it.
+						if (!recovered.ready && !recovered.untouched) {
+							throw new Error(
+								recovered.error ? `${NOT_RESTORED} ${recovered.error}` : NOT_RESTORED,
+							);
+						}
+						// This call's tool may have written before it, as for the call that found the stop.
+						if (recovered.restored) this.restoreUnreported = true;
+					}
+					// Every call is told, the preview's Resume's restore included, until a tool
+					// result has carried it to the model: a call that gave up waiting, or a tool
+					// that caught it, would otherwise use it up unheard.
+					if (this.restoreUnreported) throw new Error(RESTORED);
+					try {
+						return await call(target, property, args);
+					} catch (error) {
+						if (!isSandboxNotRunning(error)) throw error;
+						this.sendConsole("The site's container had stopped; restoring it...");
+						const recovered = await abortableWait(
+							this.recoverSite(this.recoveryHostname(), true),
+							signal,
+						).catch((recoveryError: unknown) => {
+							// A recovery that failed outright failed all the same: nothing ran.
+							if (signal?.aborted) throw recoveryError;
+							this.sendConsole(
+								`Warning: the site could not be restored: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+							);
+							throw error;
+						});
+						if (!recovered.ready && !recovered.untouched) throw error;
+						// The site was still there: the refused call ran nothing, and nothing is lost.
+						if (!recovered.restored) return await call(target, property, args);
+						this.restoreUnreported = true;
+						throw new Error(RESTORED);
+					}
+				};
+			},
+		});
+	}
+
+	/** A finished tool call whose error or result carries the restore message has told the model. */
+	private noteToolCallReported(event: {
+		success: boolean;
+		output?: unknown;
+		error?: unknown;
+	}): void {
+		if (!this.restoreUnreported) return;
+		const text = event.success
+			? JSON.stringify(event.output ?? null)
+			: event.error instanceof Error
+				? event.error.message
+				: String(event.error);
+		// Its first sentence: a tool may cut the rest of a long error.
+		if (text?.includes(RESTORED.slice(0, RESTORED.indexOf(".") + 1))) {
+			this.restoreUnreported = false;
+		}
+	}
+
+	/** Where recovery exposes the preview: the local app host in development. */
+	private recoveryHostname(): string {
+		const appHost = this.state.appHost;
+		return appHost && isLocalHostname(appHost) ? appHost : this.env.PREVIEW_HOSTNAME;
+	}
+
+	/** A read that is safe to repeat, retried once when the Sandbox object restarts under it. */
 	private async runSandboxRead<T>(
-		operation: (sandbox: SandboxInstance) => Promise<T>,
+		operation: (sandbox: SandboxOps) => Promise<T>,
 		signal?: AbortSignal,
 	): Promise<T> {
 		try {
-			return await operation(this.getOrCreateSandbox());
+			return await operation(this.toolSandboxOps(signal));
 		} catch (error) {
-			if (!isSandboxRuntimeReplacement(error)) throw error;
-			this.sendConsole("Sandbox runtime changed; retrying the read...");
-			this.sandbox = null;
+			if (!isRetryableObjectError(error)) throw error;
 			await new Promise((resolve) => setTimeout(resolve, 750));
 			signal?.throwIfAborted();
-			return operation(this.getOrCreateSandbox());
+			return operation(this.toolSandboxOps(signal));
 		}
 	}
 
-	/** Retry the first harmless command when the Sandbox DO is reset while waking. */
+	/** A probe that is safe to repeat, retried while the Sandbox object restarts under it. */
 	private async execRecoveryCommand(command: string, timeout: number) {
-		let lastError: unknown;
-		for (let attempt = 1; attempt <= 3; attempt++) {
+		for (let attempt = 1; ; attempt++) {
 			try {
-				return await this.getOrCreateSandbox().exec(command, { timeout });
+				return await this.sandboxOps().exec(command, { timeout });
 			} catch (error) {
-				lastError = error;
-				if (!isSandboxWakeReset(error) || attempt === 3) throw error;
-				this.sendConsole(`Sandbox wake was reset; retrying (${attempt}/3)...`);
-				this.sandbox = null;
-				this.devServerProcess = undefined;
-				this.devServerProcessId = undefined;
+				if (!isRetryableObjectError(error) || attempt === 3) throw error;
+				this.sendConsole(`The Sandbox restarted; retrying (${attempt}/3)...`);
 				await new Promise((resolve) => setTimeout(resolve, attempt * 750));
 			}
 		}
-		throw lastError;
 	}
 
 	/**
@@ -2462,7 +2750,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const result = await sandbox.refreshPreview(path);
 			// A route that renders but is uncacheable (negotiated Vary) is served live.
 			if (result.success || result.rendered) return true;
-			this.sendConsole(`Warning: preview snapshot returned HTTP ${result.status ?? "unknown"}.`);
+			this.sendConsole(
+				result.error
+					? `Warning: preview snapshot failed: ${result.error}`
+					: `Warning: preview snapshot returned HTTP ${result.status ?? "unknown"}.`,
+			);
 		} catch (error) {
 			this.sendConsole(
 				`Warning: preview snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2471,8 +2763,64 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return false;
 	}
 
-	private refreshAndReloadPreview(initialBuild = false): Promise<void> {
-		return this.refreshAndReloadPreviewInternal(initialBuild);
+	/**
+	 * After a mutation: mark every preview snapshot stale before the tool
+	 * returns, then re-render and reload the preview in the background. Renders
+	 * are coalesced: mutations during one lead to one more render of the newest
+	 * revision. The model's own checks read the dev server directly, so they
+	 * never wait for this.
+	 */
+	private async refreshAndReloadPreview(initialBuild = false): Promise<void> {
+		try {
+			await this.env.Sandbox.getByName(this.name).invalidatePreviewSnapshots();
+		} catch (error) {
+			this.sendConsole(
+				`Warning: preview snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		this.previewRefreshQueued = {
+			initialBuild: initialBuild || (this.previewRefreshQueued?.initialBuild ?? false),
+		};
+		if (this.previewRefreshRunning) return;
+		const running = (async () => {
+			try {
+				while (this.previewRefreshQueued) {
+					const queued = this.previewRefreshQueued;
+					this.previewRefreshQueued = undefined;
+					const render = this.refreshAndReloadPreviewInternal(queued.initialBuild, {
+						invalidate: false,
+					});
+					this.previewRenderInFlight = render;
+					try {
+						await render;
+					} catch (error) {
+						console.warn("[BuilderAgent] background preview refresh failed:", error);
+					}
+				}
+			} finally {
+				// Cleared as the queue drains, so a refresh queued from here on starts a new loop.
+				this.previewRefreshRunning = undefined;
+				this.previewRenderInFlight = undefined;
+			}
+		})();
+		this.previewRefreshRunning = running;
+		this.ctx.waitUntil(running);
+	}
+
+	/**
+	 * The dev server stalls under concurrent renders and CMS requests, so a CMS
+	 * call lets the render in flight finish first: only that one, for a bounded
+	 * time, and not past a Stop. Once a call has waited a render out, later
+	 * calls go ahead, so a wedged render cannot hold every call.
+	 */
+	private async previewRendersIdle(signal?: AbortSignal): Promise<void> {
+		const render = this.previewRenderInFlight;
+		if (!render || render === this.previewRenderOutwaited || signal?.aborted) return;
+		const stopped = new Promise<void>((resolve) =>
+			signal?.addEventListener("abort", () => resolve(), { once: true }),
+		);
+		const settled = await Promise.race([settleWithin(render, this.previewRenderWaitMs), stopped]);
+		if (settled?.status === "timeout") this.previewRenderOutwaited = render;
 	}
 
 	/**
@@ -2480,12 +2828,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * re-render `/` and the routes open in the builder so the reload that
 	 * follows shows current HTML on whatever page the user is viewing.
 	 */
-	private async refreshPreviewSnapshots(): Promise<boolean> {
+	private async refreshPreviewSnapshots({
+		invalidate = true,
+	}: { invalidate?: boolean } = {}): Promise<boolean> {
 		try {
 			const sandbox = this.env.Sandbox.getByName(this.name);
-			const [home] = await sandbox.refreshPreviews(["/", ...this.viewedPreviewPaths()], {
-				invalidate: true,
-			});
+			const [home] = await sandbox.refreshPreviews(
+				["/", ...this.viewedPreviewPaths()],
+				invalidate ? { invalidate: true } : {},
+			);
 			if (home?.success || home?.rendered) return true;
 			this.sendConsole(
 				home?.error
@@ -2575,8 +2926,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
-	private async refreshAndReloadPreviewInternal(initialBuild = false): Promise<void> {
-		const refreshed = await this.refreshPreviewSnapshots();
+	private async refreshAndReloadPreviewInternal(
+		initialBuild = false,
+		options: { invalidate?: boolean } = {},
+	): Promise<void> {
+		const refreshed = await this.refreshPreviewSnapshots(options);
 		const update = recordPersonalizationMilestone(this.state, initialBuild, refreshed);
 		if (update) this.publishMilestone("personalized", update);
 		this.broadcast(JSON.stringify({ type: "reload" }));
@@ -2619,7 +2973,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			SELECT v FROM builder_secrets WHERE k = 'templateGuidance'
 		`[0]?.v;
 		if (pinned) return (this.templateGuidance = pinned);
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		try {
 			const result = await sandbox.exec(`cat ${SITE_PATH}/AGENTS.md`, { timeout: 5000 });
 			if (result.success && result.stdout.trim()) return this.pinTemplateGuidance(result.stdout);
@@ -2639,15 +2993,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private startInitialScaffoldPrefetch(
-		sandbox = this.getOrCreateSandbox(),
+		sandbox = this.sandboxOps(),
 	): Promise<InitialScaffoldContext> {
 		return this.initialScaffoldPrefetch.start(
 			async (signal) => {
 				try {
-					const result = await readFilesFromSandbox(sandbox, INITIAL_SCAFFOLD_PATHS, {
-						streamFile,
-						signal,
-					});
+					const result = await readFilesFromSandbox(sandbox, INITIAL_SCAFFOLD_PATHS, { signal });
 					return createInitialScaffoldContext(result);
 				} catch {
 					return emptyInitialScaffoldContext();
@@ -2668,9 +3019,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			: context;
 	}
 
-	/** Wait for the dev listener after HMR/restart without forcing a slow SSR render. */
-	private async waitForDevServer(signal?: AbortSignal): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+	/**
+	 * Wait for the dev listener after HMR/restart without forcing a slow SSR render.
+	 * A CMS call waits through the tools' view of the Sandbox, which restores a
+	 * stopped container: a restore, or a recovery that failed, ends the wait, since
+	 * asking again would start another recovery. Other errors pass, as they do here.
+	 */
+	private async waitForDevServer(signal?: AbortSignal, tools?: SandboxOps): Promise<void> {
+		const sandbox = tools ?? this.sandboxOps();
 		for (let i = 0; i < 20; i++) {
 			signal?.throwIfAborted();
 			try {
@@ -2679,7 +3035,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					signal,
 				});
 				if (check.success) return;
-			} catch {
+			} catch (error) {
+				if (tools && isSandboxInterruption(error)) throw error;
 				// Server is mid-restart; keep polling.
 			}
 			await new Promise((r) => setTimeout(r, 500));
@@ -2703,7 +3060,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private async runDevBypass(signal?: AbortSignal): Promise<string | undefined> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const base = "http://localhost:4321";
 		const bypassUrl = `${base}/_emdash/api/setup/dev-bypass?token=1&content=0`;
 
@@ -2857,36 +3214,69 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
+	/**
+	 * Dependencies for a site cloned from its snapshot, which excludes
+	 * `node_modules`. The image's prepared scaffold already has them installed,
+	 * and the image has no package store, so `pnpm install` would download all
+	 * of them again; reuse them while the lockfile is still the scaffold's.
+	 */
+	private async restoreDependencies(signal?: AbortSignal): Promise<number> {
+		const archive = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}.tgz`;
+		const lockfile = `${PREPARED_TEMPLATES_PATH}/${BUILDER_TEMPLATE_DIR}/pnpm-lock.yaml`;
+		const sandbox = this.sandboxOps();
+		this.sendStatus("Restoring dependencies...");
+		const reused = await sandbox
+			.exec(preparedDependenciesCommand(archive, SITE_PATH, lockfile), {
+				timeout: 180_000,
+				signal,
+			})
+			.catch(() => undefined);
+		signal?.throwIfAborted();
+		if (reused?.success) {
+			this.sendConsole("Restored dependencies from the prepared image.");
+			return 0;
+		}
+		if (reused?.exitCode !== 1) {
+			// An interrupted extraction must not leave pnpm half a dependency tree.
+			await sandbox
+				.exec(`rm -rf ${shellQuote(`${SITE_PATH}/node_modules`)}`, { timeout: 60_000 })
+				.catch(() => undefined);
+		}
+		return this.installDeps(signal);
+	}
+
 	/** Run `pnpm install` in the site dir, streaming logs. Returns the exit code. */
 	private async installDeps(signal?: AbortSignal): Promise<number> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		this.sendStatus("Installing dependencies...");
 		this.sendConsole("$ pnpm install");
-		const install = await sandbox.startProcess(
-			"pnpm install --prefer-offline --reporter=append-only",
-			{
-				cwd: SITE_PATH,
-			},
-		);
-		const installLogs = await sandbox.streamProcessLogs(install.id);
-		const installLogsDone = this.pumpLogs(installLogs);
-		const stopInstall = () => void install.kill("SIGTERM").catch(() => {});
+		const install = `install-${crypto.randomUUID().slice(0, 8)}`;
+		await sandbox.startProcess(install, "pnpm install --prefer-offline --reporter=append-only", {
+			cwd: SITE_PATH,
+		});
+		const stopInstall = () => void sandbox.stopProcess(install);
 		signal?.addEventListener("abort", stopInstall, { once: true });
 		if (signal?.aborted) stopInstall();
+		let installLogsDone: Promise<void> | undefined;
+		let exited = false;
 		try {
-			const installResult = await install.waitForExit(300000);
+			installLogsDone = this.pumpLogs(await sandbox.followProcessLogs(install));
+			const installResult = await sandbox.waitForProcessExit(install, 300000);
+			exited = true;
 			signal?.throwIfAborted();
 			return installResult.exitCode;
 		} finally {
 			signal?.removeEventListener("abort", stopInstall);
-			await installLogsDone.catch(() => {});
+			// Its log follows the install, so an install still running must stop first.
+			if (!exited) await sandbox.stopProcess(install).catch(() => undefined);
+			await installLogsDone?.catch(() => {});
 		}
 	}
 
 	/** Reapply runtime-critical config that model-authored edits must preserve. */
 	private async protectAstroConfig(stripSandboxPlugin = false): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const astroPath = `${SITE_PATH}/astro.config.mjs`;
 		const cfg = await sandbox.readFile(astroPath, { encoding: "utf-8" });
 		if (!cfg.success) return;
@@ -2903,7 +3293,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?: AbortSignal,
 	): Promise<void> {
 		signal?.throwIfAborted();
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const quickTunnel = this.usesQuickTunnelPreview();
 		if (!configurationReady) await this.protectAstroConfig();
 		await sandbox.writeFile(`${SITE_PATH}/src/worker.ts`, CANONICAL_WORKER_TS);
@@ -2930,7 +3320,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		this.sendStatus("Starting dev server...");
 		const archivedModules = await sandbox.exec(
 			`grep -q '/tmp/pnpm-store' ${SITE_PATH}/node_modules/.modules.yaml`,
-			{ signal },
+			{ timeout: 15_000, signal },
 		);
 		const previewVariables = [
 			...(previewUrl ? [`EMDASH_PREVIEW_URL=${shellQuote(previewUrl)}`] : []),
@@ -2941,17 +3331,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			? `mkdir -p /tmp/pnpm-store && ${previewEnv}PNPM_CONFIG_STORE_DIR=/tmp/pnpm-store pnpm dev --host 0.0.0.0`
 			: `${previewEnv}pnpm dev --host 0.0.0.0`;
 		this.sendConsole(archivedModules.success ? "$ pnpm dev (prepared archive)" : "$ pnpm dev");
-		const processHost = quickTunnel
-			? await this.getOrCreateProcessSession(sandbox, DEV_SERVER_SESSION_ID)
-			: sandbox;
-		const devServer = await processHost.startProcess(devCommand, { cwd: SITE_PATH });
-		this.devServerProcess = devServer;
-		this.devServerProcessId = devServer.id;
-		const stopOnAbort = () => void devServer.kill("SIGTERM").catch(() => {});
+		const devServer = `${DEV_SERVER_PROCESS_PREFIX}${crypto.randomUUID().slice(0, 8)}`;
+		await sandbox.startProcess(devServer, devCommand, { cwd: SITE_PATH });
+		this.devServerProcessId = devServer;
+		const stopOnAbort = () => void sandbox.stopProcess(devServer);
 		signal?.addEventListener("abort", stopOnAbort, { once: true });
 		if (signal?.aborted) stopOnAbort();
 		this.devServerErrors = [];
-		const logStream = await sandbox.streamProcessLogs(devServer.id);
+		const logStream = await sandbox.followProcessLogs(devServer);
 		const logsDone = this.pumpLogs(logStream, true);
 		try {
 			await this.waitForDevServerPort(45_000, signal);
@@ -2981,7 +3368,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		label: string,
 		signal?: AbortSignal,
 	): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const deadline = Date.now() + timeoutMs;
 		do {
 			signal?.throwIfAborted();
@@ -3017,13 +3404,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		try {
 			const shot = await this.runSandboxRead((sandbox) => {
 				const browserSession = `preview-${crypto.randomUUID().slice(0, 8)}`;
-				return sandbox.exec(
-					`AGENT_BROWSER_DEFAULT_TIMEOUT=45000 AGENT_BROWSER_ARGS=--disable-dev-shm-usage agent-browser --session ${browserSession} ` +
-						`--allowed-domains localhost,127.0.0.1 ` +
-						`batch 'open http://127.0.0.1:4321/' 'set viewport 1024 640' ` +
-						`'screenshot ${outPath}' 'close'`,
-					{ timeout: 90000, signal },
-				);
+				return sandbox.exec(previewScreenshotCommand(browserSession, outPath), {
+					timeout: 90000,
+					signal,
+				});
 			}, signal);
 			if (!shot.success) {
 				return {
@@ -3047,13 +3431,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	/** Kill the tracked `pnpm dev` process if running. Safe to call when stopped. */
 	private async stopDevServer(): Promise<void> {
-		const sandbox = this.getOrCreateSandbox();
-		if (this.devServerProcess) {
-			await this.devServerProcess.kill("SIGTERM").catch(() => {});
-		} else if (this.devServerProcessId) {
-			await sandbox.killProcess(this.devServerProcessId).catch(() => {});
-		}
-		this.devServerProcess = undefined;
+		const sandbox = this.sandboxOps();
+		if (this.devServerProcessId) await sandbox.stopProcess(this.devServerProcessId);
 		this.devServerProcessId = undefined;
 		const stopped = await sandbox.exec(
 			"pkill -f '[a]stro dev' || true; " +
@@ -3073,6 +3452,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private async restartDevServer(
 		metrics?: TurnMetrics,
+		signal?: AbortSignal,
 	): Promise<{ success: boolean; error?: string }> {
 		this.sendStatus("Restarting dev server...");
 		this.sendConsole("$ restart dev server");
@@ -3087,13 +3467,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.sendConsole(`Warning: dev server restart lost its transport: ${message}`);
-			this.sandbox = null;
-			this.devServerProcess = undefined;
 			this.devServerProcessId = undefined;
-			const appHost = this.state.appHost;
-			const hostname = appHost && isLocalHostname(appHost) ? appHost : this.env.PREVIEW_HOSTNAME;
 			try {
-				const recovered = await this.recoverSite(hostname, true);
+				const recovered = await abortableWait(
+					this.recoverSite(this.recoveryHostname(), true),
+					signal,
+				);
 				if (recovered.ready) {
 					this.setState({
 						...this.state,
@@ -3187,7 +3566,22 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async doRecoverSite(hostname: string): Promise<SiteRecoveryResult> {
-		let sandbox = this.getOrCreateSandbox();
+		// A build under way when the container stopped may be stopped while this waits.
+		const duringBuild = this.activeBuildConvergences.size > 0;
+		const slotWait = new AbortController();
+		this.recoverySlotWait = slotWait;
+		const started = await this.waitForSandbox(slotWait.signal)
+			.catch((error: unknown) => {
+				if (!slotWait.signal.aborted) throw error;
+				return { ok: false as const, error: SITE_BEING_DELETED };
+			})
+			.finally(() => {
+				if (this.recoverySlotWait === slotWait) this.recoverySlotWait = undefined;
+			});
+		if (!started.ok) return { ready: false, error: started.error };
+		// Deletion can end the wait just as a slot is granted: it destroys that container.
+		if (slotWait.signal.aborted) return { ready: false, error: SITE_BEING_DELETED };
+		let sandbox = this.sandboxOps();
 
 		// Probe the listening socket, not `/`. A warm Astro process can spend
 		// several seconds bundling a newly reached route; treating that HTTP
@@ -3221,7 +3615,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (this.recoveryReconnectMcp) {
 				const token = this.getApiToken();
 				if (token && !(await this.connectMcp(exposed.url, token))) {
-					return { ready: false, error: "The CMS connection did not recover." };
+					return { ready: false, error: "The CMS connection did not recover.", untouched: true };
 				}
 			}
 			this.setState({
@@ -3237,8 +3631,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 
 		const hasSite = await this.execRecoveryCommand(`test -f ${SITE_PATH}/package.json`, 5000);
-		sandbox = this.getOrCreateSandbox();
+		sandbox = this.sandboxOps();
 		const apiToken = this.getApiToken();
+		// Only `test` saying no means the site is gone. A probe that timed out (124)
+		// says nothing, and restoring would clone the checkpoint over newer work.
+		if (!hasSite.success && hasSite.exitCode !== 1) {
+			return { ready: false, error: "The site's container did not answer. Try again shortly." };
+		}
 
 		if (!hasSite.success) {
 			// Site dir is gone (sandbox slept). Restore from the Artifacts repo.
@@ -3251,17 +3650,25 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			this.sendStatus("Restoring session...");
 			this.sendConsole("$ git clone session snapshot");
-			const clone = await sandbox.exec(
-				`rm -rf ${SITE_PATH} && git clone -q ${shellQuote(repo.remote)} ${SITE_PATH}`,
-				{ timeout: 120000, env: artifactsGitEnv(repo.token) },
-			);
+			const clone = await sandbox.exec(snapshotCloneCommand(repo.remote, SITE_PATH), {
+				timeout: 120000,
+				env: artifactsGitEnv(repo.token),
+			});
 			if (!clone.success) {
 				this.sendConsole(
 					`Warning: restore failed: ${redactArtifactsToken(clone.stderr || clone.stdout || "git clone failed")}`,
 				);
 				return { ready: false, error: "The saved site snapshot could not be restored." };
 			}
-			const installCode = await this.installDeps();
+			// The site is its checkpoint now, whatever happens next. What the model changed
+			// since may be gone: mid-build, or before a build when the last save failed.
+			if (duringBuild || this.activeBuildConvergences.size > 0 || this.state.persistenceError) {
+				this.restoreUnreported = true;
+			}
+			for (const convergence of this.activeBuildConvergences.values()) {
+				convergence.noteSiteReplaced();
+			}
+			const installCode = await this.restoreDependencies();
 			if (installCode !== 0) {
 				this.sendConsole(`pnpm install failed during restore (exit ${installCode})`);
 				return { ready: false, error: "Dependencies could not be restored for the saved site." };
@@ -3285,7 +3692,112 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this.markMilestone("cmsReady");
 			if (await this.connectMcp(exposed.url, apiToken)) this.markMilestone("agentToolsReady");
 		}
-		return { ready: true, previewUrl: exposed.url };
+		return { ready: true, previewUrl: exposed.url, ...(hasSite.success ? {} : { restored: true }) };
+	}
+
+	/**
+	 * Get the site a running container. When every slot in the deployment is
+	 * taken the Sandbox reports the site's place in the queue: show it and ask
+	 * again until a slot frees up or `SANDBOX_WAIT_MAX_MS` passes.
+	 */
+	private async waitForSandbox(
+		signal?: AbortSignal,
+	): Promise<{ ok: true } | { ok: false; error: string }> {
+		const deadline = Date.now() + SANDBOX_WAIT_MAX_MS;
+		const status = this.state.status ?? "";
+		let waited = false;
+		let started = false;
+		let gaveUp = false;
+		// Asking again: a refusal from an earlier wait would outlast a start that is granted.
+		if (this.state.sandboxWait?.gaveUp) this.setState({ ...this.state, sandboxWait: undefined });
+		try {
+			for (;;) {
+				signal?.throwIfAborted();
+				const start = await this.sandboxOps().ensureRunning();
+				if (start.ok) {
+					started = true;
+					if (this.state.sandboxPaused) this.setState({ ...this.state, sandboxPaused: undefined });
+					return { ok: true };
+				}
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) {
+					gaveUp = true;
+					return { ok: false, error: SLOTS_BUSY };
+				}
+				waited = true;
+				const ahead = start.position === undefined ? undefined : Math.max(0, start.position - 1);
+				if (this.state.sandboxWait?.ahead !== ahead || !this.state.sandboxWait) {
+					this.setState({ ...this.state, sandboxWait: { ahead } });
+				}
+				this.sendStatus(
+					ahead
+						? `Waiting for a free build slot (${ahead} ahead)...`
+						: "Waiting for a free build slot...",
+				);
+				await abortableDelay(Math.min(start.retryAfterMs, remaining), signal);
+			}
+		} finally {
+			// A place left in the queue would hold up the sites behind it.
+			if (!started)
+				await this.sandboxOps()
+					.cancelStart()
+					.catch(() => undefined);
+			if (gaveUp) this.setState({ ...this.state, sandboxWait: { gaveUp: true } });
+			else if (this.state.sandboxWait) this.setState({ ...this.state, sandboxWait: undefined });
+			if (waited) this.sendStatus(status);
+		}
+	}
+
+	/**
+	 * The Sandbox asks before it stops an idle container. Work under way keeps
+	 * it running; otherwise the latest changes are saved first, so the next
+	 * start restores them. A save that keeps failing stops holding the
+	 * container after an hour: an idle container must not run forever.
+	 */
+	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
+		// The Sandbox calls by plain RPC, which skips onStart, and may write state first.
+		this.resetProgressLeftByEviction();
+		// One check at a time: an alarm that stopped waiting asks again while the save runs.
+		this.stopCheck ??= this.checkSandboxStop(idleForMs).finally(() => {
+			this.stopCheck = undefined;
+		});
+		return this.stopCheck;
+	}
+
+	private async checkSandboxStop(idleForMs: number): Promise<{ busy: boolean }> {
+		// Work this instance runs counts however long it takes (the Sandbox stops a
+		// container idle for two hours regardless); rows left by an earlier instance
+		// count while young enough to be a turn that chat recovery resumes.
+		const busy = () =>
+			this.liveOwnerWork.size > 0 || this.hasRecentOwnerActivity() || Boolean(this.recoveryPromise);
+		if (busy()) return { busy: true };
+		if (this.state.siteReady && !this.isDeletionPending()) {
+			// A save skipped during the failure cooldown is no save.
+			const failed =
+				(await this.backupSite({ quiet: true, skipIfUnchanged: true })) ||
+				this.state.persistenceError;
+			if (failed && idleForMs < 60 * 60_000) return { busy: true };
+		}
+		// The owner may have come back during the save.
+		return { busy: busy() };
+	}
+
+	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
+	async markSandboxStopped(): Promise<void> {
+		this.resetProgressLeftByEviction();
+		// A finished provision no longer means a warm container: the next turn must recover.
+		if (this.provisionPromise && this.provisionPromise === this.settledProvision) {
+			this.provisionPromise = null;
+		}
+		if (this.state.siteReady && !this.state.sandboxPaused) {
+			this.setState({ ...this.state, sandboxPaused: true });
+		}
+	}
+
+	/** The owner's builder tab is in use: keep the container from its idle stop. */
+	async keepSandboxAwake(): Promise<void> {
+		if (!this.state.siteReady || this.isDeletionPending()) return;
+		await this.env.Sandbox.getByName(this.name).touch();
 	}
 
 	/** Wake and restore an established site as soon as its sidebar route opens. */
@@ -3338,15 +3850,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * short-lived, repo-scoped write token. Resolves to the redacted failure
 	 * message when the backup failed (it is also kept as `persistenceError`).
 	 */
-	private backupSite(
-		options: { quiet?: boolean; skipIfUnchanged?: boolean } = {},
-	): Promise<string | undefined> {
+	private backupSite(options: BackupOptions = {}): Promise<string | undefined> {
 		return this.enqueueBackupSite(options);
 	}
 
-	private enqueueBackupSite(
-		options: { quiet?: boolean; skipIfUnchanged?: boolean } = {},
-	): Promise<string | undefined> {
+	/**
+	 * The checkpoint after a mutating tool: the snapshot is staged and committed
+	 * before the tool returns, and uploaded in the background while the model
+	 * thinks. The turn's final save waits for the upload.
+	 */
+	private checkpointSite(): Promise<string | undefined> {
+		return this.backupSite({ quiet: true, background: true });
+	}
+
+	private enqueueBackupSite(options: BackupOptions = {}): Promise<string | undefined> {
 		const queued = this.backupChain.then(() => this.performBackupSite(options));
 		this.backupChain = queued.then(
 			() => {},
@@ -3358,13 +3875,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async performBackupSite({
 		quiet = false,
 		skipIfUnchanged = false,
-	}: {
-		quiet?: boolean;
-		skipIfUnchanged?: boolean;
-	}): Promise<string | undefined> {
+		background = false,
+	}: BackupOptions): Promise<string | undefined> {
 		if (this.isDeletionPending()) return;
 		if (!this.state.siteReady || (quiet && Date.now() < this.backupRetryAfter)) return;
-		const sandbox = this.getOrCreateSandbox();
+		// A waited save judges "unchanged" against what has actually been uploaded.
+		if (!background) await this.pushTail;
+		const sandbox = this.sandboxOps();
 		const previewGeneration = await this.env.Sandbox.getByName(this.name)
 			.getPreviewGeneration()
 			.catch(() => undefined);
@@ -3380,70 +3897,148 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		if (!quiet) this.sendStatus("Saving session...");
 		try {
-			const { remote, token } = await this.ensureArtifactsRepo();
-			// Git must never scan the live Vite/SQLite tree: files can change beneath
-			// its object reader and produce an unusable snapshot. Copy at a completed
-			// tool/turn boundary, then commit only the stable staging tree.
-			let staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
-				timeout: 120000,
-			});
-			if (!staged.success) {
-				this.sendConsole("Session snapshot staging was interrupted; retrying once...");
-				await new Promise((resolve) => setTimeout(resolve, 250));
-				staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
+			try {
+				// Git must never scan the live Vite/SQLite tree: files can change beneath
+				// its object reader and produce an unusable snapshot. Copy at a completed
+				// tool/turn boundary, then commit only the stable staging tree.
+				let staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
 					timeout: 120000,
+					background: true,
 				});
-			}
-			if (!staged.success) {
-				throw new Error(staged.stderr || staged.stdout || "session staging copy failed");
-			}
-			const script = [
-				`cd ${SNAPSHOT_PATH}`,
-				"git init -q",
-				`git config user.email ${shellQuote(ARTIFACTS_GIT_EMAIL)}`,
-				`git config user.name ${shellQuote(ARTIFACTS_GIT_USER)}`,
-				"git add -A",
-				`git commit -q --allow-empty -m ${shellQuote(`session snapshot ${new Date().toISOString()}`)}`,
-				// The Sandbox RPC timeout does not kill a stalled git child. Bound it inside the container.
-				`timeout --signal=TERM --kill-after=2s ${SNAPSHOT_PUSH_TIMEOUT_SECONDS}s git push -q ${shellQuote(remote)} HEAD:main --force`,
-			].join(" && ");
-			let result = await sandbox.exec(script, {
-				cwd: SNAPSHOT_PATH,
-				timeout: 65_000,
-				env: artifactsGitEnv(token),
-			});
-			if (!result.success && isTransientSnapshotPushFailure(result)) {
-				this.sendConsole("Session snapshot upload was interrupted; retrying once...");
-				await new Promise((resolve) => setTimeout(resolve, 1000));
-				result = await sandbox.exec(script, {
+				if (!staged.success) {
+					this.sendConsole("Session snapshot staging was interrupted; retrying once...");
+					await new Promise((resolve) => setTimeout(resolve, 250));
+					staged = await sandbox.exec(snapshotStagingCommand(SITE_PATH, SNAPSHOT_PATH), {
+						timeout: 120000,
+						background: true,
+					});
+				}
+				if (!staged.success) {
+					throw new Error(staged.stderr || staged.stdout || "session staging copy failed");
+				}
+				const commit = snapshotCommitCommand({
+					snapshotPath: SNAPSHOT_PATH,
+					gitDir: SNAPSHOT_GIT_DIR,
+					message: `session snapshot ${new Date().toISOString()}`,
+					name: ARTIFACTS_GIT_USER,
+					email: ARTIFACTS_GIT_EMAIL,
+				});
+				let committed = await sandbox.exec(commit, {
 					cwd: SNAPSHOT_PATH,
+					timeout: 60_000,
+					background: true,
+				});
+				if (!committed.success) {
+					// A damaged snapshot repository costs only one full upload to rebuild.
+					this.sendConsole("Session snapshot commit failed; rebuilding its repository...");
+					// An upload still reading it would fail, and report a save that worked as lost.
+					await this.pushTail;
+					await sandbox
+						.exec(`rm -rf ${shellQuote(SNAPSHOT_GIT_DIR)}`, { timeout: 30_000, background: true })
+						.catch(() => undefined);
+					committed = await sandbox.exec(commit, {
+						cwd: SNAPSHOT_PATH,
+						timeout: 60_000,
+						background: true,
+					});
+				}
+				if (!committed.success) {
+					throw new Error(committed.stderr || committed.stdout || "session snapshot commit failed");
+				}
+			} catch (err) {
+				// Uploads of earlier snapshots must not report this one as saved.
+				this.unsavedAfterSeq = this.committedSnapshot?.seq ?? 0;
+				return this.recordBackupFailure(err);
+			}
+			this.committedSnapshot = {
+				seq: (this.committedSnapshot?.seq ?? 0) + 1,
+				generation: previewGeneration,
+			};
+			const pushed = this.pushLatestSnapshot(quiet);
+			if (background) return;
+			return await pushed;
+		} finally {
+			if (!quiet) this.sendStatus("");
+		}
+	}
+
+	/**
+	 * Upload the latest committed snapshot. Uploads run one at a time, so an
+	 * older snapshot never lands after a newer one, and a queued upload that
+	 * finds its snapshot already sent returns at once.
+	 */
+	private pushLatestSnapshot(quiet: boolean): Promise<string | undefined> {
+		const run = this.pushTail.then(async () => {
+			const target = this.committedSnapshot;
+			if (!target || target.seq <= this.pushedSnapshotSeq) return undefined;
+			try {
+				const { remote, token } = await this.writableArtifactsRepo();
+				const push = snapshotPushCommand({
+					gitDir: SNAPSHOT_GIT_DIR,
+					remote,
+					timeoutSeconds: SNAPSHOT_PUSH_TIMEOUT_SECONDS,
+				});
+				// Not the staging copy: the next checkpoint may be rebuilding it.
+				const options = {
+					cwd: "/tmp",
 					timeout: 65_000,
 					env: artifactsGitEnv(token),
-				});
+					background: true,
+				};
+				let result = await this.execSnapshotPush(push, options);
+				if (!result.success && isTransientSnapshotPushFailure(result)) {
+					this.sendConsole("Session snapshot upload was interrupted; retrying once...");
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+					result = await this.execSnapshotPush(push, options);
+				}
+				if (!result.success) {
+					// A rejected token must not be reused for the next checkpoint.
+					this.artifactsWriteAccess = undefined;
+					throw new Error(
+						result.exitCode === 124
+							? "Session snapshot upload timed out."
+							: redactArtifactsToken(result.stderr || result.stdout || "git push failed"),
+					);
+				}
+			} catch (err) {
+				return this.recordBackupFailure(err);
 			}
-			if (!result.success) {
-				throw new Error(
-					result.exitCode === 124
-						? "Session snapshot upload timed out."
-						: redactArtifactsToken(result.stderr || result.stdout || "git push failed"),
-				);
+			this.pushedSnapshotSeq = target.seq;
+			this.lastSavedPreviewGeneration = target.generation;
+			// A later checkpoint failed before it could be committed; it is still unsaved.
+			if (this.unsavedAfterSeq !== undefined && target.seq <= this.unsavedAfterSeq) {
+				return undefined;
 			}
+			this.unsavedAfterSeq = undefined;
 			this.backupRetryAfter = 0;
-			this.lastSavedPreviewGeneration = previewGeneration;
 			if (!quiet) this.sendConsole("Session saved.");
 			if (this.state.persistenceError) {
 				this.setState({ ...this.state, persistenceError: undefined });
 			}
-		} catch (err) {
-			this.backupRetryAfter = Date.now() + BACKUP_FAILURE_COOLDOWN_MS;
-			const detail = redactArtifactsToken(err instanceof Error ? err.message : String(err));
-			const message = "The latest session checkpoint could not be saved.";
-			this.sendConsole(`Warning: session backup failed: ${detail}`);
-			this.setState({ ...this.state, persistenceError: message });
-			return message;
-		} finally {
-			if (!quiet) this.sendStatus("");
-		}
+			return undefined;
+		});
+		this.pushTail = run.then(
+			() => {},
+			() => {},
+		);
+		return run;
+	}
+
+	/** Uploads run as their own process, beside the model's commands. */
+	private execSnapshotPush(
+		command: string,
+		options: { cwd: string; timeout: number; env: Record<string, string>; background: boolean },
+	) {
+		return this.sandboxOps().exec(command, options);
+	}
+
+	private recordBackupFailure(err: unknown): string {
+		this.backupRetryAfter = Date.now() + BACKUP_FAILURE_COOLDOWN_MS;
+		const detail = redactArtifactsToken(err instanceof Error ? err.message : String(err));
+		const message = "The latest session checkpoint could not be saved.";
+		this.sendConsole(`Warning: session backup failed: ${detail}`);
+		this.setState({ ...this.state, persistenceError: message });
+		return message;
 	}
 
 	private async prepareStaticSiteSnapshot(
@@ -3490,7 +4085,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const checkpointGeneration = await this.env.Sandbox.getByName(this.name).getPreviewGeneration();
 		assertSnapshotGeneration(previewGeneration, checkpointGeneration);
 
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		let buildProcessId: string | undefined;
 		let buildLogs: Promise<void> | undefined;
 		let productionProcessId: string | undefined;
@@ -3519,13 +4114,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			this.sendStatus("Building the production site...");
 			this.sendConsole("$ pnpm build (publish snapshot)");
-			const build = await sandbox.startProcess(
+			const build = `publish-build-${crypto.randomUUID().slice(0, 8)}`;
+			await sandbox.startProcess(
+				build,
 				`EMDASH_SITE_URL=${shellQuote(liveUrl.origin)} pnpm build`,
 				{ cwd: PUBLISH_PATH },
 			);
-			buildProcessId = build.id;
-			buildLogs = this.pumpLogs(await sandbox.streamProcessLogs(build.id));
-			const buildResult = await build.waitForExit(300_000);
+			buildProcessId = build;
+			buildLogs = this.pumpLogs(await sandbox.followProcessLogs(build));
+			const buildResult = await sandbox.waitForProcessExit(build, 300_000);
 			buildProcessId = undefined;
 			await buildLogs.catch(() => undefined);
 			buildLogs = undefined;
@@ -3538,15 +4135,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				timeout: 5000,
 			});
 			this.sendConsole("$ wrangler dev (publish snapshot)");
-			const production = await sandbox.startProcess(
+			const production = `publish-serve-${crypto.randomUUID().slice(0, 8)}`;
+			await sandbox.startProcess(
+				production,
 				`CLOUDFLARE_API_TOKEN= CLOUDFLARE_API_KEY= CLOUDFLARE_EMAIL= ` +
 					`EMDASH_SITE_URL=${shellQuote(liveUrl.origin)} pnpm exec wrangler dev --local ` +
 					`--ip 0.0.0.0 --port ${PRODUCTION_SNAPSHOT_PORT} --persist-to .wrangler/state ` +
 					`-c dist/server/wrangler.json`,
 				{ cwd: PUBLISH_PATH },
 			);
-			productionProcessId = production.id;
-			productionLogs = this.pumpLogs(await sandbox.streamProcessLogs(production.id));
+			productionProcessId = production;
+			productionLogs = this.pumpLogs(await sandbox.followProcessLogs(production));
 			this.sendStatus("Starting production checks...");
 			await this.waitForSandboxPort(PRODUCTION_SNAPSHOT_PORT, 45_000, "Production runner");
 
@@ -3592,13 +4191,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			): Promise<BuiltSnapshotAsset | undefined> => {
 				const target = builtAssetTarget(path);
 				if (!target) return;
-				const command = `test -f ${shellQuote(target.filePath)} && head -c ${maximumBytes + 1} -- ${shellQuote(target.filePath)} | base64`;
-				const file = await sandbox.exec(`bash -o pipefail -c ${shellQuote(command)}`, {
-					cwd: PUBLISH_PATH,
-					timeout: 15_000,
-				});
-				if (!file.success) return;
-				const bytes = decodeBase64((file.stdout ?? "").replace(/\s+/g, ""));
+				// As a file, not command output, which is cut at 1 MiB.
+				const stream = await sandbox.readFileStream(target.filePath).catch(() => undefined);
+				if (!stream) return;
+				const bytes = await readAtMost(stream, maximumBytes + 1);
 				if (bytes.byteLength > maximumBytes) {
 					throw new StaticSiteSnapshotError(
 						"SNAPSHOT_TOO_LARGE",
@@ -3618,14 +4214,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				previewOrigin: this.state.previewUrl,
 				liveOrigin: liveUrl.origin,
 				fetch: (path) =>
-					sandbox.containerFetch(
-						new URL(path, liveUrl.origin).toString(),
-						{
-							headers: { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
-							redirect: "manual",
-						},
-						PRODUCTION_SNAPSHOT_PORT,
-					),
+					sandbox.fetchPort(PRODUCTION_SNAPSHOT_PORT, new URL(path, liveUrl.origin).toString(), {
+						headers: { Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+						redirect: "manual",
+					}),
 				inspectBuiltAsset,
 				readBuiltAsset,
 			});
@@ -3647,11 +4239,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return snapshot;
 		} finally {
 			if (buildProcessId) {
-				await sandbox.killProcess(buildProcessId).catch(() => undefined);
+				await sandbox.stopProcess(buildProcessId);
 				await buildLogs?.catch(() => undefined);
 			}
 			if (productionProcessId) {
-				await sandbox.killProcess(productionProcessId).catch(() => undefined);
+				await sandbox.stopProcess(productionProcessId);
 				await productionLogs?.catch(() => undefined);
 			}
 			try {
@@ -4089,172 +4681,207 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * (`wrangler deploy --temporary`), returning a live URL and a claim URL the
 	 * user can open within 60 minutes to take ownership.
 	 *
+	 * Nothing calls this yet; it is kept working so the path can be switched on.
+	 * Like publishing, it saves the site and works on a staged copy of that
+	 * checkpoint, so the preview keeps running and nothing it changes for the
+	 * deploy can reach the site or its snapshot. Chat turns wait while it runs.
+	 *
 	 * The session was already created without the sandbox runner / Worker
-	 * Loader / crons. Temp accounts also can't provision R2, so we strip
-	 * `storage` from astro.config and `r2_buckets` from wrangler.jsonc *before*
-	 * the build (so the built worker doesn't reference the absent MEDIA binding),
-	 * then restore them in a `finally`. The session's D1 (schema + content) is
-	 * exported locally, scrubbed of users/tokens/secrets (`scrubAuthFromSnapshot`),
-	 * and loaded into the temp account's D1 after deploy via
-	 * `d1 execute --remote --temporary` (D1 is covered by the temp preview-account
-	 * token). The deployed copy therefore has the content but no media (R2), and
-	 * the claimant creates their own admin through the setup wizard.
+	 * Loader / crons. Temp accounts also can't provision R2, so the copy has
+	 * `storage` stripped from astro.config and `r2_buckets` from wrangler.jsonc
+	 * before the build (so the built worker doesn't reference the absent MEDIA
+	 * binding). The copy's D1 (schema + content) is scrubbed of users, tokens
+	 * and secrets (`scrubStagedContentCommand`), exported, and loaded into the
+	 * temp account's D1 after deploy via `d1 execute --remote --temporary` (D1
+	 * is covered by the temp preview-account token). The deployed copy
+	 * therefore has the content but no media (R2), and the claimant creates
+	 * their own admin through the setup wizard.
 	 *
 	 * Deploy uses the adapter-generated `dist/server/wrangler.json` (correct
 	 * built `main` + `no_bundle: true`) rather than a hand-built config -- the
 	 * latter pointed at the source worker entry and made wrangler re-bundle it,
 	 * failing on Astro/EmDash virtual modules. A current Wrangler is pulled via
 	 * `npx wrangler@latest` (the template pins an older one without `--temporary`),
-	 * and the sandbox is unauthenticated, which `--temporary` requires.
+	 * and the sandbox is unauthenticated, which `--temporary` requires. Wrangler
+	 * runs with its own home, removed afterwards, so the temporary account's
+	 * cached claim token does not stay where the model's shell can read it.
 	 */
 	private async deploySite(): Promise<DeployResult> {
-		if (!this.state.siteReady) {
+		if (
+			this.isDeletionPending() ||
+			!this.state.siteReady ||
+			Boolean(this.state.initialGeneration && this.state.initialGeneration.status !== "ready")
+		) {
 			return { success: false, error: "The site is not ready to deploy yet." };
 		}
-		const sandbox = this.getOrCreateSandbox();
-		const astroPath = `${SITE_PATH}/astro.config.mjs`;
-		const wranglerPath = `${SITE_PATH}/wrangler.jsonc`;
-
-		this.sendStatus("Preparing deploy...");
-		const origAstro = await sandbox.readFile(astroPath, { encoding: "utf-8" });
-		const origWrangler = await sandbox.readFile(wranglerPath, { encoding: "utf-8" });
-		if (!origAstro.success || !origWrangler.success) {
-			this.sendStatus("");
-			return { success: false, error: "Could not read the project config for deploy." };
-		}
-
-		try {
-			// Stop the dev server first: it shares .vite/.astro/dist with the
-			// build and watches astro.config, so leaving it running while we
-			// swap configs and run `astro build` corrupts the optimizer cache
-			// and crashes the preview. It's restarted in the finally.
-			this.sendStatus("Stopping preview for deploy...");
-			await this.stopDevServer();
-
-			// Snapshot the session's D1 (schema + content) from the local state
-			// while it's at rest. `--local` needs no credentials; the canonical
-			// wrangler.jsonc (still in place here) has the DB binding. We load
-			// this into the freshly-provisioned temp D1 after deploy.
-			const snapshotPath = "/tmp/d1-snapshot.sql";
-			this.sendStatus("Exporting content...");
-			this.sendConsole("$ wrangler d1 export DB --local");
-			const dump = await sandbox.exec(
-				`npx -y wrangler@latest d1 export DB --local --output ${snapshotPath} -c wrangler.jsonc`,
-				{ cwd: SITE_PATH, timeout: 120000 },
-			);
-			let haveSnapshot = dump.success;
-			if (!haveSnapshot) {
-				this.sendConsole(
-					`Warning: content export failed; deployed site will be empty: ${(dump.stderr || dump.stdout).slice(0, 300)}`,
-				);
-			} else {
-				// The export carries the dev-bypass admin and the hash of this
-				// session's full-scope PAT; neither may reach a public site. Skip
-				// the content load entirely if the scrub can't be applied.
-				const snapshot = await sandbox.readFile(snapshotPath, { encoding: "utf-8" });
-				if (snapshot.success) {
-					await sandbox.writeFile(snapshotPath, scrubAuthFromSnapshot(snapshot.content));
-				} else {
-					haveSnapshot = false;
-					this.sendConsole(
-						"Warning: could not scrub credentials from the content export; deployed site will be empty.",
-					);
-				}
+		const busy = {
+			success: false,
+			error: "Wait for the current site activity to finish, then deploy again.",
+		};
+		if (this.hasOwnerActivity()) return busy;
+		return this.withOwnerActivity("deploy", async () => {
+			if (
+				(this.stateWrittenHere && this.hasProgressInState()) ||
+				this.provisionPromise ||
+				this.recoveryPromise ||
+				!(await this.waitUntilStable({ timeout: 1 }))
+			) {
+				return busy;
 			}
-
-			// Drop R2 for the build: from astro.config (so the built code doesn't
-			// wire the MEDIA binding) and from wrangler.jsonc (so the generated
-			// deploy config has no MEDIA binding the temp account can't create).
-			await sandbox.writeFile(astroPath, stripStorageFromAstroConfig(origAstro.content));
-			await sandbox.writeFile(wranglerPath, stripR2FromWrangler(origWrangler.content));
-
-			this.sendStatus("Building site for deploy...");
-			this.sendConsole("$ EMDASH_DEPLOY_MODE=temporary pnpm build");
-			const build = await sandbox.startProcess("EMDASH_DEPLOY_MODE=temporary pnpm build", {
-				cwd: SITE_PATH,
-			});
-			const buildLogs = await sandbox.streamProcessLogs(build.id);
-			const buildLogsDone = this.pumpLogs(buildLogs);
-			const buildResult = await build.waitForExit(300000);
-			await buildLogsDone.catch(() => {});
-			if (buildResult.exitCode !== 0) {
-				throw new Error(`Build failed with exit code ${buildResult.exitCode}`);
-			}
-
-			this.sendStatus("Deploying to Cloudflare...");
-			this.sendConsole("$ wrangler deploy --temporary");
-			// Deploy the adapter-generated config (built entry + `no_bundle`).
-			// Scrub any Cloudflare credentials from the env: `--temporary` only
-			// works when Wrangler is unauthenticated.
-			const deploy = await sandbox.exec(
+			const sandbox = this.sandboxOps();
+			const astroPath = `${DEPLOY_PATH}/astro.config.mjs`;
+			const wranglerPath = `${DEPLOY_PATH}/wrangler.jsonc`;
+			const contentPath = `${DEPLOY_PATH}.sql`;
+			// Credentials cleared: `--temporary` only works when Wrangler is unauthenticated.
+			const wrangler =
 				"CLOUDFLARE_API_TOKEN= CLOUDFLARE_API_KEY= CLOUDFLARE_EMAIL= CI=1 " +
-					"npx -y wrangler@latest deploy --temporary -c dist/server/wrangler.json",
-				{ cwd: SITE_PATH, timeout: 180000 },
-			);
-			const output = `${deploy.stdout}\n${deploy.stderr}`;
-			for (const line of output.split("\n")) {
-				if (line.trim()) this.sendConsole(line);
-			}
-			if (!deploy.success) {
-				throw new Error(`Deploy failed: ${(deploy.stderr || deploy.stdout).slice(0, 300)}`);
-			}
+				`HOME=${DEPLOY_HOME} npm_config_cache=/home/user/.npm npx -y wrangler@latest`;
+			let buildProcessId: string | undefined;
+			try {
+				const siteProbe = `test -f ${SITE_PATH}/package.json && test -d ${SITE_PATH}/node_modules`;
+				const siteAvailable = await this.execRecoveryCommand(siteProbe, 5000).catch(() => null);
+				if (!siteAvailable?.success) {
+					this.sendStatus("Restoring the site before deploying...");
+					const recovered = await this.recoverSite(this.recoveryHostname()).catch(() => ({
+						ready: false as const,
+						error: undefined,
+					}));
+					const restoredSite = recovered.ready
+						? await this.execRecoveryCommand(siteProbe, 5000).catch(() => null)
+						: null;
+					if (!recovered.ready || !restoredSite?.success) {
+						throw new Error(
+							recovered.error ?? "The saved site could not be restored before deploying.",
+						);
+					}
+				}
 
-			// Load the snapshot into the temp account's freshly-provisioned D1.
-			// D1 commands accept `--temporary` (the temp preview-account token
-			// covers D1), so this reuses the cached temp account from the deploy
-			// -- still unauthenticated. Non-fatal: a failure leaves the deployed
-			// site up but empty rather than aborting the deploy.
-			if (haveSnapshot) {
-				this.sendStatus("Loading content into the deployed site...");
-				this.sendConsole("$ wrangler d1 execute DB --remote --temporary --file <snapshot>");
-				const load = await sandbox.exec(
-					"CLOUDFLARE_API_TOKEN= CLOUDFLARE_API_KEY= CLOUDFLARE_EMAIL= CI=1 " +
-						`npx -y wrangler@latest d1 execute DB --remote --temporary -y --file ${snapshotPath} -c dist/server/wrangler.json`,
-					{ cwd: SITE_PATH, timeout: 180000 },
+				this.sendStatus("Preparing deploy...");
+				const backupError = await this.backupSite();
+				if (backupError) throw new Error("The latest draft could not be saved before deploying.");
+				const staged = await sandbox.exec(
+					`timeout --signal=TERM --kill-after=2s ${PUBLISH_STAGING_TIMEOUT_SECONDS}s ` +
+						`sh -c ${shellQuote(`${publishStagingCommand(SNAPSHOT_PATH, SITE_PATH, DEPLOY_PATH)} && rm -f ${DEPLOY_PATH}/.dev.vars`)}`,
+					{ timeout: 120_000 },
 				);
-				if (load.success) {
-					this.sendConsole("Content loaded into the deployed site.");
-				} else {
-					this.sendConsole(
-						`Warning: content load failed; deployed site may be empty: ${(load.stderr || load.stdout).slice(0, 300)}`,
+				if (!staged.success) {
+					throw new Error(
+						staged.exitCode === 124
+							? "Deploy staging timed out."
+							: staged.stderr || staged.stdout || "deploy staging copy failed",
 					);
 				}
-			}
 
-			const liveUrl = output.match(/https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev[^\s]*/i)?.[0];
-			const claimUrl = output.match(/https:\/\/dash\.cloudflare\.com\/claim[^\s'"]*/i)?.[0];
-			if (!claimUrl) {
-				this.sendConsole("Warning: no claim URL found in the deploy output.");
-			}
+				// The copy runs without the preview's .dev.vars (localhost and preview URLs).
+				// Drop R2 for the build: from astro.config (so the built code doesn't
+				// wire the MEDIA binding) and from wrangler.jsonc (so the generated
+				// deploy config has no MEDIA binding the temp account can't create).
+				const astro = await sandbox.readFile(astroPath, { encoding: "utf-8" });
+				const wranglerConfig = await sandbox.readFile(wranglerPath, { encoding: "utf-8" });
+				await sandbox.writeFile(astroPath, stripStorageFromAstroConfig(astro.content));
+				await sandbox.writeFile(wranglerPath, stripR2FromWrangler(wranglerConfig.content));
 
-			this.setState({ ...this.state, deploy: { liveUrl, claimUrl, at: Date.now() } });
-			this.sendConsole(liveUrl ? `Deployed: ${liveUrl}` : "Deploy completed.");
-			return { success: true, liveUrl, claimUrl };
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			this.sendConsole(`ERROR: ${message}`);
-			return { success: false, error: message };
-		} finally {
-			// Restore the originals so the live preview (with media) keeps working.
-			try {
-				await sandbox.writeFile(astroPath, origAstro.content);
-				await sandbox.writeFile(wranglerPath, origWrangler.content);
-			} catch {
-				// best-effort cleanup
-			}
-			// Bring the preview back up with the restored config.
-			try {
-				this.sendStatus("Restarting preview...");
-				await this.startDevServer();
-				await this.refreshPreviewSnapshots();
-				this.broadcast(JSON.stringify({ type: "reload" }));
-			} catch (err) {
-				this.sendConsole(
-					`Warning: could not restart preview after deploy: ${err instanceof Error ? err.message : String(err)}`,
+				// The copy's D1 carries the dev-bypass admin and the hash of this
+				// session's full-scope PAT; neither may reach a public site. Deploy
+				// without content if they cannot be removed first.
+				this.sendStatus("Exporting content...");
+				this.sendConsole("$ wrangler d1 export DB --local");
+				const scrubbed = await sandbox.exec(scrubStagedContentCommand(DEPLOY_PATH), {
+					cwd: DEPLOY_PATH,
+					timeout: 60_000,
+				});
+				let haveContent = scrubbed.success;
+				if (!haveContent) {
+					this.sendConsole(
+						`Warning: could not remove credentials from the content; deployed site will be empty: ${(scrubbed.stderr || scrubbed.stdout).slice(0, 300)}`,
+					);
+				} else {
+					const dump = await sandbox.exec(
+						`${wrangler} d1 export DB --local --output ${contentPath} -c wrangler.jsonc && ` +
+							// An export of some other, empty local database would deploy nothing.
+							`grep -Eq 'INSERT INTO "?_emdash_migrations"?' ${contentPath}`,
+						{ cwd: DEPLOY_PATH, timeout: 120000 },
+					);
+					haveContent = dump.success;
+					if (!haveContent) {
+						this.sendConsole(
+							`Warning: content export failed; deployed site will be empty: ${(dump.stderr || dump.stdout).slice(0, 300)}`,
+						);
+					}
+				}
+
+				this.sendStatus("Building site for deploy...");
+				this.sendConsole("$ EMDASH_DEPLOY_MODE=temporary pnpm build");
+				const build = `deploy-build-${crypto.randomUUID().slice(0, 8)}`;
+				await sandbox.startProcess(build, "EMDASH_DEPLOY_MODE=temporary pnpm build", {
+					cwd: DEPLOY_PATH,
+				});
+				buildProcessId = build;
+				const buildLogsDone = this.pumpLogs(await sandbox.followProcessLogs(build));
+				const buildResult = await sandbox.waitForProcessExit(build, 300000);
+				buildProcessId = undefined;
+				await buildLogsDone.catch(() => {});
+				if (buildResult.exitCode !== 0) {
+					throw new Error(`Build failed with exit code ${buildResult.exitCode}`);
+				}
+
+				this.sendStatus("Deploying to Cloudflare...");
+				this.sendConsole("$ wrangler deploy --temporary");
+				// Deploy the adapter-generated config (built entry + `no_bundle`).
+				const deploy = await sandbox.exec(
+					`${wrangler} deploy --temporary -c dist/server/wrangler.json`,
+					{ cwd: DEPLOY_PATH, timeout: 180000 },
 				);
+				const output = `${deploy.stdout}\n${deploy.stderr}`;
+				for (const line of output.split("\n")) {
+					if (line.trim()) this.sendConsole(line);
+				}
+				if (!deploy.success) {
+					throw new Error(`Deploy failed: ${(deploy.stderr || deploy.stdout).slice(0, 300)}`);
+				}
+
+				// Load the content into the temp account's freshly-provisioned D1.
+				// D1 commands accept `--temporary` (the temp preview-account token
+				// covers D1), so this reuses the temp account the deploy cached in
+				// Wrangler's home. Non-fatal: a failure leaves the deployed site up
+				// but empty rather than aborting the deploy.
+				if (haveContent) {
+					this.sendStatus("Loading content into the deployed site...");
+					this.sendConsole("$ wrangler d1 execute DB --remote --temporary --file <content>");
+					const load = await sandbox.exec(
+						`${wrangler} d1 execute DB --remote --temporary -y --file ${contentPath} -c dist/server/wrangler.json`,
+						{ cwd: DEPLOY_PATH, timeout: 180000 },
+					);
+					if (load.success) {
+						this.sendConsole("Content loaded into the deployed site.");
+					} else {
+						this.sendConsole(
+							`Warning: content load failed; deployed site may be empty: ${(load.stderr || load.stdout).slice(0, 300)}`,
+						);
+					}
+				}
+
+				const liveUrl = output.match(/https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev[^\s]*/i)?.[0];
+				const claimUrl = output.match(/https:\/\/dash\.cloudflare\.com\/claim[^\s'"]*/i)?.[0];
+				if (!claimUrl) {
+					this.sendConsole("Warning: no claim URL found in the deploy output.");
+				}
+
+				this.setState({ ...this.state, deploy: { liveUrl, claimUrl, at: Date.now() } });
+				this.sendConsole(liveUrl ? `Deployed: ${liveUrl}` : "Deploy completed.");
+				return { success: true, liveUrl, claimUrl };
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				this.sendConsole(`ERROR: ${message}`);
+				return { success: false, error: message };
+			} finally {
+				if (buildProcessId) await sandbox.stopProcess(buildProcessId).catch(() => {});
+				await sandbox
+					.exec(`rm -rf ${DEPLOY_PATH} ${contentPath} ${DEPLOY_HOME}`, { timeout: 60_000 })
+					.catch(() => undefined);
+				this.sendStatus("");
 			}
-			this.sendStatus("");
-		}
+		});
 	}
 
 	/**
@@ -4265,8 +4892,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async provisionSite(hostname: string, signal?: AbortSignal): Promise<ProvisionResult> {
 		if (signal?.aborted) return { ready: false, stopped: true };
 		if (this.state.siteReady) {
-			const recovered = await this.recoverSite(hostname);
-			if (signal?.aborted) return { ready: false, stopped: true };
+			// Recovery can wait minutes for a slot, and the preview's restore may share
+			// it: a stopped turn leaves it running for them and returns at once.
+			const recovered = await unlessAborted(this.recoverSite(hostname), signal);
+			if (!recovered || signal?.aborted) return { ready: false, stopped: true };
 			if (recovered.ready) return recovered;
 			const error = recovered.error ?? "The saved site could not be restored.";
 			this.sendConsole(`Recovery stopped without replacing the site: ${error}`);
@@ -4274,16 +4903,23 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return { ready: false, error };
 		}
 
-		const sandbox = this.getOrCreateSandbox();
+		const sandbox = this.sandboxOps();
 		const templateDir = BUILDER_TEMPLATE_DIR;
+		let containerReady = false;
 
 		try {
+			const started = await this.waitForSandbox(signal);
+			if (!started.ok) throw new Error(started.error);
+			containerReady = true;
 			this.markMilestone("containerStarting");
 			// Prepared templates include their dependency trees in the image. Retain a
 			// network fallback so older images and local development remain recoverable.
 			this.sendStatus("Opening a blank site canvas...");
 			const preparedArchive = `${PREPARED_TEMPLATES_PATH}/${templateDir}.tgz`;
-			const prepared = await sandbox.exec(`test -f ${preparedArchive}`, { signal });
+			const prepared = await sandbox.exec(`test -f ${preparedArchive}`, {
+				timeout: 15_000,
+				signal,
+			});
 			if (prepared.success) {
 				this.sendConsole(`$ extract prepared ${templateDir}`);
 				const copied = await sandbox.exec(
@@ -4386,7 +5022,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return { ready: true, previewUrl: exposed.url };
 		} catch (err) {
 			if (signal?.aborted) {
-				if (!this.state.siteReady) await this.stopDevServer();
+				// No container means no dev server, and nothing to run commands in.
+				if (!this.state.siteReady && containerReady) await this.stopDevServer();
 				this.sendStatus("");
 				return { ready: false, stopped: true };
 			}
@@ -4466,14 +5103,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			abortSignal?.throwIfAborted();
 			let result: unknown;
 			try {
-				result = await this.mcpCallQueue.run(() => {
+				result = await this.mcpCallQueue.run(async () => {
+					await this.previewRendersIdle(abortSignal);
 					abortSignal?.throwIfAborted();
 					return this.mcp.callTool({ name, arguments: repairedArgs, serverId });
 				});
 			} catch (err) {
 				abortSignal?.throwIfAborted();
 				if (attempt < MAX_ATTEMPTS - 1) {
-					await this.waitForDevServer(abortSignal);
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps(abortSignal));
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
@@ -4483,7 +5121,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			if (mcpResult?.isError) {
 				const text = mcpResultText(result) || `${name} failed`;
 				if (attempt < MAX_ATTEMPTS - 1 && isTransientDevServerError(text)) {
-					await this.waitForDevServer(abortSignal);
+					await this.waitForDevServer(abortSignal, this.toolSandboxOps(abortSignal));
 					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
@@ -4638,14 +5276,108 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
+	 * The Dynamic Worker executor for CMS programs, or undefined when the
+	 * Worker Loader binding or the ENABLE_CMS_SCRIPTS switch is off.
+	 */
+	private async createCmsScriptExecutor(): Promise<Executor | undefined> {
+		const env = this.env as Env & { LOADER?: WorkerLoader; ENABLE_CMS_SCRIPTS?: string };
+		if (!env.LOADER || env.ENABLE_CMS_SCRIPTS !== "true") return undefined;
+		return createCmsScriptExecutor(env.LOADER);
+	}
+
+	/**
+	 * `run_cms_script`: a program's calls run the same tool objects as direct
+	 * calls, rebuilt against the program's mutation scope and a deferred sync,
+	 * so the whole program is one mutation window with one preview refresh and
+	 * one checkpoint, both inside the window.
+	 */
+	private async buildCmsScriptTool(turn: {
+		convergence: BuildConvergence;
+		failureGuard: McpToolFailureGuard;
+		metrics: TurnMetrics;
+		abortSignal: AbortSignal;
+		toolNames: readonly string[];
+		imageSources: ImageSources;
+	}): Promise<ToolSet> {
+		const executor = await this.createCmsScriptExecutor();
+		if (!executor) return {};
+		const names = CMS_SCRIPT_TOOLS.filter((name) => turn.toolNames.includes(name));
+		const immediate = this.immediateSiteSync(turn.metrics);
+		return {
+			[CMS_SCRIPT_TOOL]: createCmsScriptTool(names, (code, { toolCallId, abortSignal }) => {
+				const signal = abortSignal ?? turn.abortSignal;
+				return turn.convergence.runScript(
+					async (scope) => {
+						const progress = this.statusLine();
+						const deferred = new DeferredSiteSync();
+						const run = new CmsScriptRun({
+							toolCallId,
+							abortSignal: signal,
+							onCall: (name, ms, ok) => turn.metrics.onScriptCall(name, ms, ok),
+							onActivity: () => progress.set("Updating content..."),
+						});
+						const inner = {
+							...this.buildMcpTools(turn.failureGuard, scope, turn.metrics, deferred, {
+								quiet: true,
+							}),
+							...createMediaTools({
+								mutations: scope,
+								checkpoint: () => deferred.checkpoint(),
+								abortSignal: run.signal,
+								unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
+								imageSources: turn.imageSources,
+								apiToken: this.getApiToken(),
+								cmsBaseUrl: this.state.previewUrl,
+							}),
+						} as Record<string, CmsScriptTarget>;
+						const fns = Object.fromEntries(
+							names
+								.filter((name) => inner[name])
+								.map((name) => [name, run.bind(name, inner[name]!)]),
+						);
+						let outcome: Awaited<ReturnType<CmsScriptRun["execute"]>> | undefined;
+						try {
+							outcome = await run.execute(executor, code, fns);
+						} finally {
+							await run.close(outcome ? outcome.stop : "aborted");
+							// Inside the mutation window, so no observation can certify pre-program HTML.
+							await deferred.flush(immediate, scope.mutated);
+							progress.clear();
+						}
+						if (outcome.stop === "aborted") signal.throwIfAborted();
+						return cmsScriptOutput(outcome, run, scope.mutated);
+					},
+					{
+						key: mutationKey(CMS_SCRIPT_TOOL, { code }),
+						cacheResult: (output) => output.success,
+					},
+				);
+			}),
+		};
+	}
+
+	/** Preview refresh and checkpoint after a mutation, as tools run them one call at a time. */
+	private immediateSiteSync(metrics?: TurnMetrics): SiteSync {
+		return {
+			refreshPreview: () =>
+				timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview()),
+			checkpoint: async () => {
+				await timeSync(metrics, "backup", () => this.checkpointSite());
+			},
+		};
+	}
+
+	/**
 	 * Build the MCP-derived tool map for the current turn. MCP supplies the
 	 * tool descriptions and JSON schemas; we wrap each execute() with a small
 	 * retry that pings the dev server if it momentarily stopped responding.
 	 */
 	private buildMcpTools(
 		failureGuard: McpToolFailureGuard,
-		convergence: BuildConvergence,
+		convergence: MutationScope,
 		metrics?: TurnMetrics,
+		sync: SiteSync = this.immediateSiteSync(metrics),
+		{ quiet = false }: { quiet?: boolean } = {},
 	) {
 		const ALLOWED_MCP_TOOLS = new Set([
 			"schema_list_collections",
@@ -4756,8 +5488,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 										: undefined;
 								},
 								finish: async () => {
-									await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await sync.refreshPreview();
+									await sync.checkpoint();
 								},
 								abortSignal,
 								ambiguousCode: /CONFLICT/,
@@ -4786,8 +5518,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									: outcome.result;
 							if (entityFailureKey) convergence.resolveUnresolvedFailure(entityFailureKey);
 							if (MUTATING_MCP_TOOLS.has(t.name)) {
-								await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-								await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+								await sync.refreshPreview();
+								await sync.checkpoint();
 							}
 							return result;
 						}
@@ -4796,13 +5528,22 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							// react; the UI marks the tool failed.
 							this.sendConsole(`MCP ${t.name} error: ${outcome.text}`);
 							const blocked = failureGuard.recordFailure(t.name, normalized.args, outcome.text);
-							const error =
-								t.name === "content_create" && outcome.text.includes("[VALIDATION_ERROR]")
+							// With status "published", EmDash saves the draft before publishing it,
+							// so a publish-stage failure leaves an entry behind.
+							const publishStageFailure =
+								t.name === "content_create" &&
+								normalized.args.status === "published" &&
+								/Cannot publish|PUBLISH_REJECTED|CONTENT_PUBLISH_ERROR/.test(outcome.text);
+							const error = publishStageFailure
+								? `${outcome.text} The entry may already exist as an unpublished draft. Find it with content_list before retrying, then fix it (for example, give it a slug) and publish it with content_publish rather than creating a duplicate.`
+								: t.name === "content_create" && outcome.text.includes("[VALIDATION_ERROR]")
 									? `${outcome.text} No content was created. Correct the content_create data and retry content_create; do not use content_update for this missing entry.`
 									: outcome.text;
+							// Forcing content_create again would duplicate a saved draft.
 							if (
 								entityFailureKey &&
 								t.name === "content_create" &&
+								!publishStageFailure &&
 								outcome.text.includes("[VALIDATION_ERROR]")
 							) {
 								convergence.recordUnresolvedFailure({
@@ -4829,9 +5570,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 			};
 		}
-		this.sendConsole(
-			`MCP tools: ${Object.keys(mcpToolEntries).length} of ${mcpState.tools.length}`,
-		);
+		if (!quiet) {
+			this.sendConsole(
+				`MCP tools: ${Object.keys(mcpToolEntries).length} of ${mcpState.tools.length}`,
+			);
+		}
 		return mcpToolEntries;
 	}
 
@@ -4858,7 +5601,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					"repeater because the current schema MCP does not expose it; model ordered structured values " +
 					"such as a project gallery as a subject-specific block type plus a blocks field. Repeater is " +
 					"valid only inside blockTypes[].fields. The plan is " +
-					"checkpointed once at the end. Call refresh_types after it succeeds.",
+					"checkpointed once at the end. A successful plan regenerates emdash-env.d.ts and returns its " +
+					"declarations in `types`; use those names directly rather than calling refresh_types or reading the file.",
 				inputSchema: schemaPlanInput,
 				execute: async ({ blockTypes = [], collections = [] }, { abortSignal }) => {
 					const hasBlocksFields = collections.some((collection) =>
@@ -4903,6 +5647,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							let createdBlockFields = 0;
 							let skippedBlockFields = 0;
 							let updatedUrlPatterns = 0;
+							const notes: string[] = [];
 							let mutationDispatched = false;
 							let ambiguousCommit = false;
 							let checkpointed = false;
@@ -4930,7 +5675,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
 								}
 								if (confirmedChanged() || mutationDispatched || ambiguousCommit) {
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await timeSync(metrics, "backup", () => this.checkpointSite());
 								}
 								checkpointed = true;
 							};
@@ -4990,6 +5735,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									if (!inspected.ok) {
 										return fail(
 											`Block type ${blockType.slug} already exists but ${inspected.reason}. Use the renderer-aware block update workflow instead.`,
+										);
+									}
+									for (const slug of inspected.urlFields) {
+										notes.push(
+											`${blockType.slug}.${slug} is still a url field, which takes only absolute URLs. Store absolute URLs in it, or change it with schema_update_block_type to store a path such as "/events".`,
 										);
 									}
 									skippedBlockTypes += 1;
@@ -5209,11 +5959,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									);
 								}
 							}
-							await checkpointChanges();
+							progress.set("Generating types...");
+							let types: Awaited<ReturnType<BuilderAgent["regenerateSiteTypes"]>>;
+							try {
+								types = await this.regenerateSiteTypes(abortSignal);
+							} finally {
+								// A Stop here must not strand the schema changes outside the snapshot.
+								await checkpointChanges();
+							}
 							return {
 								success: true as const,
 								changed: confirmedChanged(),
 								...counters(),
+								...(notes.length > 0 ? { notes } : {}),
+								types,
 							};
 						},
 						mutationKey("apply_schema_plan", { blockTypes, collections }),
@@ -5221,6 +5980,48 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 			}),
 		};
+	}
+
+	/**
+	 * Regenerate emdash-env.d.ts after a schema change and return what the model
+	 * needs from it. Never throws: a failed refresh leaves the schema change in
+	 * place and tells the model to run refresh_types.
+	 */
+	private async regenerateSiteTypes(
+		abortSignal?: AbortSignal,
+	): Promise<
+		| ({ success: true; file: string } & ReturnType<typeof typeDeclarationsForModel>)
+		| { success: true; file: string; note: string }
+		| { success: false; error: string }
+	> {
+		try {
+			const result = await this.runSandboxRead(
+				(sandbox) => refreshLiveTypes(sandbox, abortSignal),
+				abortSignal,
+			);
+			if (result.success && result.declarations) {
+				return {
+					success: true,
+					file: result.generatedFile ?? "emdash-env.d.ts",
+					...typeDeclarationsForModel(result.declarations),
+				};
+			}
+			if (result.success) {
+				// The legacy CLI writes the types without returning them.
+				const file = result.generatedFile ?? "emdash-env.d.ts";
+				return { success: true, file, note: `Read ${file} for the generated names.` };
+			}
+			return {
+				success: false,
+				error: `Types were not regenerated (${(result.stderr || result.stdout || "no declarations returned").slice(0, 300)}). Call refresh_types before writing typed code.`,
+			};
+		} catch (error) {
+			abortSignal?.throwIfAborted();
+			return {
+				success: false,
+				error: `Types were not regenerated (${error instanceof Error ? error.message : String(error)}). Call refresh_types before writing typed code.`,
+			};
+		}
 	}
 
 	private async runReconciledSchemaWrite(options: {
@@ -5248,7 +6049,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			(outcome.status === "toolError" && options.ambiguousCode.test(outcome.text));
 		const committed = outcome.status === "ok";
 		if (options.abortSignal?.aborted) {
-			if (committed || ambiguous) await this.backupSite({ quiet: true });
+			if (committed || ambiguous) await this.checkpointSite();
 			options.abortSignal.throwIfAborted();
 		}
 
@@ -5260,12 +6061,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				response = await options.reconcile();
 				reconciled = response !== undefined;
 			} catch (error) {
-				if (committed || ambiguous) await this.backupSite({ quiet: true });
+				if (committed || ambiguous) await this.checkpointSite();
 				throw error;
 			}
 		}
 		if (!response) {
-			if (committed || ambiguous) await this.backupSite({ quiet: true });
+			if (committed || ambiguous) await this.checkpointSite();
 			const detail =
 				outcome.status === "toolError" || outcome.status === "thrown"
 					? outcome.text
@@ -5288,7 +6089,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const result: Record<string, unknown> = {};
 		const finishMutation = async () => {
 			await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
-			await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+			await timeSync(metrics, "backup", () => this.checkpointSite());
 		};
 		const reject = (error: string) => ({
 			changed: false as const,
@@ -5743,7 +6544,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	private async validateLiveBlockContracts(
-		sandbox: SandboxInstance,
+		sandbox: SandboxOps,
 		abortSignal?: AbortSignal,
 	): Promise<BlockRendererValidationResult> {
 		const { evidence, issues } = await this.loadLiveBlockEvidence(abortSignal);
@@ -5813,7 +6614,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * gets a short result summary out.
 	 */
 	private buildContentBatchTool(convergence: BuildConvergence, metrics?: TurnMetrics) {
-		const genModel = createBuilderModel(this.env);
+		const genModel = this.createTurnModel(metrics, "entry-body");
 		return {
 			create_entries_batch: tool({
 				description: [
@@ -5821,7 +6622,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					"body text in PARALLEL. Prefer this over many separate content_create calls whenever you",
 					"are seeding multiple entries of the same collection (several blog posts, portfolio",
 					"projects, etc.). You give a short brief per entry and the body prose is written for you;",
-					"entries are created AND published. Inspect the collection with schema_get_collection first.",
+					"entries are created AND published. Inspect the collection with schema_get_collection first, unless you created it with apply_schema_plan in this turn.",
 					"Put ONLY real schema fields (excerpt, image fieldValue from upload_media, date, etc.) in",
 					"each entry's `fields` -- unknown fields are dropped. Credit authors via the per-entry",
 					"`bylines` (byline ids from byline_create), NOT in `fields`. Upload images first.",
@@ -5939,12 +6740,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					let draftedCount = 0;
 					drafting.set(`Drafting (0/${entries.length})...`);
 					this.sendConsole(`Generating ${entries.length} entry bodies in parallel...`);
-					const generateBody = async (entry: { title: string; brief: string }) => {
+					const generateBody = async (entry: {
+						title: string;
+						brief: string;
+					}): Promise<{ body: string } | { body: null; error: string }> => {
 						const MAX = 4;
+						let problem = "empty body generated";
 						for (let attempt = 0; attempt < MAX; attempt++) {
 							abortSignal?.throwIfAborted();
 							try {
-								const { text, usage } = await generateText({
+								const { text, usage, finishReason } = await generateText({
 									model: genModel,
 									abortSignal,
 									system: [
@@ -5955,12 +6760,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 										"frontmatter, no title line, no preamble such as 'Here is'. Output only the body markdown.",
 									].join("\n"),
 									prompt: `Title: ${entry.title}\n\nWrite about: ${entry.brief}`,
-									maxOutputTokens: 2048,
-									providerOptions: BUILDER_PROVIDER_OPTIONS,
+									maxOutputTokens: ENTRY_BODY_MAX_OUTPUT_TOKENS,
+									providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.entryBody, {
+										reasoningSummary: false,
+									}),
 								});
 								metrics?.addSubcall(usage);
+								// A body cut off at the token limit would publish half an article.
+								if (finishReason === "length") {
+									problem = "body generation was cut off at the length limit";
+									continue;
+								}
 								const body = text.trim();
-								if (body.length > 0) return body;
+								if (body.length > 0) return { body };
+								problem = "empty body generated";
 							} catch (err) {
 								abortSignal?.throwIfAborted();
 								// Retry capacity/rate errors with backoff; rethrow the rest.
@@ -5972,13 +6785,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								throw err;
 							}
 						}
-						return null;
+						return { body: null, error: problem };
 					};
-					const drafted = await mapLimit(entries, 3, async (entry) => {
+					const drafted = await mapLimit(entries, ENTRY_BODY_CONCURRENCY, async (entry) => {
 						abortSignal?.throwIfAborted();
 						try {
-							const body = await generateBody(entry);
-							return { entry, body, error: body ? undefined : "empty body generated" };
+							const generated = await generateBody(entry);
+							return {
+								entry,
+								body: generated.body,
+								error: generated.body === null ? generated.error : undefined,
+							};
 						} catch (err) {
 							return {
 								entry,
@@ -6011,7 +6828,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								publishing.set("Saving...");
 								await timeSync(metrics, "previewRefresh", () => this.refreshAndReloadPreview());
 								if (results.some((result) => result.ok)) {
-									await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+									await timeSync(metrics, "backup", () => this.checkpointSite());
 								}
 							};
 							for (const [index, d] of drafted.entries()) {
@@ -6128,6 +6945,43 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	/** Model turns awaiting a record, keyed by request id, for the onChatResponse fallback. */
 	private readonly openTurnMetrics = new Map<string, TurnMetrics>();
 
+	private logInitialBuildBenchmark(
+		benchmark: InitialBuildBenchmark,
+		outcome: "completed" | "failed" | "stopped",
+	): void {
+		console.log(
+			JSON.stringify({
+				event: "builder.initial_build_benchmark",
+				sessionId: this.name,
+				outcome,
+				...benchmark,
+			}),
+		);
+	}
+
+	/**
+	 * The builder model, tagged for AI Gateway logs and counted against the turn.
+	 * A `purpose` marks a sub-call, whose attempts are not the current step's.
+	 */
+	private createTurnModel(metrics: TurnMetrics | undefined, purpose?: string) {
+		return createBuilderModel(this.env, {
+			metadata: {
+				session: this.name,
+				// The turn id is the client's chat request id; keep the header value safe.
+				...(metrics
+					? { turn: metrics.turnId.replace(/[^\w.-]/g, "").slice(0, 64), kind: metrics.kind }
+					: {}),
+				...(purpose ? { purpose } : {}),
+			},
+			...(metrics
+				? {
+						onResponse: (status: number) =>
+							metrics.noteModelResponse(status, { step: purpose === undefined }),
+					}
+				: {}),
+		});
+	}
+
 	private startTurnMetrics(
 		requestId: string | undefined,
 		init: Omit<TurnMetricsInit, "turnId" | "model">,
@@ -6206,7 +7060,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (!record) return;
 		try {
 			if (record.error) record.error = redactArtifactsToken(record.error);
-			if (keepInState) this.setState({ ...this.state, lastTurnMetrics: record });
+			if (keepInState) {
+				this.setState({ ...this.state, lastTurnMetrics: turnMetricsForState(record) });
+			}
 			console.log(
 				JSON.stringify({ event: "builder.turn_metrics", sessionId: this.name, ...record }),
 			);
@@ -6265,11 +7121,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const resuming = options?.continuation === true || this.restartingInterruptedTurn;
 		const turnUserMessageId = this.latestUserMessageId();
 		this.restartingInterruptedTurn = false;
-		if (this.hasOwnerActivityKind("publish")) {
+		const exclusive = this.hasOwnerActivityKind("publish")
+			? "Publishing is in progress."
+			: this.hasOwnerActivityKind("deploy")
+				? "A deploy is in progress."
+				: undefined;
+		if (exclusive) {
 			try {
 				await this.registerProjectForCurrentOwner();
 			} catch {}
-			return this.errorTurn("Publishing is in progress. Wait for it to finish, then try again.");
+			return this.errorTurn(`${exclusive} Wait for it to finish, then try again.`);
 		}
 		// A resumed turn already passed the gate; keep that if it is evicted again.
 		if (resuming) markChatTurnStarted(this);
@@ -6278,6 +7139,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this
 				.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
 			this.beginOwnerActivity(`chat:${options.requestId}`, "chat");
+			this.activeTurnRequestId = options.requestId;
 		}
 		try {
 			await this.registerProjectForCurrentOwner();
@@ -6360,8 +7222,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const closedHistory = closeInterruptedToolCalls(this.messages);
 		if (closedHistory) await this.persistMessages(closedHistory);
 
-		const model = createBuilderModel(this.env);
-
 		const finish = onFinish as (...args: unknown[]) => unknown;
 
 		// Provisioning runs in the background. While the site isn't ready we run
@@ -6413,6 +7273,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					})
 					.finally(() => {
 						if (this.provisionController === controller) this.provisionController = null;
+						this.settledProvision = pending;
 					});
 			}
 			const isUserTurn = this.messages[this.messages.length - 1]?.role === "user";
@@ -6449,8 +7310,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				promptChars: interviewSystem.length,
 				toolCount: interviewTools ? Object.keys(interviewTools).length : 0,
 			});
+			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
-				model,
+				model: this.createTurnModel(metrics),
 				system: interviewSystem,
 				messages: interviewMessages,
 				tools: interviewTools,
@@ -6460,8 +7322,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					: [hasToolCall("ask_questions"), stepCountIs(2)],
 				maxRetries: 5,
 				maxOutputTokens: 8192,
-				providerOptions: BUILDER_PROVIDER_OPTIONS,
+				providerOptions: builderProviderOptions(
+					alreadyInterviewed
+						? BUILDER_REASONING_EFFORT.holding
+						: BUILDER_REASONING_EFFORT.interview,
+					{ promptCacheKey: this.name },
+				),
 				abortSignal,
+				experimental_onStepStart: (event) =>
+					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
+				onChunk: ({ chunk }) => metrics.observeChunk(chunk.type),
 				onStepFinish: (step) => {
 					this.touchBuildActivity();
 					metrics.onStep(step);
@@ -6469,6 +7339,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				experimental_onToolCallFinish: (event) => {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
+					errors.noteToolCall(event);
 				},
 				onAbort: () => this.recordTurnMetrics(metrics.finish("stopped")),
 				onError: ({ error }) => {
@@ -6487,7 +7358,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				stream: withReasoningDurations(
 					result.toUIMessageStream(
 						replyStreamOptions(
-							(error) => friendlyTurnError(error),
+							errors.errorText,
 							initialGenerationId,
 							alreadyInterviewed ? "holding" : undefined,
 						),
@@ -6543,17 +7414,18 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				: runawayController.signal;
 			const convergence = new BuildConvergence(buildAbortSignal);
 			if (options?.requestId) this.activeBuildConvergences.set(options.requestId, convergence);
+			const imageSources = imageSourcesFrom(this.messages);
 			const sandboxTools = createTools(
-				() => this.getOrCreateSandbox(),
+				() => this.toolSandboxOps(buildAbortSignal),
 				{
 					reloadPreview: () =>
 						timeSync(metrics, "previewRefresh", () =>
 							this.refreshAndReloadPreview(tracksInitialBuild),
 						),
 					checkpointSite: async () => {
-						await timeSync(metrics, "backup", () => this.backupSite({ quiet: true }));
+						await timeSync(metrics, "backup", () => this.checkpointSite());
 					},
-					restartDevServer: () => this.restartDevServer(metrics),
+					restartDevServer: () => this.restartDevServer(metrics, buildAbortSignal),
 					getRecentRenderErrors: () =>
 						[
 							...new Set(
@@ -6568,12 +7440,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					runSandboxRead: (operation) => this.runSandboxRead(operation, buildAbortSignal),
 					validateBlockContracts: (sandbox) =>
 						this.validateLiveBlockContracts(sandbox, buildAbortSignal),
+					typecheckCache: {
+						lastPassed: () => this.readSecret("typecheckedSource"),
+						recordPassed: (fingerprint) => this.writeSecret("typecheckedSource", fingerprint),
+					},
 				},
 				{
 					convergence,
 					abortSignal: buildAbortSignal,
-					streamFile,
 					unsplashAccessKey: this.env.UNSPLASH_ACCESS_KEY,
+					imageSources,
 					apiToken: this.getApiToken(),
 					cmsBaseUrl: this.state.previewUrl,
 					previewImagesEnabled: true,
@@ -6582,13 +7458,27 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			);
 
 			const mcpFailureGuard = new McpToolFailureGuard();
-			const tools = {
+			const directTools = {
 				...sandboxTools,
 				...this.buildMcpTools(mcpFailureGuard, convergence, metrics),
 				...this.buildSchemaPlanTool(convergence, metrics),
 				...this.buildBlockEvolutionTools(convergence, metrics),
 				...this.buildContentBatchTool(convergence, metrics),
 			};
+			const tools = reportingRestores(
+				{
+					...directTools,
+					...(await this.buildCmsScriptTool({
+						convergence,
+						failureGuard: mcpFailureGuard,
+						metrics,
+						abortSignal: buildAbortSignal,
+						toolNames: Object.keys(directTools),
+						imageSources,
+					})),
+				},
+				() => this.restoreUnreported,
+			);
 			const buildToolNames = Object.keys(tools) as Array<keyof typeof tools>;
 			const initialScaffoldContext = isInitialBuild
 				? await this.loadInitialScaffoldContext()
@@ -6599,6 +7489,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				templateGuidance,
 				initialScaffoldContext,
 				editMode: !tracksInitialBuild,
+				cmsScripts: CMS_SCRIPT_TOOL in tools,
 			});
 
 			const onBuildFinish = async (...args: unknown[]) => {
@@ -6633,16 +7524,24 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 							...(isInitialBuild ? {} : { resumed: true }),
 						};
 						this.setState({ ...this.state, initialBuildBenchmark: benchmark });
-						console.log(
-							JSON.stringify({
-								event: "builder.initial_build_benchmark",
-								sessionId: this.name,
-								...benchmark,
-							}),
-						);
+						this.logInitialBuildBenchmark(benchmark, "completed");
 					}
 				} else if (tracksInitialBuild) {
+					const stopped =
+						buildAbortSignal.aborted ||
+						this.state.initialGeneration?.status === "stopping" ||
+						this.state.initialGeneration?.status === "stopped";
 					this.setInitialGenerationStatus("failed");
+					// Unfinished builds are the slow tail; log what they did first.
+					if (outcome?.steps) {
+						this.logInitialBuildBenchmark(
+							{
+								...summarizeInitialBuildBenchmark(this.state.milestones ?? {}, outcome.steps),
+								...(isInitialBuild ? {} : { resumed: true }),
+							},
+							stopped ? "stopped" : "failed",
+						);
+					}
 				}
 				if (tracksInitialBuild) this.setState({ ...this.state, initialBuildInFlight: false });
 				markChatTurnFinished(this, metrics.pendingRecord());
@@ -6655,8 +7554,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				if (isInitialBuild) this.markMilestone("buildStarting");
 			}
 			metrics.streamStarted({ promptChars: system.length, toolCount: buildToolNames.length });
+			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
-				model,
+				model: this.createTurnModel(metrics),
 				system,
 				messages: modelMessages,
 				tools,
@@ -6664,9 +7564,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				// turn. Keep text and tool history intact; prepareStep only drops
 				// superseded screenshot bytes. Interview turns are capped at 2.
 				stopWhen: stepCountIs(BUILD_STEP_CAP),
-				prepareStep: ({ messages }) => {
-					return prepareBuildStep(convergence, messages, buildToolNames);
-				},
+				prepareStep: ({ messages, stepNumber }) =>
+					prepareBuildTurnStep(convergence, messages, buildToolNames, {
+						initialBuild: tracksInitialBuild,
+						stepNumber,
+					}),
+				experimental_onStepStart: (event) =>
+					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
 				onStepFinish: (step) => {
 					convergence.finishStep(step);
 					if (tracksInitialBuild) {
@@ -6681,7 +7585,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				experimental_onToolCallFinish: (event) => {
 					this.touchBuildActivity();
 					metrics.onToolCallFinish(event);
+					errors.noteToolCall(event);
+					this.noteToolCallReported(event);
 				},
+				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
 				onAbort: () => {
 					if (convergence.currentRevision() > 0) this.dropSuggestions();
 					this.recordTurnMetrics(
@@ -6692,10 +7599,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 				maxRetries: 5,
 				maxOutputTokens: 32768,
-				providerOptions: BUILDER_PROVIDER_OPTIONS,
+				// prepareStep sets each step's effort over these options.
+				providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.build, {
+					promptCacheKey: this.name,
+				}),
 				abortSignal: buildAbortSignal,
 				onChunk: ({ chunk }) => {
 					this.touchBuildActivity();
+					metrics.observeChunk(chunk.type);
 					if (!runawayToolInput.observe(chunk)) return;
 					const error = new Error(
 						"Stopped a malformed tool call after excessive whitespace in its unfinished input.",
@@ -6713,9 +7624,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(
-						replyStreamOptions((error) => friendlyTurnError(error), initialGenerationId),
-					),
+					result.toUIMessageStream(replyStreamOptions(errors.errorText, initialGenerationId)),
 				),
 			});
 		} catch (err) {
@@ -6734,10 +7643,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	override async onStart(): Promise<void> {
-		if (!this.stateWrittenHere && this.hasProgressInState()) {
-			// A recovered turn marks itself active again when it resumes.
-			this.setState({ ...this.state, status: "", previewRestarting: false, turnActive: false });
-		}
+		this.resetProgressLeftByEviction();
 		if (this.state.initialGeneration?.status === "stopping") {
 			this.setInitialGenerationStatus("stopped", this.state.initialGeneration.terminalMessageId);
 		}
@@ -6797,6 +7703,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	protected override async onChatResponse(result: ChatResponseResult) {
+		if (result.requestId === this.activeTurnRequestId) this.activeTurnRequestId = undefined;
 		if (result.requestId === this.activeInitialRequestId) {
 			if (result.status === "aborted") {
 				await this.requestStop(this.state.initialGeneration?.id);
@@ -6875,6 +7782,15 @@ callable({
 })(BuilderAgent.prototype.resumePreview, {
 	kind: "method",
 	name: "resumePreview",
+	static: false,
+	private: false,
+} as ClassMethodDecoratorContext);
+
+callable({
+	description: "Keep the site's container from its idle stop while the owner uses the builder.",
+})(BuilderAgent.prototype.keepSandboxAwake, {
+	kind: "method",
+	name: "keepSandboxAwake",
 	static: false,
 	private: false,
 } as ClassMethodDecoratorContext);

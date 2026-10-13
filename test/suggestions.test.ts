@@ -18,7 +18,39 @@ const session = {
 };
 
 describe("next-step suggestions", () => {
-	it("asks the small model for JSON and keeps up to four clean, distinct suggestions", async () => {
+	it("asks for the owner's likely next requests, not only unfinished work", async () => {
+		let request: any;
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			request = input;
+			return { response: { suggestions: [] } };
+		});
+		await suggestNextSteps({ run }, "Brief", session);
+
+		// After a finished build, "only unfinished work" left the model nothing to suggest.
+		expect(request.messages[0]?.content).toContain("most likely to ask");
+		expect(request.messages[0]?.content).toContain("Return exactly 3 suggestions");
+		expect(request.messages[0]?.content).not.toContain("unfinished");
+	});
+
+	it("warns when the model's reply has no usable suggestion, saying how many it offered", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const empty = vi.fn(async () => ({ response: { suggestions: [] } }));
+			const filtered = vi.fn(async () => ({
+				response: { suggestions: [modelSuggestion("Set up Stripe checkout")] },
+			}));
+			expect(await suggestNextSteps({ run: empty }, "Brief", session)).toEqual([]);
+			expect(await suggestNextSteps({ run: filtered }, "Brief", session)).toEqual([]);
+			expect(warn.mock.calls).toEqual([
+				["[suggestions] no usable suggestion; the model offered 0"],
+				["[suggestions] no usable suggestion; the model offered 1"],
+			]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("asks the small model for JSON and keeps up to three clean, distinct suggestions", async () => {
 		const run = vi.fn(async () => ({
 			response: {
 				suggestions: [
@@ -47,7 +79,6 @@ describe("next-step suggestions", () => {
 			},
 			suggestion("Build the archive page"),
 			suggestion("Create the author byline"),
-			suggestion("Improve the recipe layout"),
 		]);
 		expect(run).toHaveBeenCalledWith(
 			SUGGESTIONS_MODEL,
@@ -56,6 +87,41 @@ describe("next-step suggestions", () => {
 				temperature: 0.2,
 			}),
 		);
+	});
+
+	it("asks for JSON with only the schema keywords Workers AI's grammar accepts", async () => {
+		let request: any;
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			request = input;
+			return { response: { suggestions: [] } };
+		});
+		await suggestNextSteps({ run }, "Brief", session);
+
+		const keywords = new Set<string>();
+		const visit = (schema: Record<string, any>) => {
+			for (const [key, value] of Object.entries(schema)) {
+				keywords.add(key);
+				if (key === "properties") Object.values(value).forEach((child: any) => visit(child));
+				if (key === "items") visit(value);
+			}
+		};
+		visit(request.response_format.json_schema);
+		// "The provided JSON schema contains features not supported by xgrammar."
+		expect([...keywords].sort()).toEqual(["enum", "items", "properties", "required", "type"]);
+	});
+
+	it("keeps a suggestion that repeats a capability and drops one that names none", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add a menu page", undefined, ["edit_site", "edit_site"]),
+					modelSuggestion("Add a gallery", undefined, []),
+				],
+			},
+		}));
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("Add a menu page"),
+		]);
 	});
 
 	it("accepts the JSON as a string", async () => {
@@ -152,6 +218,155 @@ describe("next-step suggestions", () => {
 				canSearchUnsplash: false,
 			}),
 		).toEqual([]);
+	});
+
+	it("tells the model which work it may not suggest, so it need not be filtered out", async () => {
+		const requests: any[] = [];
+		const run = vi.fn(async (_model: unknown, input: any) => {
+			requests.push(input);
+			return { response: { suggestions: [] } };
+		});
+		const toolNames = ["write_file", "search_unsplash", "upload_media"];
+		await suggestNextSteps({ run }, "Brief", { toolNames, canSearchUnsplash: false });
+		await suggestNextSteps({ run }, "Brief", { toolNames, canSearchUnsplash: true });
+
+		const [keyless, keyed] = requests.map((request) => request.messages[0].content as string);
+		expect(keyless).toContain("invented testimonials, reviews, or ratings");
+		expect(keyless).toContain("Photo search is not available in this session");
+		expect(keyed).not.toContain("Photo search is not available");
+	});
+
+	it("drops 5-star reviews, and headshots or pictures without photo search", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		expect(
+			await suggestNextSteps(
+				{ run: reply(["Show 5-star reviews", "Add staff headshots", "Add a picture gallery"]) },
+				"Brief",
+				keyless,
+			),
+		).toEqual([]);
+	});
+
+	it("drops invented social proof but keeps a review site's own reviews", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add more testimonials", undefined, ["cms_content"]),
+					modelSuggestion("Add customer reviews", undefined, ["cms_content"]),
+					modelSuggestion("Build the reviews archive"),
+					modelSuggestion("Add more projects", undefined, ["cms_content"]),
+				],
+			},
+		}));
+
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("Build the reviews archive"),
+			suggestion("Add more projects"),
+		]);
+	});
+
+	it("keeps star classes that are the site's own content", async () => {
+		const run = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("List more 4-star hotels", undefined, ["cms_content"]),
+					modelSuggestion("Add a Michelin 3-star page"),
+				],
+			},
+		}));
+
+		expect(await suggestNextSteps({ run }, "Brief", session)).toEqual([
+			suggestion("List more 4-star hotels"),
+			suggestion("Add a Michelin 3-star page"),
+		]);
+	});
+
+	it("drops getting new photos without photo search, but not editing the ones there", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const newPhotos = [
+			"Add a photo gallery",
+			"Replace the hero image",
+			"Add more location-based photos",
+		];
+		const imageEdits = [
+			"Add a lightbox to project images",
+			"Add captions to gallery photos",
+			"Show more images per row",
+		];
+		const toolNames = ["write_file", "search_unsplash", "upload_media"];
+		const keyless = { toolNames, canSearchUnsplash: false };
+		const keyed = { toolNames, canSearchUnsplash: true };
+
+		expect(await suggestNextSteps({ run: reply(newPhotos) }, "Brief", keyless)).toEqual([]);
+		expect(await suggestNextSteps({ run: reply(newPhotos) }, "Brief", keyed)).toEqual(
+			newPhotos.map((label) => suggestion(label)),
+		);
+		expect(await suggestNextSteps({ run: reply(imageEdits) }, "Brief", keyless)).toEqual(
+			imageEdits.map((label) => suggestion(label)),
+		);
+	});
+
+	it("keeps edits to the photos there when a photo word names what changes", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		for (const imageEdits of [
+			["Add image captions", "Add an image lightbox", "Swap hero image side"],
+			["Add photo credits", "Replace the photo grid", "Add image carousel"],
+		]) {
+			expect(await suggestNextSteps({ run: reply(imageEdits) }, "Brief", keyless)).toEqual(
+				imageEdits.map((label) => suggestion(label)),
+			);
+		}
+		// Unless it asks for new photos to fill it.
+		const newPhotos = vi.fn(async () => ({
+			response: {
+				suggestions: [
+					modelSuggestion("Add photo carousel", "Add a carousel with five new landscape photos."),
+					modelSuggestion("Add image slider", "Add a slider of fresh food photos to the menu."),
+					modelSuggestion("Add a photo grid section", "Add a grid of extra travel images."),
+				],
+			},
+		}));
+		expect(await suggestNextSteps({ run: newPhotos }, "Brief", keyless)).toEqual([]);
+	});
+
+	it("keeps pills about photography that need no new photos", async () => {
+		const reply = (labels: string[]) =>
+			vi.fn(async () => ({
+				response: { suggestions: labels.map((label) => modelSuggestion(label)) },
+			}));
+		const keyless = {
+			toolNames: ["write_file", "search_unsplash", "upload_media"],
+			canSearchUnsplash: false,
+		};
+
+		for (const labels of [
+			["Add a Photos link to the nav", "Add photo categories", "Add photography services"],
+			["Add a portrait sessions page", "Add a photography tips post", "Add photography pricing"],
+			["Add wedding photography packages", "Add a photography FAQ page"],
+		]) {
+			expect(await suggestNextSteps({ run: reply(labels) }, "Brief", keyless)).toEqual(
+				labels.map((label) => suggestion(label)),
+			);
+		}
 	});
 
 	it("gives the model the brief and the latest reply as plain text only", () => {

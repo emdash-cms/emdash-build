@@ -1,3 +1,5 @@
+import { PREVIEW_PROXY_HEADER } from "./preview-router.js";
+
 /** Select only public HTML document routes for last-known-good preview caching. */
 export function previewDocumentKey(request: Request): string | undefined {
 	if (request.method !== "GET" && request.method !== "HEAD") return undefined;
@@ -5,6 +7,9 @@ export function previewDocumentKey(request: Request): string | undefined {
 	const url = new URL(request.url);
 	if (
 		url.pathname.startsWith("/_emdash/") ||
+		// Astro's per-request endpoints answer with fragments or data, never a page.
+		url.pathname.startsWith("/_server-islands/") ||
+		url.pathname.startsWith("/_actions/") ||
 		url.pathname.startsWith("/@") ||
 		url.pathname.startsWith("/src/") ||
 		url.pathname.startsWith("/node_modules/") ||
@@ -24,7 +29,7 @@ export function previewDocumentKey(request: Request): string | undefined {
 
 export function preventPreviewErrorCaching(request: Request, response: Response): Response {
 	if (
-		request.headers.get("x-sandbox-preview-proxy") !== "1" ||
+		request.headers.get(PREVIEW_PROXY_HEADER) !== "1" ||
 		request.headers.get("Upgrade")?.toLowerCase() === "websocket" ||
 		response.status < 400
 	) {
@@ -66,6 +71,17 @@ export function hasNegotiatedVary(response: Response): boolean {
 		.split(",")
 		.map((header) => header.trim().toLowerCase())
 		.some((header) => header !== "" && header !== "accept-encoding");
+}
+
+/**
+ * Whether someone is loading the response as a page: a navigation, or a
+ * client without fetch metadata asking for HTML. A page's script fetching a
+ * fragment is not, so a fragment is not refused as an incomplete page.
+ */
+export function isPageNavigation(request: Request): boolean {
+	const destination = request.headers.get("Sec-Fetch-Dest");
+	if (destination) return ["document", "iframe", "frame"].includes(destination);
+	return (request.headers.get("Accept") ?? "").includes("text/html");
 }
 
 export function isCredentialedPreviewRequest(request: Request): boolean {

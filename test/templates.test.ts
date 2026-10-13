@@ -37,6 +37,9 @@ describe("builder template prototype", () => {
 		expect(prompt).toContain("Do not call validation, preview, or ad hoc `exec` checks again");
 		expect(prompt).toContain("Template guidance marker.");
 		expect(prompt).toContain("Render rich text with `<RichText");
+		expect(prompt).toContain("`emdash/ui` has no `RichText`");
+		expect(prompt).toContain('import RichText from "../../ui/RichText.astro";');
+		expect(prompt).toContain("never pass it an image field's object");
 		expect(prompt).not.toContain("Render rich text with `<PortableText");
 		expect(prompt).not.toContain("Keep the template's existing typefaces");
 		expect(prompt).toContain("Current structured-block contract");
@@ -47,23 +50,45 @@ describe("builder template prototype", () => {
 			'Do not declare `type: "repeater"` directly in a collection\'s fields',
 		);
 		expect(prompt).toContain("from `src/components/blocks/index.ts` with `../../../emdash-env`");
-		expect(prompt).toContain("Before `edit_files`, read every current file together");
+		// Edits match current text themselves; re-reading a file the model just wrote costs a step.
+		expect(prompt).toContain("without reading it again");
+		expect(prompt).not.toContain("Do this even if you authored the files earlier in the turn");
 		expect(prompt).toContain("use `edit_files`");
 		expect(prompt).toContain(
 			"Never call `exec` in the same model step as `validate_site` or `view_preview`",
 		);
 		expect(prompt).toContain("smallest complete, navigable, editable version");
 		expect(prompt).toContain(
-			"default to a small, coherent set of subject-specific Unsplash images",
+			"and `search_unsplash` is available, default to a small, coherent set of subject-specific photos from it",
+		);
+		// Asked for Unsplash photos it could not search for, the model wrote URLs from memory.
+		expect(prompt).not.toContain("subject-specific Unsplash images");
+		expect(prompt).toContain("Never write a photo URL from memory");
+		expect(prompt).toContain(
+			"Without `search_unsplash` or user images, or when photo search fails, design without photography",
+		);
+		// A required image field left a photo portfolio with no projects at all.
+		expect(prompt).toContain(
+			"keep image fields optional and still create every entry the site needs",
 		);
 		expect(prompt).toContain("do not describe the images as stock, sample, or placeholders");
 		expect(prompt).toContain("never put scaffolding language");
 		expect(prompt).not.toContain("strong, editable first version");
 		expect(prompt).not.toContain(".agents/skills/frontend-design/SKILL.md");
-		expect(prompt.indexOf("Call `view_preview`")).toBeLessThan(
-			prompt.indexOf("Call `validate_site`"),
-		);
+		// A mid-build look is optional; validation delivers the final preview.
+		expect(prompt).toContain("only when a visual decision is genuinely uncertain");
+		expect(prompt).toContain("When it passes it also returns the final preview screenshot");
+		expect(prompt).toContain('`status: "published"`');
 		expect(prompt).not.toContain("Custom Portable Text blocks");
+	});
+
+	it("describes CMS programs only when the tool is available", () => {
+		expect(buildBuildPrompt({})).not.toContain("run_cms_script");
+		for (const editMode of [false, true]) {
+			const prompt = buildBuildPrompt({ editMode, cmsScripts: true });
+			expect(prompt).toContain("`run_cms_script`");
+			expect(prompt).toContain("do not re-run it whole");
+		}
 	});
 
 	it("puts initial block guidance after stale pinned and snapshot guidance", () => {
@@ -116,6 +141,12 @@ describe("builder template prototype", () => {
 		});
 		expect(prompt).toContain("editing an existing EmDash CMS site");
 		expect(prompt).toContain("Old tool output was omitted");
+		// Edit turns add pages and collections too: a team page without photos needs its members.
+		expect(prompt).toContain("never write a photo URL from memory");
+		expect(prompt).toContain(
+			"keep new image fields optional and still create the entries the request needs",
+		);
+		expect(prompt).toContain("or when photo search fails");
 		expect(prompt).toContain("Preserve every surviving block's `_key`, `_type`, and `_version`");
 		expect(prompt).toContain("read `.agents/skills/blocks-schema-evolution/SKILL.md`");
 		expect(prompt).toContain("An older recovered project may lack");
@@ -159,5 +190,14 @@ describe("builder template prototype", () => {
 			'import { defineConfig, passthroughImageService } from "astro/config";',
 		);
 		expect(config).toContain("service: passthroughImageService(),");
+	});
+
+	it("turns off EmDash's update check, which no site owner can act on", async () => {
+		const config = await readFile(
+			new URL("../prototype/builder-cloudflare/astro.config.mjs", import.meta.url),
+			"utf8",
+		);
+
+		expect(config).toContain("updateCheck: false,");
 	});
 });

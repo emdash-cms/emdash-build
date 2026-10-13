@@ -473,8 +473,8 @@ export function ChatPanel({
 		beginQuestionnaireSend(
 			questionnaireResponse?.toolCallId ?? initialView!.id,
 			questionnaireResponse && !initialGeneration
-				? "Resume the initial build using my questionnaire answers above. Reuse the existing work; before finishing, run validate_site until it passes, then inspect the final preview."
-				: "Resume the initial build using the brief and answers above. Reuse the existing work; before finishing, run validate_site until it passes, then inspect the final preview.",
+				? "Resume the initial build using my questionnaire answers above. Reuse the existing work; before finishing, run validate_site until it passes and review the preview it returns."
+				: "Resume the initial build using the brief and answers above. Reuse the existing work; before finishing, run validate_site until it passes and review the preview it returns.",
 		);
 	};
 

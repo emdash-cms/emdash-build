@@ -67,6 +67,7 @@ import {
 } from "./recent-projects.js";
 import { initialGenerationForDisplay, isInitialGenerationActive } from "./initial-generation.js";
 import { useProjectListRefresh } from "./use-project-refresh.js";
+import { useSandboxHeartbeat } from "./sandbox-heartbeat.js";
 import { toasts } from "./toasts.js";
 import {
 	messageDeliveryStatus,
@@ -639,6 +640,9 @@ function AppInner({
 	const [initialGeneration, setInitialGeneration] = useState<InitialGeneration>();
 	const [buildDurationMs, setBuildDurationMs] = useState<number>();
 	const [previewRestarting, setPreviewRestarting] = useState(false);
+	const [slotWait, setSlotWait] = useState<BuilderState["sandboxWait"]>();
+	const [sandboxPaused, setSandboxPaused] = useState(false);
+	const sandboxPausedRef = useRef(false);
 	const [reopenState, setReopenState] = useState<
 		"waking" | "ready" | "failed" | "unknown" | "needsChat" | undefined
 	>(resuming && session.previewUrl ? "waking" : undefined);
@@ -849,6 +853,9 @@ function AppInner({
 					: undefined,
 			);
 			setPreviewRestarting(state.previewRestarting ?? false);
+			setSlotWait(state.sandboxWait);
+			sandboxPausedRef.current = state.sandboxPaused === true;
+			setSandboxPaused(sandboxPausedRef.current);
 			if (state.previewRestarting) {
 				resumeSawServerWake.current = true;
 				if (resumeOutcomeUnknown.current) setReopenState("waking");
@@ -1152,6 +1159,17 @@ function AppInner({
 		resumeRequested.current = true;
 		retryRecovery();
 	}, [resuming, retryRecovery]);
+	useSandboxHeartbeat(agent);
+	// Coming back to a tab whose idle editor was stopped resumes it.
+	useEffect(() => {
+		const resumeWhenSeen = () => {
+			if (document.visibilityState === "visible" && sandboxPausedRef.current) {
+				retryRecoveryRef.current();
+			}
+		};
+		document.addEventListener("visibilitychange", resumeWhenSeen);
+		return () => document.removeEventListener("visibilitychange", resumeWhenSeen);
+	}, []);
 	const projectStatus: ProjectSummary["status"] = provisionError
 		? "failed"
 		: liveUrl
@@ -1813,6 +1831,8 @@ function AppInner({
 											onPreviewPathChange={reportPreviewPath}
 											onRefreshRoute={refreshPreviewRoute}
 											onCheckRouteSnapshot={checkPreviewRoute}
+											slotWait={slotWait}
+											paused={sandboxPaused && !resumingPreview && !provisionError}
 										/>
 									</div>
 

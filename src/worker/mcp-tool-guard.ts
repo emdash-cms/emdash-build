@@ -1,3 +1,4 @@
+import type { JSONSchema7 } from "ai";
 import { mutationKey } from "./build-convergence.js";
 
 type JsonObject = Record<string, unknown>;
@@ -6,7 +7,6 @@ function isObject(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const PAGINATED_CURSOR_TOOLS = new Set(["content_list", "search", "media_list"]);
 const CONTENT_ORDER_ALIASES: Record<string, string> = {
 	created_at: "createdAt",
 	updated_at: "updatedAt",
@@ -21,13 +21,14 @@ const CONTENT_ORDER_ALIASES: Record<string, string> = {
  * that one optional value as required-but-nullable to the builder model while
  * leaving the real MCP contract unchanged.
  */
-export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unknown {
-	if (!isObject(inputSchema)) return inputSchema;
+export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): JSONSchema7 {
+	if (!isObject(inputSchema)) return inputSchema as JSONSchema7;
 
 	const adapted = structuredClone(inputSchema) as JsonObject;
 	const properties = adapted.properties;
-	if (!isObject(properties)) return inputSchema;
-	if (PAGINATED_CURSOR_TOOLS.has(toolName) && isObject(properties.cursor)) {
+	if (!isObject(properties)) return inputSchema as JSONSchema7;
+	// Every listing's cursor: left optional, the model invents one, such as ":x".
+	if (isObject(properties.cursor)) {
 		const stringCursor: JsonObject = { ...properties.cursor, type: "string" };
 		delete stringCursor.anyOf;
 		delete stringCursor.description;
@@ -41,7 +42,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 			: [];
 		if (!required.includes("cursor")) required.push("cursor");
 		adapted.required = required;
-		return adapted;
+		return adapted as JSONSchema7;
 	}
 	if (toolName !== "menu_set_items") return inputSchema;
 	const itemsProperty = properties.items;
@@ -64,7 +65,7 @@ export function adaptMcpToolSchema(toolName: string, inputSchema: unknown): unkn
 		: [];
 	if (!required.includes("parentIndex")) required.push("parentIndex");
 	itemSchema.required = required;
-	return adapted;
+	return adapted as JSONSchema7;
 }
 
 /**
@@ -79,10 +80,8 @@ export function normalizeMcpToolArgs(
 ): { args: Record<string, unknown>; repaired: boolean } {
 	let normalized = args;
 	let repaired = false;
-	if (
-		PAGINATED_CURSOR_TOOLS.has(toolName) &&
-		(args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim()))
-	) {
+	// A blank cursor means the first page to the model, and nothing to EmDash, for any listing.
+	if (args.cursor === null || (typeof args.cursor === "string" && !args.cursor.trim())) {
 		normalized = { ...normalized };
 		delete normalized.cursor;
 		repaired = true;
@@ -95,6 +94,13 @@ export function normalizeMcpToolArgs(
 		if (normalized === args) normalized = { ...normalized };
 		normalized.orderBy = normalizedOrderBy;
 		repaired = true;
+	}
+	if (toolName === "content_create") {
+		const created = normalizeContentCreate(normalized);
+		if (created !== normalized) {
+			normalized = created;
+			repaired = true;
+		}
 	}
 	if (toolName !== "menu_set_items" || !Array.isArray(normalized.items)) {
 		return { args: normalized, repaired };
@@ -114,6 +120,26 @@ export function normalizeMcpToolArgs(
 		: { args: normalized, repaired: false };
 }
 
+/**
+ * Luna builds entries from objects that carry their slug, and fills optional
+ * identifiers with "". EmDash rejects both: `slug` is a built-in entry field,
+ * never a data field, and "" names no locale or entry. An explicit slug wins.
+ */
+function normalizeContentCreate(args: JsonObject): JsonObject {
+	let next = args;
+	const copy = () => (next === args ? (next = { ...args }) : next);
+	if (isObject(args.data) && typeof args.data.slug === "string" && args.data.slug) {
+		const { slug, ...data } = args.data;
+		const target = copy();
+		target.data = data;
+		if (!target.slug) target.slug = slug;
+	}
+	for (const key of ["locale", "translationOf"]) {
+		if (args[key] === "") delete copy()[key];
+	}
+	return next;
+}
+
 const AUTO_PUBLISH_NOTE =
 	"In this builder, when status is omitted and the item is already published, the staged " +
 	"change is published automatically if there is no existing draft or schedule. On success, " +
@@ -121,8 +147,14 @@ const AUTO_PUBLISH_NOTE =
 const CONTENT_LIST_NOTE =
 	"Pass cursor: null on the first page. On later pages, pass only the exact cursor returned by the previous response; never invent a cursor. Omit orderBy unless the collection schema confirms that field is indexed.";
 
+/** Saves the separate content_publish step EmDash's own description points to. */
+const CREATE_PUBLISHED_NOTE =
+	'In this builder, pass status: "published" to create and publish the entry in one call, unless the user asked for a draft. ' +
+	"Publishing needs a slug, which is derived only from a title or name field, so pass an explicit slug for any other entry.";
+
 /** EmDash's description, plus what the builder does differently. */
 export function mcpToolDescription(toolName: string, description: string): string {
+	if (toolName === "content_create") return `${description} ${CREATE_PUBLISHED_NOTE}`;
 	if (toolName === "content_update") return `${description} ${AUTO_PUBLISH_NOTE}`;
 	if (toolName === "content_list") return `${description} ${CONTENT_LIST_NOTE}`;
 	return description;
