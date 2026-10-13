@@ -3604,6 +3604,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		let waited = false;
 		let started = false;
 		let gaveUp = false;
+		// Asking again: a refusal from an earlier wait would outlast a start that is granted.
+		if (this.state.sandboxWait?.gaveUp) this.setState({ ...this.state, sandboxWait: undefined });
 		try {
 			for (;;) {
 				signal?.throwIfAborted();

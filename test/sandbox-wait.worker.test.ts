@@ -121,6 +121,26 @@ describe("waiting for a sandbox slot", () => {
 		});
 	});
 
+	it("stops saying every slot is busy as soon as a retry asks again", async () => {
+		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000006");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as Harness;
+			const seen: Array<BuilderState["sandboxWait"]> = [];
+			harness.sandboxOps = () => ({
+				ensureRunning: async () => {
+					seen.push(harness.state.sandboxWait);
+					return { ok: true };
+				},
+				cancelStart: async () => {},
+			});
+			instance.setState({ ...instance.state, sandboxWait: { gaveUp: true } });
+
+			await expect(harness.waitForSandbox()).resolves.toEqual({ ok: true });
+			// A granted start can take half a minute, under a message that it was refused.
+			expect(seen).toEqual([undefined]);
+		});
+	});
+
 	it("lets Stop end a follow-up whose site waits for a slot", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
 		await runInDurableObject(agent, async (instance) => {
