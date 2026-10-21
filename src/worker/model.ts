@@ -1,8 +1,53 @@
+import { createAnthropic, type AnthropicLanguageModelOptions } from "@ai-sdk/anthropic";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import type { ModelMessage } from "ai";
 import { prepareBuildStep, type BuildConvergence } from "./build-convergence.js";
 
 export const BUILDER_MODEL_ID = "openai/gpt-5.6-luna";
+
+/**
+ * Gateway model ids a local model comparison may pin per project, from the
+ * comma-separated `BUILDER_MODEL_CHOICES`. Deployed config leaves it empty, so
+ * production always builds with BUILDER_MODEL_ID.
+ */
+export function builderModelChoices(env: { BUILDER_MODEL_CHOICES?: string }): string[] {
+	return (env.BUILDER_MODEL_CHOICES ?? "")
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
+
+/**
+ * The API a gateway model id is served through. Claude models go to the
+ * gateway's Anthropic Messages endpoint: its Responses translation turns effort
+ * into budgeted thinking, which Claude 5.5 models reject.
+ */
+export type BuilderProvider = "openai" | "anthropic";
+
+export function builderProvider(modelId: string): BuilderProvider {
+	return modelId.startsWith("anthropic/") ? "anthropic" : "openai";
+}
+
+/** The gateway lists `anthropic/claude-opus-5.5`; Anthropic's API names it `claude-opus-5-5`. */
+function anthropicModelId(modelId: string): string {
+	return modelId.slice("anthropic/".length).replaceAll(".", "-");
+}
+
+/**
+ * Claude 5.5 models take no assistant prefill, but a first build that follows
+ * an interview without questions continues the interview's own reply. For
+ * Claude the turn's input ends at the latest user or tool message; the reply
+ * stays in the stored conversation.
+ */
+export function turnInputMessages(
+	messages: ModelMessage[],
+	provider: BuilderProvider,
+): ModelMessage[] {
+	if (provider !== "anthropic") return messages;
+	let end = messages.length;
+	while (end > 0 && messages[end - 1]?.role === "assistant") end -= 1;
+	return messages.slice(0, end);
+}
 
 export type BuilderReasoningEffort = "low" | "medium" | "high";
 
@@ -37,6 +82,7 @@ export function builderProviderOptions(
 		promptCacheKey?: string;
 	} = {},
 ) {
+	// Each provider reads only its own key, so one value serves every model.
 	return {
 		openai: {
 			forceReasoning: true,
@@ -45,6 +91,12 @@ export function builderProviderOptions(
 			...(promptCacheKey ? { promptCacheKey } : {}),
 			store: false,
 		} satisfies OpenAIResponsesProviderOptions,
+		anthropic: {
+			thinking: { type: "adaptive", ...(reasoningSummary ? { display: "summarized" } : {}) },
+			effort,
+			// Automatic caching of the growing prefix, as OpenAI caches without being asked.
+			cacheControl: { type: "ephemeral" },
+		} satisfies AnthropicLanguageModelOptions,
 	};
 }
 
@@ -68,26 +120,44 @@ export function buildStepProviderOptions(step: {
 	stepNumber: number;
 	allowedTools?: { toolNames: string[]; mode: "auto" | "required" };
 }) {
+	const forced = step.allowedTools?.mode === "required";
 	return {
 		openai: {
 			reasoningEffort: buildStepReasoningEffort(step),
 			...(step.allowedTools ? { allowedTools: step.allowedTools } : {}),
 			// A forced tool is one call, as tool_choice for a single function was.
-			...(step.allowedTools?.mode === "required" ? { parallelToolCalls: false } : {}),
+			...(forced ? { parallelToolCalls: false } : {}),
 		} satisfies OpenAIResponsesProviderOptions,
+		anthropic: {
+			effort: buildStepReasoningEffort(step),
+			...(forced ? { disableParallelToolUse: true } : {}),
+		} satisfies AnthropicLanguageModelOptions,
 	};
 }
 
-/** One build step's settings: convergence gating plus this step's provider options. */
+/**
+ * One build step's settings: convergence gating plus this step's provider
+ * options. Anthropic has no allowed_tools, so a forced tool becomes a tool
+ * choice (the SDK sends only that tool, unforced, to models that reject forced
+ * tools), and a narrowed set is dropped as on gateways that reject the field:
+ * exec refuses by itself while validation is current.
+ */
 export function prepareBuildTurnStep<TOOL_NAME extends string>(
 	convergence: BuildConvergence,
 	messages: ModelMessage[],
 	toolNames: readonly TOOL_NAME[],
-	step: { initialBuild: boolean; stepNumber: number },
+	step: { initialBuild: boolean; stepNumber: number; provider: BuilderProvider },
 ) {
 	const { allowedTools, ...prepared } = prepareBuildStep(convergence, messages, toolNames);
+	const forcedTool =
+		step.provider === "anthropic" &&
+		allowedTools?.mode === "required" &&
+		allowedTools.toolNames.length === 1
+			? allowedTools.toolNames[0]
+			: undefined;
 	return {
 		...prepared,
+		...(forcedTool ? { toolChoice: { type: "tool" as const, toolName: forcedTool } } : {}),
 		providerOptions: buildStepProviderOptions({ ...step, allowedTools }),
 	};
 }
@@ -155,6 +225,8 @@ function jsonBody(init: RequestInit | undefined): Record<string, unknown> | unde
 type GatewayEnv = Pick<Env, "AI_GATEWAY_TOKEN" | "AI_GATEWAY_ACCOUNT_ID" | "AI_GATEWAY_ID">;
 
 export interface BuilderModelOptions {
+	/** A gateway model id from `builderModelChoices`; BUILDER_MODEL_ID otherwise. */
+	modelId?: string;
 	/** AI Gateway custom metadata, so gateway logs can be joined to builder turns. */
 	metadata?: Record<string, string | number | boolean>;
 	/** Called once per HTTP attempt, retries included; 0 means the request failed. */
@@ -202,6 +274,23 @@ export function createBuilderModel(env: GatewayEnv, options: BuilderModelOptions
 		if (retried.ok) optionalFieldsRejected = true;
 		return retried;
 	};
+	const modelId = options.modelId ?? BUILDER_MODEL_ID;
+	if (builderProvider(modelId) === "anthropic") {
+		return createAnthropic({
+			baseURL: `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/anthropic/v1`,
+			// The gateway bills its own account; a provider key would replace that.
+			apiKey: "gateway-billed",
+			headers: {
+				"cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}`,
+				...(options.metadata ? { "cf-aig-metadata": JSON.stringify(options.metadata) } : {}),
+			},
+			fetch: (input, init) => {
+				const headers = new Headers(init?.headers);
+				headers.delete("x-api-key");
+				return attempt(input, { ...init, headers });
+			},
+		}).messages(anthropicModelId(modelId));
+	}
 	const gateway = createOpenAI({
 		apiKey: env.AI_GATEWAY_TOKEN,
 		baseURL: `https://api.cloudflare.com/client/v4/accounts/${env.AI_GATEWAY_ACCOUNT_ID}/ai/v1`,
@@ -211,7 +300,7 @@ export function createBuilderModel(env: GatewayEnv, options: BuilderModelOptions
 		},
 		fetch: gatewayFetch,
 	});
-	return gateway.responses(BUILDER_MODEL_ID);
+	return gateway.responses(modelId);
 }
 
 /** The reasoning effort a step's provider options request, for turn metrics. */

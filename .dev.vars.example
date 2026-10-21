@@ -5,3 +5,6 @@ AI_GATEWAY_TOKEN=
 
 # Optional. Obtain a key from Unsplash if media search is needed.
 UNSPLASH_ACCESS_KEY=
+
+# Optional, local only. Gateway model ids a project may pin for scripts/model-comparison.
+# BUILDER_MODEL_CHOICES=openai/gpt-6-luna,anthropic/claude-haiku-5.5,anthropic/claude-opus-5.5

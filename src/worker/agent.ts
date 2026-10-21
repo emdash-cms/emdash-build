@@ -137,10 +137,13 @@ import {
 import {
 	BUILDER_MODEL_ID,
 	BUILDER_REASONING_EFFORT,
+	builderModelChoices,
+	builderProvider,
 	builderProviderOptions,
 	createBuilderModel,
 	prepareBuildTurnStep,
 	requestedReasoningEffort,
+	turnInputMessages,
 } from "./model.js";
 import {
 	McpToolFailureGuard,
@@ -6965,6 +6968,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private createTurnModel(metrics: TurnMetrics | undefined, purpose?: string) {
 		return createBuilderModel(this.env, {
+			modelId: this.builderModelId(),
 			metadata: {
 				session: this.name,
 				// The turn id is the client's chat request id; keep the header value safe.
@@ -6982,12 +6986,32 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		});
 	}
 
+	/**
+	 * Pin the model a local comparison asked for, from a local dev client only.
+	 * A project keeps the first model pinned, and one that already has replies
+	 * keeps the model that wrote them: reasoning one provider returned cannot
+	 * be replayed to another.
+	 */
+	private pinBuilderModel(requested: unknown, clientHost: string | undefined): void {
+		if (typeof requested !== "string" || !clientHost || !isLocalHostname(clientHost)) return;
+		if (!builderModelChoices(this.env).includes(requested) || this.readSecret("builderModel"))
+			return;
+		if (this.messages.some((message) => message.role === "assistant")) return;
+		this.writeSecret("builderModel", requested);
+	}
+
+	/** The model a local comparison pinned for this project, or BUILDER_MODEL_ID. */
+	private builderModelId(): string {
+		const pinned = this.readSecret("builderModel");
+		return pinned && builderModelChoices(this.env).includes(pinned) ? pinned : BUILDER_MODEL_ID;
+	}
+
 	private startTurnMetrics(
 		requestId: string | undefined,
 		init: Omit<TurnMetricsInit, "turnId" | "model">,
 	): TurnMetrics {
 		const turnId = requestId ?? crypto.randomUUID();
-		const metrics = new TurnMetrics({ ...init, turnId, model: BUILDER_MODEL_ID });
+		const metrics = new TurnMetrics({ ...init, turnId, model: this.builderModelId() });
 		if (requestId) this.openTurnMetrics.set(requestId, metrics);
 		return metrics;
 	}
@@ -7196,6 +7220,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (clientHost && this.state.appHost !== clientHost) {
 			this.setState({ ...this.state, appHost: clientHost });
 		}
+		this.pinBuilderModel(options?.body?.builderModel, clientHost);
 		const candidateHost = clientHost ?? this.state.appHost;
 		const hostname =
 			candidateHost && isLocalHostname(candidateHost) ? candidateHost : this.env.PREVIEW_HOSTNAME;
@@ -7548,7 +7573,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				await this.saveAndRecordTurn(metrics);
 			};
 			const history = await convertToModelMessages(this.messages);
-			const modelMessages = tracksInitialBuild ? history : compactFollowUpContext(history);
+			const modelMessages = turnInputMessages(
+				tracksInitialBuild ? history : compactFollowUpContext(history),
+				builderProvider(this.builderModelId()),
+			);
 			if (tracksInitialBuild) {
 				this.setState({ ...this.state, buildStarted: true, initialBuildInFlight: true });
 				if (isInitialBuild) this.markMilestone("buildStarting");
@@ -7568,6 +7596,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					prepareBuildTurnStep(convergence, messages, buildToolNames, {
 						initialBuild: tracksInitialBuild,
 						stepNumber,
+						provider: builderProvider(this.builderModelId()),
 					}),
 				experimental_onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),

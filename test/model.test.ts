@@ -9,9 +9,12 @@ import {
 	BUILDER_REASONING_EFFORT,
 	buildStepProviderOptions,
 	buildStepReasoningEffort,
+	builderModelChoices,
+	builderProvider,
 	builderProviderOptions,
 	createBuilderModel,
 	prepareBuildTurnStep,
+	turnInputMessages,
 } from "../src/worker/model.js";
 
 const env = {
@@ -56,21 +59,36 @@ function completedResponse() {
 describe("builder model configuration", () => {
 	it("uses Luna without stored response references", () => {
 		expect(BUILDER_MODEL_ID).toBe("openai/gpt-5.6-luna");
-		expect(builderProviderOptions("medium")).toEqual({
-			openai: {
-				forceReasoning: true,
-				reasoningEffort: "medium",
-				reasoningSummary: "auto",
-				store: false,
-			},
+		expect(builderProviderOptions("medium").openai).toEqual({
+			forceReasoning: true,
+			reasoningEffort: "medium",
+			reasoningSummary: "auto",
+			store: false,
 		});
 		expect(builderProviderOptions("high", { promptCacheKey: "session-1" }).openai).toMatchObject({
 			promptCacheKey: "session-1",
 		});
 		// Nobody reads a sub-call's reasoning, so it asks for no summary.
-		expect(builderProviderOptions("low", { reasoningSummary: false })).toEqual({
-			openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+		expect(builderProviderOptions("low", { reasoningSummary: false }).openai).toEqual({
+			forceReasoning: true,
+			reasoningEffort: "low",
+			store: false,
 		});
+	});
+
+	it("gives Claude adaptive thinking at the same effort, with automatic caching", () => {
+		expect(builderProviderOptions("high").anthropic).toEqual({
+			thinking: { type: "adaptive", display: "summarized" },
+			effort: "high",
+			cacheControl: { type: "ephemeral" },
+		});
+		expect(builderProviderOptions("low", { reasoningSummary: false }).anthropic).toEqual({
+			thinking: { type: "adaptive" },
+			effort: "low",
+			cacheControl: { type: "ephemeral" },
+		});
+		expect(builderProvider("anthropic/claude-opus-5.5")).toBe("anthropic");
+		expect(builderProvider(BUILDER_MODEL_ID)).toBe("openai");
 	});
 
 	it("spends high effort only where a step shapes the rest of the build", () => {
@@ -102,10 +120,134 @@ describe("builder model configuration", () => {
 				allowedTools: { toolNames: ["view_preview"], mode: "required" },
 				parallelToolCalls: false,
 			},
+			anthropic: { effort: "medium", disableParallelToolUse: true },
 		});
 		expect(buildStepProviderOptions({ initialBuild: false, stepNumber: 4 })).toEqual({
 			openai: { reasoningEffort: "medium" },
+			anthropic: { effort: "medium" },
 		});
+	});
+
+	it("forces Claude's tool through tool choice and leaves a narrowed set to exec's own refusal", () => {
+		const toolNames = ["exec", "write_file", "view_preview"] as const;
+		const validated = new BuildConvergence();
+		validated.recordValidation(validated.beginObservation()!, { success: true });
+		const step = { initialBuild: true, stepNumber: 5 };
+
+		const claude = prepareBuildTurnStep(validated, [], toolNames, {
+			...step,
+			provider: "anthropic",
+		});
+		const luna = prepareBuildTurnStep(validated, [], toolNames, { ...step, provider: "openai" });
+
+		expect(claude.toolChoice).toEqual({ type: "tool", toolName: "view_preview" });
+		expect(claude.providerOptions.anthropic).toEqual({
+			effort: "medium",
+			disableParallelToolUse: true,
+		});
+		expect(luna.toolChoice).toBeUndefined();
+		expect(luna.providerOptions.openai.allowedTools).toEqual({
+			toolNames: ["view_preview"],
+			mode: "required",
+		});
+		expect(claude).not.toHaveProperty("activeTools");
+	});
+
+	it("ends Claude's input at the latest user or tool message, not a prefill", () => {
+		const brief = { role: "user" as const, content: "Build a bakery site" };
+		const ack = { role: "assistant" as const, content: "I'll start building now." };
+		const call = {
+			role: "assistant" as const,
+			content: [{ type: "tool-call" as const, toolCallId: "1", toolName: "exec", input: {} }],
+		};
+		const result = {
+			role: "tool" as const,
+			content: [
+				{
+					type: "tool-result" as const,
+					toolCallId: "1",
+					toolName: "exec",
+					output: { type: "text" as const, value: "ok" },
+				},
+			],
+		};
+
+		expect(turnInputMessages([brief, ack], "anthropic")).toEqual([brief]);
+		expect(turnInputMessages([brief, ack], "openai")).toEqual([brief, ack]);
+		expect(turnInputMessages([brief, call, result], "anthropic")).toEqual([brief, call, result]);
+	});
+
+	it("sends Claude to the gateway's Anthropic endpoint, billed by the gateway", async () => {
+		const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+		const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			requests.push({
+				url: String(input),
+				headers: new Headers(init?.headers),
+				body: JSON.parse(String(init?.body)),
+			});
+			return new Response(
+				JSON.stringify({
+					id: "msg_1",
+					type: "message",
+					role: "assistant",
+					model: "claude-opus-5-5",
+					content: [{ type: "text", text: "ok" }],
+					stop_reason: "end_turn",
+					stop_sequence: null,
+					usage: { input_tokens: 1, output_tokens: 1 },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		};
+		const { generateText } = await import("ai");
+		const tools = {
+			write_file: tool({ inputSchema: z.object({}), execute: async () => ({}) }),
+			view_preview: tool({ inputSchema: z.object({}), execute: async () => ({}) }),
+		};
+		const forcedPreview = {
+			tools,
+			prompt: "Build",
+			toolChoice: { type: "tool" as const, toolName: "view_preview" as const },
+			providerOptions: builderProviderOptions("high"),
+		};
+
+		await generateText({
+			model: createBuilderModel(env, {
+				fetch,
+				modelId: "anthropic/claude-opus-5.5",
+				metadata: { session: "s1" },
+			}),
+			...forcedPreview,
+		});
+		await generateText({
+			model: createBuilderModel(env, { fetch, modelId: "anthropic/claude-haiku-5.5" }),
+			...forcedPreview,
+		});
+
+		const [opus, haiku] = requests;
+		expect(opus?.url).toBe(
+			"https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic/v1/messages",
+		);
+		expect(opus?.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+		expect(opus?.headers.has("x-api-key")).toBe(false);
+		expect(JSON.parse(opus?.headers.get("cf-aig-metadata") ?? "null")).toEqual({ session: "s1" });
+		expect(opus?.body).toMatchObject({
+			model: "claude-opus-5-5",
+			thinking: { type: "adaptive", display: "summarized" },
+			output_config: { effort: "high" },
+			cache_control: { type: "ephemeral" },
+		});
+		// Opus 5.5 rejects forced tools: only the forced tool goes, unforced.
+		expect(opus?.body.tool_choice).toMatchObject({ type: "auto" });
+		expect((opus?.body.tools as Array<{ name: string }>).map((t) => t.name)).toEqual([
+			"view_preview",
+		]);
+		expect(haiku?.body.model).toBe("claude-haiku-5-5");
+		expect(haiku?.body.tool_choice).toMatchObject({ type: "tool", name: "view_preview" });
+		expect((haiku?.body.tools as Array<{ name: string }>).map((t) => t.name)).toEqual([
+			"write_file",
+			"view_preview",
+		]);
 	});
 
 	it("applies a per-step effort through prepareStep", async () => {
@@ -156,6 +298,29 @@ describe("builder model configuration", () => {
 			{ ...base, reasoningEffort: "high" },
 			{ ...base, reasoningEffort: "medium" },
 		]);
+	});
+
+	it("sends a comparison model id when one is chosen", async () => {
+		const bodies: Array<Record<string, unknown>> = [];
+		const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+			bodies.push(JSON.parse(String(init?.body)));
+			return completedResponse();
+		};
+		const { generateText } = await import("ai");
+
+		await generateText({ model: createBuilderModel(env, { fetch }), prompt: "hi" });
+		await generateText({
+			model: createBuilderModel(env, { fetch, modelId: "openai/gpt-6-luna" }),
+			prompt: "hi",
+		});
+
+		expect(bodies.map((body) => body.model)).toEqual([BUILDER_MODEL_ID, "openai/gpt-6-luna"]);
+		expect(
+			builderModelChoices({
+				BUILDER_MODEL_CHOICES: " openai/gpt-6-luna, ,anthropic/claude-haiku-5-5 ",
+			}),
+		).toEqual(["openai/gpt-6-luna", "anthropic/claude-haiku-5-5"]);
+		expect(builderModelChoices({})).toEqual([]);
 	});
 
 	it("reports every model response status and tags gateway requests", async () => {
@@ -338,6 +503,7 @@ describe("build step requests", () => {
 				prepareBuildTurnStep(convergence, messages, toolNames, {
 					initialBuild: true,
 					stepNumber,
+					provider: "openai",
 				}),
 		});
 		await result.consumeStream();

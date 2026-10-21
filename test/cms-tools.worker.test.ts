@@ -1485,6 +1485,11 @@ describe("create_entries_batch drafting", () => {
 				expect(request.maxOutputTokens).toBe(4096);
 				expect(request.providerOptions).toEqual({
 					openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+					anthropic: {
+						thinking: { type: "adaptive" },
+						effort: "low",
+						cacheControl: { type: "ephemeral" },
+					},
 				});
 			}
 		});

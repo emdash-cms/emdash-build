@@ -39,6 +39,8 @@ export interface TurnMetricsRecord {
 	error?: string;
 	stepCapReached: boolean;
 	model: string;
+	/** Model ids the provider reported serving this turn's steps. */
+	servedModels: string[];
 	promptChars: number;
 	toolCount: number;
 	startedAt: number;
@@ -118,6 +120,7 @@ export class TurnMetrics {
 	private readonly tokens = emptyTokens();
 	private readonly subcalls = { calls: 0, tokens: emptyTokens() };
 	private readonly stepTimings: StepTiming[] = [];
+	private readonly servedModels = new Set<string>();
 	private stepTimingsOmitted = 0;
 	private currentStep?: {
 		startedAt: number;
@@ -201,8 +204,10 @@ export class TurnMetrics {
 	onStep(step: {
 		usage: LanguageModelUsage;
 		content?: ReadonlyArray<{ type: string; toolCallId?: string; toolName?: string }>;
+		response?: { modelId?: string };
 	}): void {
 		this.stepCount += 1;
+		if (step.response?.modelId) this.servedModels.add(step.response.modelId);
 		addUsage(this.tokens, step.usage);
 		this.recordStepTiming(step.usage);
 		this.peakInputTokens = Math.max(this.peakInputTokens, step.usage.inputTokens ?? 0);
@@ -354,6 +359,7 @@ export class TurnMetrics {
 			...(this.error ? { error: this.error } : {}),
 			stepCapReached: this.stepCount >= this.init.stepCap && finishReason === "tool-calls",
 			model: this.init.model,
+			servedModels: [...this.servedModels],
 			promptChars: this.promptChars,
 			toolCount: this.toolCount,
 			startedAt: this.startedAt,

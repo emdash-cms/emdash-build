@@ -224,6 +224,69 @@ describe("builder state", () => {
 		expect(result.second).toBeUndefined();
 	});
 
+	it("builds with the first allowed comparison model a local project asks for", async () => {
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000010");
+		const result = await runInDurableObject(agent, async (instance) => {
+			const internals = instance as unknown as {
+				env: Record<string, unknown>;
+				messages: Array<{ id: string; role: string; parts: unknown[] }>;
+				pinBuilderModel(requested: unknown, clientHost: string | undefined): void;
+				builderModelId(): string;
+				createTurnModel(metrics: undefined): { modelId: string };
+			};
+			const productionEnv = internals.env;
+			const modelId = () => internals.builderModelId();
+			const local = "localhost:5173";
+			const seen: string[] = [];
+			internals.pinBuilderModel("anthropic/claude-opus-5.5", local);
+			seen.push(modelId());
+			internals.env = {
+				...productionEnv,
+				BUILDER_MODEL_CHOICES: "anthropic/claude-opus-5.5,openai/gpt-6-luna",
+			};
+			internals.pinBuilderModel("anthropic/claude-haiku-5.5", local);
+			internals.pinBuilderModel("anthropic/claude-opus-5.5", "build.example.com");
+			seen.push(modelId());
+			internals.pinBuilderModel("anthropic/claude-opus-5.5", local);
+			internals.pinBuilderModel("openai/gpt-6-luna", local);
+			seen.push(modelId());
+			// The turn's model is the pinned one, by Anthropic's own name for it.
+			seen.push(internals.createTurnModel(undefined).modelId);
+			internals.env = productionEnv;
+			seen.push(modelId());
+			return seen;
+		});
+
+		expect(result).toEqual([
+			"openai/gpt-5.6-luna",
+			"openai/gpt-5.6-luna",
+			"anthropic/claude-opus-5.5",
+			"claude-opus-5-5",
+			"openai/gpt-5.6-luna",
+		]);
+	});
+
+	it("keeps the default model for a project that already has replies", async () => {
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000011");
+		const result = await runInDurableObject(agent, async (instance) => {
+			const internals = instance as unknown as {
+				env: Record<string, unknown>;
+				messages: Array<{ id: string; role: string; parts: unknown[] }>;
+				pinBuilderModel(requested: unknown, clientHost: string | undefined): void;
+				builderModelId(): string;
+			};
+			internals.env = { ...internals.env, BUILDER_MODEL_CHOICES: "anthropic/claude-opus-5.5" };
+			internals.messages = [
+				{ id: "u1", role: "user", parts: [{ type: "text", text: "Build a site" }] },
+				{ id: "a1", role: "assistant", parts: [{ type: "text", text: "Sure" }] },
+			];
+			internals.pinBuilderModel("anthropic/claude-opus-5.5", "localhost:5173");
+			return internals.builderModelId();
+		});
+
+		expect(result).toBe("openai/gpt-5.6-luna");
+	});
+
 	it("broadcasts whether a chat turn is running, independent of the status line", async () => {
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000007");
 		const result = await runInDurableObject(agent, async (instance) => {

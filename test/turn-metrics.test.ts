@@ -123,6 +123,7 @@ describe("turn metrics", () => {
 			tokens: { input: 2_500, cachedInput: 1_200, output: 350, reasoning: 130 },
 			peakInputTokens: 1_500,
 			stepCapReached: false,
+			servedModels: ["mock-model-id"],
 		});
 		expect(record?.tools.write_file).toMatchObject({ calls: 1, failures: 0 });
 		// A `success: false` result and a thrown error both count as failures.

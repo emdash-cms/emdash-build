@@ -34,6 +34,7 @@
 		"format": "oxfmt"
 	},
 	"dependencies": {
+		"@ai-sdk/anthropic": "^3.0.134",
 		"@ai-sdk/openai": "^3.0.114",
 		"@ai-sdk/react": "3.0.273",
 		"@base-ui/react": "1.8.0",

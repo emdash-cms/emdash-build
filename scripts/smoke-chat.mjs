@@ -64,6 +64,8 @@ async function auditPreview(previewUrl, round, expect, requestSignal, storyMove)
 async function run(env) {
 	const baseUrl = new URL(env.EMDASH_SMOKE_URL ?? "http://localhost:5173");
 	const requireQuestionnaire = env.EMDASH_SMOKE_REQUIRE_QUESTIONNAIRE === "1";
+	// Honoured only by a dev server whose BUILDER_MODEL_CHOICES lists it.
+	const builderModel = env.EMDASH_SMOKE_MODEL || undefined;
 	const browserAuditEnabled = env.EMDASH_SMOKE_BROWSER === "1";
 	const timeoutMs = Number(env.EMDASH_SMOKE_TIMEOUT_MS ?? 12 * 60 * 1000);
 	// Node fires timers above 2^31-1 ms (or Infinity) almost immediately.
@@ -87,6 +89,7 @@ async function run(env) {
 		return await chat({
 			baseUrl,
 			brief,
+			builderModel,
 			requireQuestionnaire,
 			browserAuditEnabled,
 			stop,
@@ -101,6 +104,7 @@ async function run(env) {
 async function chat({
 	baseUrl,
 	brief,
+	builderModel,
 	requireQuestionnaire,
 	browserAuditEnabled,
 	stop,
@@ -124,14 +128,21 @@ async function chat({
 	socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
 	const socket = new WebSocket(socketUrl, { headers: { Cookie: cookie } });
 
+	const sentChatIds = new Set();
 	function sendChat(id, messages) {
+		sentChatIds.add(id);
 		socket.send(
 			JSON.stringify({
 				type: "cf_agent_use_chat_request",
 				id,
 				init: {
 					method: "POST",
-					body: JSON.stringify({ messages, trigger: "submit-message", appHost: baseUrl.host }),
+					body: JSON.stringify({
+						messages,
+						trigger: "submit-message",
+						appHost: baseUrl.host,
+						...(builderModel ? { builderModel } : {}),
+					}),
 				},
 			}),
 		);
@@ -166,9 +177,25 @@ async function chat({
 			turns: [...turns.values()],
 			totals: summarizeTurns([...turns.values()]),
 		});
-		const finish = (value) => {
+		let resolveIdle;
+		const finish = async (value) => {
 			if (phase === "done") return;
 			phase = "done";
+			// A failed run must not leave its turn building beside the next run.
+			if (
+				value.ok === false &&
+				latestState?.turnActive === true &&
+				socket.readyState === WebSocket.OPEN
+			) {
+				const idle = new Promise((resolve) => {
+					resolveIdle = resolve;
+					setTimeout(resolve, 60_000);
+				});
+				for (const id of sentChatIds) {
+					socket.send(JSON.stringify({ type: "cf_agent_chat_request_cancel", id }));
+				}
+				await idle;
+			}
 			socket.terminate();
 			resolve(report(value));
 		};
@@ -356,6 +383,7 @@ async function chat({
 				answerQuestions(Array.isArray(message.messages) ? message.messages : []);
 				return;
 			}
+			if (message.type === "cf_agent_state" && message.state?.turnActive !== true) resolveIdle?.();
 			if (message.type !== "cf_agent_state" || phase === "done") return;
 			latestState = message.state;
 			const milestones = Object.keys(latestState?.milestones ?? {});
