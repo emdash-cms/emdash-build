@@ -1,0 +1,44 @@
+# How to compare builder models
+
+These scripts run the comparison described in [PLAN.md](PLAN.md). Results go to `.model-comparison/<run>/`, which git ignores. Run every step from the repository root, outside any sandbox. The steps need the network, Docker, and Chrome.
+
+1. Add a valid `AI_GATEWAY_TOKEN` to `.dev.vars`. Add the models to compare as `BUILDER_MODEL_CHOICES`, separated by commas. The dev server lets a project pin only a model in this list.
+2. Check that every model works on the builder's request path.
+
+   ```bash
+   node --import ./scripts/model-comparison/ts-resolve.mjs scripts/model-comparison/probe.mjs
+   ```
+
+   Each line is one check for one model. Start the run only when every model passes the gate in [PLAN.md](PLAN.md#gate-before-the-first-trial). Every check prints `"ok":true`, `reasoning` tokens rise from `effortLow` to `effortHigh`, the tool loops report cached tokens, and `servedModel` matches the model. The probe and the judge import the worker's own model code, which `ts-resolve.mjs` lets plain Node load.
+
+3. Start the dev server with `pnpm dev`.
+4. Run the pilot block, check its trials and screenshots, then run the trials. Rerun the same command to resume after an interruption. The runner skips the trials already recorded in `trials.jsonl`. If it reports excluded trials, add `--rerun-excluded` to rerun their blocks.
+
+   ```bash
+   node scripts/model-comparison/run.mjs --run pilot --briefs bakery --reps 1
+   ```
+
+   ```bash
+   node scripts/model-comparison/run.mjs --run 2026-10-models
+   ```
+
+5. Judge the sites blind with judges that are not candidates.
+
+   ```bash
+   node --import ./scripts/model-comparison/ts-resolve.mjs scripts/model-comparison/judge.mjs --run 2026-10-models --judges anthropic/claude-sonnet-5.5,openai/gpt-6.1-sol
+   ```
+
+6. Optional: score the sites yourself. Open `.model-comparison/2026-10-models/gallery.html`, score every site, and click **Download verdicts**. Then import the file.
+
+   ```bash
+   node scripts/model-comparison/gallery.mjs --run 2026-10-models
+   node scripts/model-comparison/gallery.mjs --run 2026-10-models --import ~/Downloads/human-verdicts.json
+   ```
+
+7. Write the report, `summary.json`, and `trials.csv`.
+
+   ```bash
+   node scripts/model-comparison/analyze.mjs --run 2026-10-models
+   ```
+
+`capture-check.mjs` and `stats-check.mjs` check the screenshot capture and the statistics against known answers. Run them after changing either one.
