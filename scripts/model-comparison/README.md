@@ -41,4 +41,10 @@ These scripts run the comparison described in [PLAN.md](PLAN.md). Results go to 
    node scripts/model-comparison/analyze.mjs --run 2026-10-models
    ```
 
+8. Optional: write a labeled review page, `review.html`, that shows each block's sites side by side with the model, timing, cost, judge scores, and judge notes. It reads `summary.json`, so run it after `analyze.mjs`.
+
+   ```bash
+   node scripts/model-comparison/review.mjs --run 2026-10-models
+   ```
+
 `capture-check.mjs` and `stats-check.mjs` check the screenshot capture and the statistics against known answers. Run them after changing either one.
