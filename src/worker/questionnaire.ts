@@ -3,6 +3,9 @@ import { z } from "zod";
 import {
 	findQuestionnaireResponse,
 	findPendingQuestionnaire,
+	MAX_DETAIL_LENGTH,
+	MAX_OPTION_LENGTH,
+	MAX_QUESTION_LENGTH,
 	type QuestionnaireMessageLike,
 } from "../shared/questionnaire.js";
 
@@ -19,11 +22,16 @@ const DESCRIPTION = [
 export const FIRST_INTERVIEW_TOOL_CHOICE = "auto" as const;
 
 const optionSchema = z.object({
-	label: z.string().trim().min(1).max(80).describe("The choice itself, 2 to 6 words."),
+	label: z
+		.string()
+		.trim()
+		.min(1)
+		.max(MAX_OPTION_LENGTH)
+		.describe("The choice itself, 2 to 6 words."),
 	description: z
 		.string()
 		.trim()
-		.max(160)
+		.max(MAX_DETAIL_LENGTH)
 		.optional()
 		.describe("One sentence on what the site will look, read, or feel like with this choice."),
 	recommended: z.boolean().optional().describe("True on the one option that best fits the brief."),
@@ -35,14 +43,14 @@ const questionSchema = z
 			.string()
 			.trim()
 			.min(1)
-			.max(240)
+			.max(MAX_QUESTION_LENGTH)
 			.describe(
 				"One warm, specific question to the owner about their site, at most two short sentences.",
 			),
 		why: z
 			.string()
 			.trim()
-			.max(160)
+			.max(MAX_DETAIL_LENGTH)
 			.optional()
 			.describe(
 				"One short sentence on what this answer changes in the site. Shown under the question.",

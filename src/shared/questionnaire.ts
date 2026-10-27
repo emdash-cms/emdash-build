@@ -60,9 +60,12 @@ const MAX_QUESTIONS = 5;
 const MAX_OPTIONS = 5;
 const MAX_QUESTION_CANDIDATES = MAX_QUESTIONS * 4;
 const MAX_OPTION_CANDIDATES = MAX_OPTIONS * 4;
-const MAX_QUESTION_LENGTH = 240;
-const MAX_OPTION_LENGTH = 160;
-const MAX_WHY_LENGTH = 160;
+// The ask_questions schema uses the same limits, so a field the form can show
+// never invalidates the whole questionnaire.
+export const MAX_QUESTION_LENGTH = 240;
+export const MAX_OPTION_LENGTH = 160;
+/** An option's description and a question's why. */
+export const MAX_DETAIL_LENGTH = 300;
 const MAX_CUSTOM_LENGTH = 1_000;
 const TERMINAL_TOOL_STATES = new Set(["output-available", "result"]);
 
@@ -81,7 +84,7 @@ function parseOption(value: unknown): QuestionOption | undefined {
 	const label = inlineText(raw.label, MAX_OPTION_LENGTH);
 	if (!label) return undefined;
 	const option: QuestionOption = { label };
-	const description = inlineText(raw.description, MAX_OPTION_LENGTH);
+	const description = inlineText(raw.description, MAX_DETAIL_LENGTH);
 	if (description) option.description = description;
 	if (raw.recommended === true) option.recommended = true;
 	return option;
@@ -131,7 +134,7 @@ export function parseClarifyingQuestions(input: unknown): ClarifyingQuestion[] {
 		if (options.length === 0 && allowCustom === false) continue;
 
 		seenQuestions.add(questionKey);
-		const why = inlineText(raw.why, MAX_WHY_LENGTH);
+		const why = inlineText(raw.why, MAX_DETAIL_LENGTH);
 		parsed.push({
 			question,
 			...(why ? { why } : {}),

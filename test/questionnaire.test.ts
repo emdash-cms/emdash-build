@@ -99,6 +99,27 @@ describe("questionnaire parsing", () => {
 				questions: [{ question: "Which tone?", why: " ", options: [{ label: "Calm" }] }],
 			}).success,
 		).toBe(true);
+		// Nor may a long description: the form shows it whole.
+		const wordy = {
+			question: "How should Crust and Crumb look and feel?",
+			why: "This sets the colours, the type, and the photography on every page of the site.",
+			options: [
+				{
+					label: "Warm editorial",
+					description:
+						"Cream paper and deep rust, a high-contrast serif for headlines with a quiet sans for body text, " +
+						"and close, natural-light photographs of crumb, crust, and flour-dusted hands at the bench.",
+				},
+			],
+		};
+		expect(wordy.options[0]!.description.length).toBeGreaterThan(160);
+		expect(questionTool.inputSchema.safeParse({ questions: [wordy] }).success).toBe(true);
+		expect(parseClarifyingQuestions({ questions: [wordy] })[0]).toEqual({
+			...wordy,
+			options: wordy.options,
+			allow_multiple: undefined,
+			allow_custom: undefined,
+		});
 		expect(
 			questionTool.inputSchema.safeParse({
 				questions: [{ question: "No answer", options: [], allow_custom: false }],
