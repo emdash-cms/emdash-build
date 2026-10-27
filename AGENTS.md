@@ -95,6 +95,8 @@ src/
 3. Builds the system prompt with `buildBuildPrompt({ templateGuidance })` from `prompts/build-blank.md` plus the scaffold-specific section.
 4. Runs `streamText` with the full tool set (sandbox tools + MCP tools).
 
+Provisioning and the build's auto-start run outside any chat turn, so chat recovery does not resume them. A new agent instance (after a deploy or an eviction) resumes them in `onStart` (`resumeInterruptedSetup`) unless the first generation was stopped or failed.
+
 Opening an existing session calls `resumePreview` without waiting for another message. Follow-up messages also call `recoverSite`: it reuses the warm sandbox, or starts a container and `git clone`s the session's Artifacts repo and restarts the dev server if the idle container was stopped. Recovery never re-scaffolds an established project; missing or failed persistence is surfaced to the user instead.
 
 ## Conventions

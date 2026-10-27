@@ -105,10 +105,7 @@ describe("Builder production snapshot preparation", () => {
 			await harness.stopDevServer();
 
 			expect(stopProcess).not.toHaveBeenCalled();
-			expect(exec).toHaveBeenCalledWith(expect.stringContaining("pkill"), {
-				cwd: "/home/user/site",
-				timeout: 5000,
-			});
+			expect(exec).toHaveBeenCalledWith(expect.stringContaining("pkill"), { timeout: 5000 });
 		});
 	});
 
