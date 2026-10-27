@@ -7414,6 +7414,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					return this.errorTurn(friendlyTurnError(recovered.error));
 				}
 			}
+			// ai-chat waits for MCP only before a client's message, not before a turn
+			// that chat recovery runs again. After a restart the saved connection
+			// reconnects in the background, which a warm recovery leaves to it.
+			await unlessAborted(this.mcp.waitForConnections(this.waitForMcpConnections), abortSignal);
+			if (abortSignal?.aborted) {
+				markChatTurnFinished(this);
+				return this.finishNoopChat(options?.requestId);
+			}
 			this.sendStatus("");
 
 			const runawayToolInput = new ToolInputWhitespaceGuard();
