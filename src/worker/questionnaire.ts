@@ -7,16 +7,27 @@ import {
 } from "../shared/questionnaire.js";
 
 const DESCRIPTION = [
-	"Ask the user the smallest useful set of first-turn questions before site generation begins.",
+	"Ask the site owner a short, pick-first creative brief before the first build.",
 	"",
-	"Each question may provide predefined options, allow multiple selections, and/or allow a custom free-text answer.",
+	"Give each question 3 or 4 distinct, concrete options the owner can choose with one click. Each option has a short label and a one-sentence description of what the site will look, read, or feel like with that choice. Mark the option that best fits the brief as recommended. Add a short why that says what the answer changes in the site.",
 	"",
-	"Every predefined option must be a self-contained decision the builder can act on now. For an exact fact, use a custom-only question. Never offer promises to provide information later or ask permission to use placeholders.",
+	"Never ask the owner to type operational facts such as opening hours, addresses, prices, dates, or contact details; the builder never invents them, and the owner adds them once the first draft exists. Ask a custom-only question (no options) only for an exact name the brief does not give.",
 	"",
-	"Call this tool only when the brief leaves at least one material decision unresolved. Include every question you need answered, then end the turn and wait. The site environment continues provisioning in parallel.",
+	"Include every question you need, then end the turn and wait. The site environment continues provisioning in parallel.",
 ].join("\n");
 
 export const FIRST_INTERVIEW_TOOL_CHOICE = "auto" as const;
+
+const optionSchema = z.object({
+	label: z.string().trim().min(1).max(80).describe("The choice itself, 2 to 6 words."),
+	description: z
+		.string()
+		.trim()
+		.max(160)
+		.optional()
+		.describe("One sentence on what the site will look, read, or feel like with this choice."),
+	recommended: z.boolean().optional().describe("True on the one option that best fits the brief."),
+});
 
 const questionSchema = z
 	.object({
@@ -25,12 +36,24 @@ const questionSchema = z
 			.trim()
 			.min(1)
 			.max(240)
-			.describe("One concise, user-facing question about a material decision."),
+			.describe(
+				"One warm, specific question to the owner about their site, at most two short sentences.",
+			),
+		why: z
+			.string()
+			.trim()
+			.max(160)
+			.optional()
+			.describe(
+				"One short sentence on what this answer changes in the site. Shown under the question.",
+			),
 		options: z
-			.array(z.string().trim().min(1).max(160))
+			.array(optionSchema)
 			.max(5)
 			.optional()
-			.describe("Short actionable choices. Omit for an exact free-text fact."),
+			.describe(
+				"3 or 4 distinct, concrete choices drawn from the brief. Omit only for an exact name.",
+			),
 		allow_multiple: z
 			.boolean()
 			.optional()
@@ -50,7 +73,7 @@ export function createAskQuestionsTool(): Tool {
 	return tool({
 		description: DESCRIPTION,
 		inputSchema: z.object({
-			questions: z.array(questionSchema).min(1).max(4),
+			questions: z.array(questionSchema).min(1).max(5),
 		}),
 		execute: async ({ questions }) => ({ ok: true, questions }),
 	});

@@ -20,13 +20,18 @@ import {
 const questions: ClarifyingQuestion[] = [
 	{
 		question: "Which pages matter most?",
-		options: ["Home", "About", "Journal"],
+		why: "Decides which pages the first build includes.",
+		options: [
+			{ label: "Home", description: "A single page that tells the whole story." },
+			{ label: "About" },
+			{ label: "Journal", description: "Dated posts you can add from the CMS." },
+		],
 		allow_multiple: true,
 		allow_custom: true,
 	},
 	{
 		question: "Which tone fits best?",
-		options: ["Editorial", "Playful"],
+		options: [{ label: "Editorial", recommended: true }, { label: "Playful" }],
 		allow_custom: true,
 	},
 ];
@@ -66,10 +71,34 @@ describe("questionnaire parsing", () => {
 			questionTool.inputSchema.safeParse({
 				questions: Array.from({ length: 5 }, (_, index) => ({
 					question: `Question ${index}`,
-					options: ["One"],
+					options: [{ label: "One" }],
+				})),
+			}).success,
+		).toBe(true);
+		expect(
+			questionTool.inputSchema.safeParse({
+				questions: Array.from({ length: 6 }, (_, index) => ({
+					question: `Question ${index}`,
+					options: [{ label: "One" }],
 				})),
 			}).success,
 		).toBe(false);
+		expect(
+			questionTool.inputSchema.safeParse({
+				questions: [{ question: "Which tone?", options: [{ description: "No label" }] }],
+			}).success,
+		).toBe(false);
+		expect(
+			questionTool.inputSchema.safeParse({
+				questions: [{ question: "Which tone?", options: ["Plain string"] }],
+			}).success,
+		).toBe(false);
+		// An empty why must not throw away the whole questionnaire.
+		expect(
+			questionTool.inputSchema.safeParse({
+				questions: [{ question: "Which tone?", why: " ", options: [{ label: "Calm" }] }],
+			}).success,
+		).toBe(true);
 		expect(
 			questionTool.inputSchema.safeParse({
 				questions: [{ question: "No answer", options: [], allow_custom: false }],
@@ -96,7 +125,13 @@ describe("questionnaire parsing", () => {
 		expect(parsed).toEqual([
 			{
 				question: "Which pages?",
-				options: ["Home", "About", "Journal", "Shop", "Contact"],
+				options: [
+					{ label: "Home" },
+					{ label: "About" },
+					{ label: "Journal" },
+					{ label: "Shop" },
+					{ label: "Contact" },
+				],
 				allow_multiple: true,
 				allow_custom: undefined,
 			},
@@ -108,16 +143,72 @@ describe("questionnaire parsing", () => {
 			},
 			{
 				question: "Fifth",
-				options: ["One"],
+				options: [{ label: "One" }],
 				allow_multiple: undefined,
 				allow_custom: undefined,
 			},
 			{
 				question: "Sixth",
-				options: ["One"],
+				options: [{ label: "One" }],
 				allow_multiple: undefined,
 				allow_custom: undefined,
 			},
+		]);
+	});
+
+	it("reads legacy string options as labels", () => {
+		expect(
+			parseClarifyingQuestions({
+				questions: [{ question: "Which tone?", options: [" Editorial ", "Playful"] }],
+			})[0]?.options,
+		).toEqual([{ label: "Editorial" }, { label: "Playful" }]);
+	});
+
+	it("keeps option descriptions, the first recommendation, and a trimmed why", () => {
+		const [question] = parseClarifyingQuestions({
+			questions: [
+				{
+					question: "Which tone?",
+					why: "  Sets   the voice of every page.  ",
+					options: [
+						{ label: " Editorial ", description: " Serif   headlines. ", recommended: true },
+						{ label: "editorial", description: "Duplicate label" },
+						{ label: "Playful", description: " ", recommended: true },
+						{ label: " ", description: "No label" },
+						{ description: "Missing label" },
+						{ label: "Calm", recommended: false },
+					],
+				},
+			],
+		});
+		expect(question).toEqual({
+			question: "Which tone?",
+			why: "Sets the voice of every page.",
+			options: [
+				{ label: "Editorial", description: "Serif headlines.", recommended: true },
+				{ label: "Playful" },
+				{ label: "Calm" },
+			],
+		});
+		expect(Object.keys(question!.options![1]!)).toEqual(["label"]);
+		expect(
+			parseClarifyingQuestions({ questions: [{ question: "Which tone?", why: " " }] })[0],
+		).not.toHaveProperty("why");
+	});
+
+	it("accepts five questions and drops a sixth", () => {
+		const parsed = parseClarifyingQuestions({
+			questions: Array.from({ length: 6 }, (_, index) => ({
+				question: `Question ${index + 1}`,
+				options: [{ label: "One" }],
+			})),
+		});
+		expect(parsed.map(({ question }) => question)).toEqual([
+			"Question 1",
+			"Question 2",
+			"Question 3",
+			"Question 4",
+			"Question 5",
 		]);
 	});
 
@@ -169,6 +260,25 @@ describe("structured questionnaire submissions", () => {
 		const answer = submission();
 		const history = JSON.parse(JSON.stringify([questionnaireMessage(), answer]));
 		expect(readQuestionnaireSubmission(history, 1)).toEqual(answer.metadata.questionnaire);
+	});
+
+	it("reads an answer to an older questionnaire with long plain-string options", () => {
+		const long =
+			"A warm, editorial homepage that leads with the bakery's story, then the seasonal menu";
+		const input = { questions: [{ question: "Which direction?", options: [long, "Playful"] }] };
+		const asked = {
+			...questionnaireMessage(),
+			parts: [{ ...questionnaireMessage().parts![0]!, input }],
+		};
+		const answers = createQuestionAnswers(parseClarifyingQuestions(input));
+		answers[0]!.selected = [long];
+		const answer = {
+			id: "answer",
+			role: "user",
+			metadata: { questionnaire: { toolCallId: "questionnaire-1", answers } },
+			parts: [{ type: "text", text: formatQuestionnaireResponse(answers) }],
+		};
+		expect(readQuestionnaireSubmission([asked, answer], 1)?.answers).toEqual(answers);
 	});
 
 	it("recognizes explicit skips without inventing selected answers", () => {

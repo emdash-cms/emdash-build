@@ -3,7 +3,7 @@ import { ArrowRight } from "@phosphor-icons/react/ArrowRight";
 import { Check } from "@phosphor-icons/react/Check";
 import { Question } from "@phosphor-icons/react/Question";
 import { X } from "@phosphor-icons/react/X";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
 	createQuestionAnswers,
 	setQuestionCustomAnswer,
@@ -37,6 +37,7 @@ export function ClarifyingQuestions({
 	const [phase, setPhase] = useState<"initial" | "idle" | "exit" | "enter">("initial");
 	const pendingQuestionRef = useRef<number | null>(null);
 	const legendRef = useRef<HTMLLegendElement>(null);
+	const idPrefix = useId();
 
 	useEffect(() => {
 		setAnswers(createQuestionAnswers(questions));
@@ -57,6 +58,7 @@ export function ClarifyingQuestions({
 	const answer = answers[current];
 	if (!question || !answer || total === 0) return null;
 
+	const whyId = `${idPrefix}-why-${current}`;
 	const isLast = current === total - 1;
 	const isAnswered = answer.selected.length > 0 || answer.custom.trim().length > 0;
 	const unavailable = disabled || submitting || !open;
@@ -159,6 +161,7 @@ export function ClarifyingQuestions({
 							key={current}
 							onAnimationEnd={onQuestionAnimationEnd}
 							className={`questionnaire-question ${questionAnimation} m-0 flex min-w-0 flex-col border-0 p-0`}
+							aria-describedby={question.why ? whyId : undefined}
 						>
 							<legend
 								ref={legendRef}
@@ -167,27 +170,44 @@ export function ClarifyingQuestions({
 							>
 								{question.question}
 							</legend>
+							{question.why ? (
+								<p
+									id={whyId}
+									className="mt-1 text-xs leading-4 break-words text-text-tertiary [overflow-wrap:anywhere]"
+								>
+									{question.why}
+								</p>
+							) : null}
 
 							<div className="mt-2 flex flex-col gap-2">
 								{question.options && question.options.length > 0 ? (
 									<div className="flex flex-col gap-1">
-										{question.options.map((option) => {
-											const checked = answer.selected.includes(option);
+										{question.options.map((option, optionIndex) => {
+											const checked = answer.selected.includes(option.label);
 											const inputType = question.allow_multiple ? "checkbox" : "radio";
+											const optionId = `${idPrefix}-option-${current}-${optionIndex}`;
+											const describedBy = [
+												option.recommended ? `${optionId}-recommended` : "",
+												option.description ? `${optionId}-description` : "",
+											]
+												.filter(Boolean)
+												.join(" ");
 											return (
 												<label
-													key={option}
+													key={option.label}
 													className={`flex min-h-10 cursor-pointer items-start gap-2.5 rounded-lg px-2 py-2 text-sm leading-5 transition-colors ${checked ? "bg-surface-sunken text-text-primary" : "text-text-secondary hover:bg-surface-sunken"}`}
 												>
 													<input
 														type={inputType}
 														name={`questionnaire-${toolCallId}-${current}`}
-														value={option}
+														value={option.label}
 														checked={checked}
 														disabled={unavailable}
+														aria-labelledby={`${optionId}-label`}
+														aria-describedby={describedBy || undefined}
 														onChange={() =>
 															setAnswers((value) =>
-																toggleQuestionOption(value, questions, current, option),
+																toggleQuestionOption(value, questions, current, option.label),
 															)
 														}
 														className="peer sr-only"
@@ -208,8 +228,26 @@ export function ClarifyingQuestions({
 															/>
 														)}
 													</span>
-													<span className="min-w-0 break-words [overflow-wrap:anywhere]">
-														{option}
+													<span className="flex min-w-0 flex-col break-words [overflow-wrap:anywhere]">
+														<span>
+															<span id={`${optionId}-label`}>{option.label}</span>
+															{option.recommended ? (
+																<span
+																	id={`${optionId}-recommended`}
+																	className="ms-1.5 inline-block rounded-full bg-accent-light px-1.5 align-[1px] text-[11px] leading-4 font-medium text-accent-text"
+																>
+																	Recommended
+																</span>
+															) : null}
+														</span>
+														{option.description ? (
+															<span
+																id={`${optionId}-description`}
+																className="mt-0.5 text-xs leading-4 text-text-tertiary"
+															>
+																{option.description}
+															</span>
+														) : null}
 													</span>
 												</label>
 											);
