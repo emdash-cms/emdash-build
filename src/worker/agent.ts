@@ -3602,7 +3602,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const exposed = await this.exposePreview(hostname);
 			const tunnelChanged =
 				this.usesQuickTunnelPreview() && previousUrl !== undefined && previousUrl !== exposed.url;
-			if (workerEntryChanged || tunnelChanged) {
+			const restarted = workerEntryChanged || tunnelChanged;
+			if (restarted) {
 				this.sendConsole(
 					workerEntryChanged
 						? "Applying the current protected preview runtime..."
@@ -3612,7 +3613,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				await this.startDevServer(exposed.url);
 			}
 			await this.refreshPreviewCache("/", true);
-			if (this.recoveryReconnectMcp) {
+			const reconnectRequested = this.recoveryReconnectMcp;
+			if (reconnectRequested) {
 				const token = this.getApiToken();
 				if (token && !(await this.connectMcp(exposed.url, token))) {
 					return { ready: false, error: "The CMS connection did not recover.", untouched: true };
@@ -3627,6 +3629,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			this.markMilestone("previewReady");
 			this.broadcast(JSON.stringify({ type: "reload" }));
+			if (restarted && !reconnectRequested) {
+				// After a builder restart the saved connection reconnects in the background,
+				// which can fail while the server is down, and a new tunnel moves the server.
+				// As after a restore, the preview is back first and a failed reconnect leaves it so.
+				const token = this.getApiToken();
+				if (token) await this.connectMcp(exposed.url, token);
+			}
 			return { ready: true, previewUrl: exposed.url };
 		}
 
@@ -7407,7 +7416,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			// ai-chat waits for MCP only before a client's message, not before a turn
 			// that chat recovery runs again. After a restart the saved connection
-			// reconnects in the background, which a warm recovery leaves to it.
+			// reconnects in the background, which a recovery that keeps the dev server
+			// leaves to it.
 			await unlessAborted(this.mcp.waitForConnections(this.waitForMcpConnections), abortSignal);
 			if (abortSignal?.aborted) {
 				markChatTurnFinished(this);
