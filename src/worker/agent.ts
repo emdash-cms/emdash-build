@@ -3506,19 +3506,23 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?.throwIfAborted();
 		this.sendStatus("Connecting to CMS...");
 		const mcpUrl = `${exposedUrl}_emdash/api/mcp`;
+		// An attempt can wait out the client's own timeouts, so retrying stops after half
+		// a minute as well as after ten attempts.
+		const retryUntil = Date.now() + 30_000;
 
-		const existingServers = this.getMcpServers();
-		for (const [id] of Object.entries(existingServers.servers)) {
-			signal?.throwIfAborted();
-			try {
-				await this.removeMcpServer(id);
-			} catch {
-				// ignore
-			}
-		}
 		try {
 			await this.retry(
-				() => {
+				async () => {
+					// Each attempt starts clean: addMcpServer would otherwise return the server a
+					// failed attempt left registered, with no tools, or refuse one that never connected.
+					for (const id of Object.keys(this.getMcpServers().servers)) {
+						signal?.throwIfAborted();
+						try {
+							await this.removeMcpServer(id);
+						} catch {
+							// ignore
+						}
+					}
 					signal?.throwIfAborted();
 					return this.addMcpServer("emdash", mcpUrl, {
 						transport: {
@@ -3527,7 +3531,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						},
 					});
 				},
-				{ maxAttempts: 10, baseDelayMs: 3000, maxDelayMs: 3000 },
+				{
+					maxAttempts: 10,
+					baseDelayMs: 3000,
+					maxDelayMs: 3000,
+					shouldRetry: () => !signal?.aborted && Date.now() < retryUntil,
+				},
 			);
 			signal?.throwIfAborted();
 			this.sendConsole("Connected to EmDash MCP server.");
