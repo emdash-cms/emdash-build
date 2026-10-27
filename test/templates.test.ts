@@ -3,28 +3,18 @@ import { readFile } from "node:fs/promises";
 import { buildBuildPrompt, buildInterviewPrompt } from "../src/worker/prompts.js";
 
 describe("builder template prototype", () => {
-	it("uses a domain-neutral interview for the blank scaffold", () => {
+	it("asks a pick-first creative brief for the blank scaffold", () => {
 		const prompt = buildInterviewPrompt();
-		expect(prompt).toContain("content model or site direction");
-		expect(prompt).toContain("ask_questions");
-		expect(prompt).toContain("Call `ask_questions` at most once");
-		expect(prompt).toContain("do not call the questionnaire");
-		expect(prompt).not.toContain("do not call `ask_questions`");
-		expect(prompt).toContain("provisioning continues in parallel");
-		expect(prompt).toContain(
-			"what the organisation, person, product, or publication actually does",
-		);
-		expect(prompt).toContain("Every predefined choice must be an answer");
-		expect(prompt).toContain("Aim for three or four useful questions");
-		expect(prompt).toContain("identity or positioning");
-		expect(prompt).toContain("Choose the answer control intentionally");
-		expect(prompt).toContain("Do not use `allow_multiple` for a question asking what is primary");
-		expect(prompt.replace(/\s+/g, " ")).toContain("Set `allow_custom: false` only when");
-		expect(prompt).toContain("Use a custom-only response");
-		expect(prompt).not.toContain("Whether placeholder content is acceptable");
-		expect(prompt).not.toContain("clearly marked editable placeholder");
-		expect(prompt).not.toContain("Do not call any tools right now");
+		expect(prompt).toContain("blank, fully customisable EmDash scaffold");
+		expect(prompt).toContain("Call `ask_questions` once");
+		expect(prompt).toContain("Setup continues in parallel");
+		expect(prompt).toContain("The owner can answer it with one click");
+		expect(prompt).toContain("Mark the one option that best fits the brief as `recommended`");
+		expect(prompt).toContain("Add a `why`");
+		expect(prompt).toContain("Do not ask for them even when the brief mentions them");
+		expect(prompt).toContain("Permission to use stock photos, sample content, or placeholders");
 		expect(prompt).not.toContain("Always call `ask_questions`");
+		expect(prompt).not.toContain("Do not call any tools right now");
 		expect(prompt).not.toContain("Pricing: tiers and prices");
 	});
 

@@ -3,9 +3,16 @@ export const ASK_QUESTIONS_TOOL_NAME = "ask_questions";
 export const QUESTIONNAIRE_DEFAULTS_MESSAGE =
 	"I skipped the clarifying questions. Use your recommended defaults and start building.";
 
+export interface QuestionOption {
+	label: string;
+	description?: string;
+	recommended?: boolean;
+}
+
 export interface ClarifyingQuestion {
 	question: string;
-	options?: string[];
+	why?: string;
+	options?: QuestionOption[];
 	allow_multiple?: boolean;
 	allow_custom?: boolean;
 }
@@ -49,17 +56,39 @@ export interface QuestionnaireSubmission {
 	answers: QuestionAnswer[];
 }
 
-const MAX_QUESTIONS = 4;
+const MAX_QUESTIONS = 5;
 const MAX_OPTIONS = 5;
 const MAX_QUESTION_CANDIDATES = MAX_QUESTIONS * 4;
 const MAX_OPTION_CANDIDATES = MAX_OPTIONS * 4;
 const MAX_QUESTION_LENGTH = 240;
 const MAX_OPTION_LENGTH = 160;
+const MAX_WHY_LENGTH = 160;
 const MAX_CUSTOM_LENGTH = 1_000;
 const TERMINAL_TOOL_STATES = new Set(["output-available", "result"]);
 
 function inlineText(value: unknown, maxLength: number): string {
 	return typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, maxLength) : "";
+}
+
+/** Sessions persisted before options gained descriptions store plain strings. */
+function parseOption(value: unknown): QuestionOption | undefined {
+	if (typeof value === "string") {
+		const label = inlineText(value, MAX_OPTION_LENGTH);
+		return label ? { label } : undefined;
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	const label = inlineText(raw.label, MAX_OPTION_LENGTH);
+	if (!label) return undefined;
+	const option: QuestionOption = { label };
+	const description = inlineText(raw.description, MAX_OPTION_LENGTH);
+	if (description) option.description = description;
+	if (raw.recommended === true) option.recommended = true;
+	return option;
+}
+
+function hasQuestionOption(question: ClarifyingQuestion, label: string): boolean {
+	return question.options?.some((option) => option.label === label) ?? false;
 }
 
 function questionInput(value: unknown): unknown[] {
@@ -79,13 +108,18 @@ export function parseClarifyingQuestions(input: unknown): ClarifyingQuestion[] {
 		const questionKey = question.toLowerCase();
 		if (!question || seenQuestions.has(questionKey)) continue;
 
-		const options: string[] = [];
+		const options: QuestionOption[] = [];
 		const seenOptions = new Set<string>();
+		let hasRecommended = false;
 		if (Array.isArray(raw.options)) {
 			for (const value of raw.options.slice(0, MAX_OPTION_CANDIDATES)) {
-				const option = inlineText(value, MAX_OPTION_LENGTH);
-				const optionKey = option.toLowerCase();
-				if (!option || seenOptions.has(optionKey)) continue;
+				const option = parseOption(value);
+				const optionKey = option?.label.toLowerCase();
+				if (!option || !optionKey || seenOptions.has(optionKey)) continue;
+				if (option.recommended) {
+					if (hasRecommended) delete option.recommended;
+					hasRecommended = true;
+				}
 				seenOptions.add(optionKey);
 				options.push(option);
 				if (options.length === MAX_OPTIONS) break;
@@ -97,8 +131,10 @@ export function parseClarifyingQuestions(input: unknown): ClarifyingQuestion[] {
 		if (options.length === 0 && allowCustom === false) continue;
 
 		seenQuestions.add(questionKey);
+		const why = inlineText(raw.why, MAX_WHY_LENGTH);
 		parsed.push({
 			question,
+			...(why ? { why } : {}),
 			options: options.length > 0 ? options : undefined,
 			allow_multiple: allowMultiple,
 			allow_custom: allowCustom,
@@ -180,7 +216,7 @@ export function toggleQuestionOption(
 ): QuestionAnswer[] {
 	const current = answers[questionIndex];
 	const question = questions[questionIndex];
-	if (!current || !question?.options?.includes(option)) return [...answers];
+	if (!current || !question || !hasQuestionOption(question, option)) return [...answers];
 
 	const next = answers.map((answer) => ({ ...answer, selected: [...answer.selected] }));
 	if (current.selected.includes(option)) {
@@ -257,7 +293,7 @@ export function readQuestionnaireSubmission(
 		if (new Set(answer.selected).size !== answer.selected.length) return;
 		if (
 			answer.selected.some(
-				(value) => typeof value !== "string" || !question.options?.includes(value),
+				(value) => typeof value !== "string" || !hasQuestionOption(question, value),
 			)
 		)
 			return;

@@ -55,4 +55,10 @@ These scripts run the comparison described in [PLAN.md](PLAN.md). Results go to 
 
 With four or more arms, pass `--wait-idle` to `run.mjs`. Each block then starts only after the app has stopped the earlier blocks' sandboxes, which otherwise linger for 10 minutes and can exhaust Colima's memory. `oom-check.mjs --run <name>` lists trials in which a sandbox command was killed for memory. Rerun those blocks with `--rerun-block`. A model that the gateway's unified API does not list yet can still run through its OpenAI endpoint with `AI_GATEWAY_OPENAI_ROUTE=provider` in `.dev.vars`.
 
+`interview-eval.mjs` runs only the first-turn interview on eight briefs and scores the questions each model asks: how many can be answered by picking an option, and how many ask the owner to type a fact such as opening hours. It needs no dev server. Run it before and after changing the interview prompt or the `ask_questions` tool, and add `--from <run>/results.json` to rescore a saved run.
+
+```bash
+node --import ./scripts/model-comparison/ts-resolve.mjs scripts/model-comparison/interview-eval.mjs --out .model-comparison/interview/<name>
+```
+
 `capture-check.mjs` and `stats-check.mjs` check the screenshot capture and the statistics against known answers. Run them after changing either one.

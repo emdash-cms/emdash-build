@@ -17,6 +17,14 @@ registerHooks({
 		return nextResolve(specifier, context);
 	},
 	load(url, context, nextLoad) {
+		if (url.startsWith("file:") && url.endsWith("?raw")) {
+			const text = readFileSync(fileURLToPath(url.slice(0, -"?raw".length)), "utf8");
+			return {
+				format: "module",
+				source: `export default ${JSON.stringify(text)};`,
+				shortCircuit: true,
+			};
+		}
 		if (!url.startsWith("file:") || !url.endsWith(".ts")) return nextLoad(url, context);
 		const { outputText } = ts.transpileModule(readFileSync(fileURLToPath(url), "utf8"), {
 			compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
