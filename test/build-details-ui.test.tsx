@@ -1989,6 +1989,49 @@ describe("build details handoff", () => {
 		expect(setupAnswerSummaryForDetails(messages, question.id)).toBeUndefined();
 	});
 
+	it("summarises answers by the first one beyond the name when no question names the visuals", () => {
+		const question = {
+			id: "assistant-question",
+			role: "assistant",
+			parts: [
+				{
+					type: "tool-ask_questions",
+					toolCallId: "ask-1",
+					state: "output-available",
+					input: {
+						questions: [
+							{ question: "What's the name of your dog grooming business?" },
+							{
+								question: "What's the heart of Pawfect Grooming?",
+								options: [{ label: "Gentle, reassuring care" }],
+							},
+							{
+								question: "What should your site feel like?",
+								options: [{ label: "Warm and calming" }],
+							},
+						],
+					},
+				},
+			],
+		};
+		const answer = {
+			id: "user-answer",
+			role: "user",
+			parts: [
+				{
+					type: "text",
+					text: "Here are my answers:\n\nQ: What's the name of your dog grooming business?\nA: Pawfect Grooming\n\nQ: What's the heart of Pawfect Grooming?\nA: Gentle, reassuring care\n\nQ: What should your site feel like?\nA: Warm and calming",
+				},
+			],
+		};
+		const response = { id: "assistant-build", role: "assistant", parts: [] };
+		const messages = chat([firstMessage, question, answer, response]).messages;
+		expect(setupAnswerSummaryForDetails(messages, response.id)).toEqual({
+			question: "What's the heart of Pawfect Grooming?",
+			answer: "Gentle, reassuring care",
+		});
+	});
+
 	it("uses a successful uploaded image for the card without pretending it is a screenshot", () => {
 		const mediaMessage = {
 			...buildMessage,
