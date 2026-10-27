@@ -70,16 +70,12 @@ async function newProject(id: string) {
 	return agent;
 }
 
-/**
- * Record what a new instance sets up and auto-starts, and what it waits for
- * first, and hold setup until `finish`.
- */
+/** Record what a new instance sets up and auto-starts, and hold setup until `finish`. */
 function recordResumes(instance: BuilderAgent) {
 	const harness = instance as unknown as SetupHarness;
 	const resumed = {
 		provisions: [] as string[],
 		autoStarts: [] as string[][],
-		mcpWaits: [] as unknown[],
 		finish: (_result: ProvisionResult) => {},
 	};
 	harness.provisionSite = (hostname) => {
@@ -92,10 +88,6 @@ function recordResumes(instance: BuilderAgent) {
 		ids.push(...(await update(instance.messages)).map((message) => message.id));
 		return { requestId: "auto-start", status: "completed" };
 	};
-	(instance.mcp as { waitForConnections(options?: unknown): Promise<void> }).waitForConnections =
-		async (options) => {
-			resumed.mcpWaits.push(options);
-		};
 	return resumed;
 }
 
@@ -278,7 +270,7 @@ describe("setup interrupted by a restart", () => {
 		expect(resumed.autoStarts).toEqual([]);
 	});
 
-	it("starts the build of a site that was ready before it, once MCP reconnects", async () => {
+	it("starts the build of a site that was ready before it", async () => {
 		const agent = await newProject("33333333-3333-4333-8333-000000000004");
 		await leaveProject(agent, {
 			siteReady: true,
@@ -286,7 +278,6 @@ describe("setup interrupted by a restart", () => {
 		});
 		const resumed = await restart(agent);
 		expect(resumed.provisions).toEqual([]);
-		expect(resumed.mcpWaits).toEqual([{ timeout: 20_000 }]);
 		expect(resumed.autoStarts).toEqual([["brief"]]);
 	});
 

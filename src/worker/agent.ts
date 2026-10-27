@@ -7693,12 +7693,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		) {
 			return;
 		}
-		void this.saveMessages(async (messages) => {
-			// A message from the builder waits for MCP to reconnect after a restart;
-			// this turn must wait itself.
-			await this.mcp.waitForConnections(this.waitForMcpConnections);
-			return [...messages];
-		}).catch((error: unknown) => console.error("[BuilderAgent] auto-start build failed:", error));
+		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
+			console.error("[BuilderAgent] auto-start build failed:", error),
+		);
 	}
 
 	/**
