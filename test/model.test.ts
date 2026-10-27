@@ -54,8 +54,8 @@ function completedResponse() {
 }
 
 describe("builder model configuration", () => {
-	it("uses Luna without stored response references", () => {
-		expect(BUILDER_MODEL_ID).toBe("openai/gpt-5.6-luna");
+	it("uses Terra without stored response references", () => {
+		expect(BUILDER_MODEL_ID).toBe("openai/gpt-6.1-terra");
 		expect(builderProviderOptions("medium")).toEqual({
 			openai: {
 				forceReasoning: true,
@@ -73,20 +73,20 @@ describe("builder model configuration", () => {
 		});
 	});
 
-	it("spends high effort only where a step shapes the rest of the build", () => {
+	it("runs every phase at low effort", () => {
 		expect(BUILDER_REASONING_EFFORT).toEqual({
-			interview: "medium",
+			interview: "low",
 			holding: "low",
-			plan: "high",
-			build: "medium",
-			followUp: "medium",
+			plan: "low",
+			build: "low",
+			followUp: "low",
 			entryBody: "low",
 		});
-		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 0 })).toBe("high");
-		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 1 })).toBe("medium");
-		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 40 })).toBe("medium");
-		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 0 })).toBe("medium");
-		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 3 })).toBe("medium");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 0 })).toBe("low");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 1 })).toBe("low");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 40 })).toBe("low");
+		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 0 })).toBe("low");
+		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 3 })).toBe("low");
 	});
 
 	it("restricts a step's callable tools through the provider, not the tools sent", () => {
@@ -98,13 +98,13 @@ describe("builder model configuration", () => {
 			}),
 		).toEqual({
 			openai: {
-				reasoningEffort: "medium",
+				reasoningEffort: "low",
 				allowedTools: { toolNames: ["view_preview"], mode: "required" },
 				parallelToolCalls: false,
 			},
 		});
 		expect(buildStepProviderOptions({ initialBuild: false, stepNumber: 4 })).toEqual({
-			openai: { reasoningEffort: "medium" },
+			openai: { reasoningEffort: "low" },
 		});
 	});
 
@@ -143,7 +143,7 @@ describe("builder model configuration", () => {
 			prompt: "Build",
 			tools: { noop: tool({ inputSchema: z.object({}), execute: async () => ({}) }) },
 			stopWhen: stepCountIs(3),
-			providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.build),
+			providerOptions: builderProviderOptions("high"),
 			prepareStep: ({ stepNumber }) => ({
 				providerOptions: buildStepProviderOptions({ initialBuild: true, stepNumber }),
 			}),
@@ -153,8 +153,8 @@ describe("builder model configuration", () => {
 		// The step's effort replaces the base effort and keeps every other option.
 		const base = { forceReasoning: true, reasoningSummary: "auto", store: false };
 		expect(sent).toEqual([
-			{ ...base, reasoningEffort: "high" },
-			{ ...base, reasoningEffort: "medium" },
+			{ ...base, reasoningEffort: "low" },
+			{ ...base, reasoningEffort: "low" },
 		]);
 	});
 
@@ -351,9 +351,9 @@ describe("build step requests", () => {
 			"session-1",
 		]);
 		expect(bodies.map((body) => (body.reasoning as { effort?: string }).effort)).toEqual([
-			"high",
-			"medium",
-			"medium",
+			"low",
+			"low",
+			"low",
 		]);
 		expect(bodies[0]?.tool_choice).toBe("auto");
 		// Validation passed: the final preview is required, one call at a time.

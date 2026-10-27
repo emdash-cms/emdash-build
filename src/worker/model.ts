@@ -2,26 +2,26 @@ import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/opena
 import type { ModelMessage } from "ai";
 import { prepareBuildStep, type BuildConvergence } from "./build-convergence.js";
 
-export const BUILDER_MODEL_ID = "openai/gpt-5.6-luna";
+export const BUILDER_MODEL_ID = "openai/gpt-6.1-terra";
 
 export type BuilderReasoningEffort = "low" | "medium" | "high";
 
 /**
- * Reasoning effort by phase. At high effort Luna thinks for several seconds
- * before every step's first answer token, and a build runs dozens of steps in
- * sequence, so high effort is spent only where one step's decisions shape the
- * rest of the turn.
+ * Reasoning effort by phase. Terra at low effort on every step built first
+ * sites in less than half the time of Luna's per-phase efforts, with no
+ * measurable difference in design score, so every phase runs low. Each phase
+ * keeps its own setting so one can be raised alone.
  */
 export const BUILDER_REASONING_EFFORT = {
 	/** Choosing questions that change the content model; the user waits on them. */
-	interview: "medium",
+	interview: "low",
 	/** A one-sentence acknowledgement while setup continues. */
 	holding: "low",
 	/** The first step of a first build plans the content model, design and schema. */
-	plan: "high",
+	plan: "low",
 	/** Later first-build steps: authoring, content, and validation fixes. */
-	build: "medium",
-	followUp: "medium",
+	build: "low",
+	followUp: "low",
 	/** Drafting entry bodies inside create_entries_batch. */
 	entryBody: "low",
 } as const satisfies Record<string, BuilderReasoningEffort>;
