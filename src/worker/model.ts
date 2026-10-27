@@ -7,9 +7,9 @@ export const BUILDER_MODEL_ID = "openai/gpt-6.1-terra";
 export type BuilderReasoningEffort = "low" | "medium" | "high";
 
 /**
- * Reasoning effort by phase. Terra at low effort on every step built first
- * sites in less than half the time of Luna's per-phase efforts, with no
- * measurable difference in design score, so every phase runs low. Each phase
+ * Reasoning effort by phase. In a local benchmark, Terra at low effort on every
+ * step built first sites in less than half the time GPT-6 Luna took at higher
+ * per-phase efforts; the design-score comparison was inconclusive. Each phase
  * keeps its own setting so one can be raised alone.
  */
 export const BUILDER_REASONING_EFFORT = {
