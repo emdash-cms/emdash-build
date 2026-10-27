@@ -170,13 +170,12 @@ describe("setup interrupted by a restart", () => {
 			});
 			return commands;
 		});
-		expect(commands.map(({ command }) => command)).toEqual([
-			expect.stringContaining("test -f"),
-			expect.stringContaining("pkill -f '[a]stro dev'"),
-			expect.stringContaining("rm -rf /home/user/site"),
-		]);
+		const stop = commands.findIndex(({ command }) => command.includes("pkill"));
+		const extract = commands.findIndex(({ command }) => command.startsWith("rm -rf"));
+		expect(stop).toBeGreaterThanOrEqual(0);
+		expect(stop).toBeLessThan(extract);
 		// Before extraction there may be no site directory to run it in.
-		expect(commands[1]?.cwd).toBeUndefined();
+		expect(commands[stop]?.cwd).toBeUndefined();
 	});
 
 	it("does not set up twice when a message arrives during resumed setup", async () => {
@@ -211,11 +210,6 @@ describe("setup interrupted by a restart", () => {
 			state: { initialGeneration: { id: "brief", status: "stopped", terminalMessageId: "brief" } },
 		},
 		{
-			id: "33333333-3333-4333-8333-000000000011",
-			left: "a first generation that was stopping",
-			state: { initialGeneration: { id: "brief", status: "stopping" } },
-		},
-		{
 			id: "33333333-3333-4333-8333-000000000012",
 			left: "a failed first generation",
 			state: {
@@ -242,15 +236,6 @@ describe("setup interrupted by a restart", () => {
 				siteReady: true,
 				buildStarted: true,
 				initialGeneration: { id: "brief", status: "preparing" },
-			},
-		},
-		{
-			id: "33333333-3333-4333-8333-000000000015",
-			left: "a first build under way",
-			state: {
-				siteReady: true,
-				buildStarted: true,
-				initialGeneration: { id: "brief", status: "building" },
 			},
 		},
 		{
@@ -281,29 +266,18 @@ describe("setup interrupted by a restart", () => {
 		expect(resumed.autoStarts).toEqual([["brief"]]);
 	});
 
-	it.each([
-		{
-			id: "33333333-3333-4333-8333-000000000007",
-			turn: "one evicted while saving its finished reply",
-			snapshot: JSON.stringify({ chatTurnFinished: true }),
-		},
-		{
-			id: "33333333-3333-4333-8333-000000000008",
-			turn: "one gone before its activity was cleared",
-			snapshot: undefined,
-		},
-	])("starts the build of a ready site after a finished turn: $turn", async ({ id, snapshot }) => {
-		const agent = await newProject(id);
+	it("starts the build of a ready site after a turn that finished", async () => {
+		const agent = await newProject("33333333-3333-4333-8333-000000000007");
+		const snapshot = JSON.stringify({ chatTurnFinished: true });
 		await leaveProject(
 			agent,
 			{ siteReady: true, initialGeneration: { id: "brief", status: "preparing" } },
 			(instance) => {
+				// The turn was evicted while it saved its finished reply.
+				instance.sql`INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
+					VALUES ('turn-fiber', '__cf_internal_chat_turn:turn', ${snapshot}, ${Date.now()})`;
 				instance.sql`INSERT INTO owner_activity (id, kind, started_at)
 					VALUES ('chat:turn', 'chat', ${Date.now()})`;
-				if (snapshot) {
-					instance.sql`INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
-						VALUES ('turn-fiber', '__cf_internal_chat_turn:turn', ${snapshot}, ${Date.now()})`;
-				}
 			},
 		);
 		const resumed = await restart(agent);

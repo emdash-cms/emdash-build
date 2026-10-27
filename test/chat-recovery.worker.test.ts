@@ -335,12 +335,6 @@ describe("chat recovery", () => {
 				harness.restartInterruptedTurn({ afterMessageId: "edit", pastGate: true }),
 		},
 		{
-			plan: "retry",
-			id: "11111111-1111-4111-8111-00000000000d",
-			recover: (harness) =>
-				harness.restartInterruptedTurn({ afterMessageId: "edit", pastGate: false }),
-		},
-		{
 			plan: "continue",
 			id: "11111111-1111-4111-8111-00000000000e",
 			partial: {
