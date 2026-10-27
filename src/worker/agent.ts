@@ -7676,7 +7676,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 */
 	private resumeInterruptedSetup(): void {
 		const status = this.state.initialGeneration?.status;
-		if (!this.getOwnerRecord() || this.provisionPromise || this.activeProvisionPromise) return;
+		if (!this.getOwnerRecord() || this.provisionPromise) return;
 		if (!this.state.siteReady) {
 			if (status === "preparing" || status === "awaiting_answers") {
 				this.startProvisioning(this.recoveryHostname());
@@ -7685,14 +7685,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		// Ready before the restart, but the build it starts was not under way yet.
 		// An interrupted turn that chat recovery runs again starts it instead.
-		if (
-			status !== "preparing" ||
-			this.buildStarted ||
-			this.state.buildStarted ||
-			this.recoveringTurn
-		) {
-			return;
-		}
+		if (status !== "preparing" || this.state.buildStarted || this.recoveringTurn) return;
 		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
 			console.error("[BuilderAgent] auto-start build failed:", error),
 		);
