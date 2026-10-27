@@ -266,6 +266,30 @@ describe("builder state", () => {
 		]);
 	});
 
+	it("pins the local default model for a new local project that names none", async () => {
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000012");
+		const result = await runInDurableObject(agent, async (instance) => {
+			const internals = instance as unknown as {
+				env: Record<string, unknown>;
+				pinBuilderModel(requested: unknown, clientHost: string | undefined): void;
+				builderModelId(): string;
+			};
+			internals.env = {
+				...internals.env,
+				BUILDER_MODEL_CHOICES: "openai/gpt-6-luna,openai/gpt-6.1-terra:all-low",
+				BUILDER_MODEL_DEFAULT: "openai/gpt-6.1-terra:all-low",
+			};
+			internals.pinBuilderModel(undefined, "build.example.com");
+			const remote = internals.builderModelId();
+			internals.pinBuilderModel(undefined, "localhost:5173");
+			// The first pin stands, so a later request cannot switch the model.
+			internals.pinBuilderModel("openai/gpt-6-luna", "localhost:5173");
+			return [remote, internals.builderModelId()];
+		});
+
+		expect(result).toEqual(["openai/gpt-5.6-luna", "openai/gpt-6.1-terra:all-low"]);
+	});
+
 	it("keeps the default model for a project that already has replies", async () => {
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000011");
 		const result = await runInDurableObject(agent, async (instance) => {

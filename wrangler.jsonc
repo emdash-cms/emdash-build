@@ -151,6 +151,12 @@
 		// Local model comparisons only (scripts/model-comparison): gateway model ids a
 		// project may pin, set in .dev.vars. Empty everywhere else, so builds use the default model.
 		"BUILDER_MODEL_CHOICES": "",
+		// Local only: "provider" sends OpenAI models to the gateway's OpenAI endpoint, which
+		// serves new models before the unified API lists them. Empty everywhere else.
+		"AI_GATEWAY_OPENAI_ROUTE": "",
+		// Local only: the choice from BUILDER_MODEL_CHOICES that a new local project pins when
+		// the client names none, so the app's own UI can try it. Empty everywhere else.
+		"BUILDER_MODEL_DEFAULT": "",
 		// 100 sandboxes of 4 vCPU use about a quarter of the account's default container
 		// limit (1,500 vCPU); model rate limits are the next ceiling.
 		"SANDBOX_MAX_CONCURRENT": "100",

@@ -25,6 +25,24 @@ const LABELS = {
 	"openai/gpt-6-luna": { name: "GPT-6 Luna", color: "#0f766e" },
 	"anthropic/claude-haiku-5.5": { name: "Claude Haiku 5.5", color: "#b45309" },
 	"anthropic/claude-opus-5.5": { name: "Claude Opus 5.5", color: "#6d28d9" },
+	"anthropic/claude-opus-5.5>openai/gpt-6-luna": {
+		name: "Opus designs, Luna builds",
+		color: "#be185d",
+	},
+	"openai/gpt-6.1-sol": { name: "GPT-6.1 Sol", color: "#0369a1" },
+	"anthropic/claude-opus-5.5+anthropic/claude-haiku-5.5": {
+		name: "Opus + Haiku helpers",
+		color: "#6d28d9",
+	},
+	"openai/gpt-6.1-sol+openai/gpt-6-luna": { name: "Sol + Luna helpers", color: "#0369a1" },
+	"anthropic/claude-opus-5.5:fast": { name: "Opus 5.5, fast mode", color: "#be185d" },
+	"anthropic/claude-opus-5.5:low": { name: "Opus 5.5, low effort", color: "#0f766e" },
+	"openai/gpt-6-luna:batched": { name: "GPT-6 Luna, fewer steps", color: "#b45309" },
+	"openai/gpt-6.1-terra:all-low": { name: "GPT-6.1 Terra, low effort", color: "#7c3aed" },
+	"openai/gpt-6.1-terra:all-low:batched": {
+		name: "GPT-6.1 Terra, low effort, fewer steps",
+		color: "#a21caf",
+	},
 };
 const label = (model) => LABELS[model] ?? { name: model, color: "#334155" };
 
@@ -128,6 +146,18 @@ ${row("Judge score, mean (1–10)", (_, d) => (scored(d).length ? score(mean(sco
 </tbody></table>`;
 }
 
+/** A multi-model build's time and cost by model, driver or designer first. */
+function split(row) {
+	const ids = row.model.split(/[>+]/);
+	if (ids.length < 2) return "";
+	const part = (id) => {
+		const ms = row.buildMsByModel?.[id];
+		const cost = row.costLowUsdByModel?.[id] ?? 0;
+		return `${escape(label(id).name)}: ${ms == null ? "helper calls" : `${minutes(ms)} of steps`}, ${money(cost, cost)}`;
+	};
+	return `<p class="judges">${ids.map(part).join(" · ")}</p>`;
+}
+
 function card(row) {
 	const { name, color } = label(row.model);
 	const trial = trials.get(row.trialId);
@@ -154,6 +184,7 @@ ${row.delivered ? "" : `<p class="reason">${escape(failureReason(trial))}</p>`}
 <div><dt>Reasoning</dt><dd>${thousands(row.tokens.reasoning)} tokens</dd></div>
 <div><dt>Judge score</dt><dd class="score">${score(row.scores.overall)}</dd></div>
 </dl>
+${split(row)}
 ${byJudge ? `<p class="judges">${byJudge}</p>` : ""}
 ${
 	judged.length

@@ -15,6 +15,8 @@ export interface TokenTotals {
 export interface StepTiming {
 	/** Reasoning effort requested for the step, when known. */
 	effort?: string;
+	/** The model id the step requested, when it differs from the turn's. */
+	model?: string;
 	/** Model HTTP attempts; above 1, the times below include the SDK's retry backoff. */
 	attempts: number;
 	/** Step start to the successful attempt's response headers: gateway and queueing time. */
@@ -56,8 +58,11 @@ export interface TurnMetricsRecord {
 	/** Sum of the timed steps' `firstOutputMs`: how long the turn waited on the model. */
 	modelWaitMs: number;
 	tokens: TokenTotals;
+	/** Completed steps by the model id each requested; a split build has two. */
+	byModel: Record<string, { steps: number; ms: number; tokens: TokenTotals }>;
 	peakInputTokens: number;
-	subcalls: { calls: number; tokens: TokenTotals };
+	/** Model calls inside tools; `byModel` when a call named its model. */
+	subcalls: { calls: number; tokens: TokenTotals; byModel?: Record<string, TokenTotals> };
 	/** Model HTTP attempts, including ones the SDK retried; status 0 is a network error. */
 	modelHttp: { requests: number; failures: Record<string, number> };
 	/** Calls made by run_cms_script programs, by inner tool; the program itself is in `tools`. */
@@ -99,7 +104,9 @@ function addUsage(totals: TokenTotals, usage: LanguageModelUsage): void {
 }
 
 function errorText(error: unknown): string {
-	const text = error instanceof Error ? error.message : String(error);
+	// Providers can stream a plain error object, such as an overloaded server.
+	const message = (error as { message?: unknown } | null)?.message;
+	const text = typeof message === "string" ? message : String(error);
 	return text.slice(0, MAX_ERROR_CHARS);
 }
 
@@ -118,13 +125,15 @@ export class TurnMetrics {
 	private stepCount = 0;
 	private peakInputTokens = 0;
 	private readonly tokens = emptyTokens();
-	private readonly subcalls = { calls: 0, tokens: emptyTokens() };
+	private readonly byModel: TurnMetricsRecord["byModel"] = Object.create(null);
+	private readonly subcalls: TurnMetricsRecord["subcalls"] = { calls: 0, tokens: emptyTokens() };
 	private readonly stepTimings: StepTiming[] = [];
 	private readonly servedModels = new Set<string>();
 	private stepTimingsOmitted = 0;
 	private currentStep?: {
 		startedAt: number;
 		effort?: string;
+		model?: string;
 		attempts: number;
 		firstByteAt?: number;
 		firstChunkAt?: number;
@@ -167,11 +176,12 @@ export class TurnMetrics {
 	}
 
 	/** A model step is about to call the provider. */
-	stepStarted(step: { effort?: string }): void {
+	stepStarted(step: { effort?: string; model?: string }): void {
 		this.currentStep = {
 			startedAt: this.now(),
 			attempts: 0,
 			...(step.effort ? { effort: step.effort } : {}),
+			...(step.model && step.model !== this.init.model ? { model: step.model } : {}),
 		};
 	}
 
@@ -209,6 +219,14 @@ export class TurnMetrics {
 		this.stepCount += 1;
 		if (step.response?.modelId) this.servedModels.add(step.response.modelId);
 		addUsage(this.tokens, step.usage);
+		const model = (this.byModel[this.currentStep?.model ?? this.init.model] ??= {
+			steps: 0,
+			ms: 0,
+			tokens: emptyTokens(),
+		});
+		model.steps += 1;
+		if (this.currentStep) model.ms += this.now() - this.currentStep.startedAt;
+		addUsage(model.tokens, step.usage);
 		this.recordStepTiming(step.usage);
 		this.peakInputTokens = Math.max(this.peakInputTokens, step.usage.inputTokens ?? 0);
 		// Calls the SDK rejected without running (bad input, unknown or inactive
@@ -252,6 +270,7 @@ export class TurnMetrics {
 		const since = (at: number | undefined) => (at === undefined ? null : at - step.startedAt);
 		this.stepTimings.push({
 			...(step.effort ? { effort: step.effort } : {}),
+			...(step.model ? { model: step.model } : {}),
 			attempts: step.attempts,
 			firstByteMs: since(step.firstByteAt),
 			firstChunkMs: since(step.firstChunkAt),
@@ -274,10 +293,12 @@ export class TurnMetrics {
 		return (this.tools[name] ??= { calls: 0, ms: 0, failures: 0 });
 	}
 
-	/** Model calls made inside a tool, such as batch entry text. */
-	addSubcall(usage: LanguageModelUsage): void {
+	/** Model calls made inside a tool, such as batch entry text or a helper's steps. */
+	addSubcall(usage: LanguageModelUsage, model?: string): void {
 		this.subcalls.calls += 1;
 		addUsage(this.subcalls.tokens, usage);
+		if (model)
+			addUsage(((this.subcalls.byModel ??= Object.create(null))[model] ??= emptyTokens()), usage);
 	}
 
 	/**
@@ -371,8 +392,9 @@ export class TurnMetrics {
 			stepTimingsOmitted: this.stepTimingsOmitted,
 			modelWaitMs: this.stepTimings.reduce((total, step) => total + (step.firstOutputMs ?? 0), 0),
 			tokens: { ...this.tokens },
+			byModel: structuredClone(this.byModel),
 			peakInputTokens: this.peakInputTokens,
-			subcalls: { calls: this.subcalls.calls, tokens: { ...this.subcalls.tokens } },
+			subcalls: structuredClone(this.subcalls),
 			modelHttp: {
 				requests: this.modelHttp.requests,
 				failures: { ...this.modelHttp.failures },

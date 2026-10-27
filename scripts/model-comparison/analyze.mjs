@@ -36,6 +36,21 @@ const PRICES = {
 		longContext: { over: 100_000, input: 0.5, cachedInput: 0.05, cacheWrite: 0.625, output: 2.5 },
 	},
 	"anthropic/claude-opus-5.5": { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 20 },
+	// developers.openai.com/api/docs/models/gpt-6.1-terra, Oct 26, 2026.
+	"openai/gpt-6.1-terra": {
+		input: 1,
+		cachedInput: 0.05,
+		cacheWrite: 1.25,
+		output: 5,
+		longContext: { over: 272_000, input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 7.5 },
+	},
+	"openai/gpt-6.1-sol": {
+		input: 2,
+		cachedInput: 0.1,
+		cacheWrite: 2.5,
+		output: 10,
+		longContext: { over: 272_000, input: 4, cachedInput: 0.2, cacheWrite: 5, output: 15 },
+	},
 };
 
 const design = JSON.parse(readFileSync(join(root, "design.json"), "utf8"));
@@ -105,6 +120,64 @@ function costRange(model, tokens, peakInputTokens) {
 	return { low: at(price, price.input), high: at(long, long.cacheWrite) };
 }
 
+/**
+ * Tokens by the model that spent them. Turns record their steps by model, and
+ * sub-calls (entry bodies, helpers) by model when they name one; otherwise a
+ * sub-call ran on the build model. Older records have one model per trial.
+ */
+const buildModelOf = (choice) => choice.split(":")[0].split("+")[0].split(">").pop();
+
+function tokensByModel(trial) {
+	const build = buildModelOf(trial.model);
+	const byModel = {};
+	const add = (model, tokens) => (byModel[model] = sumTokens(byModel[model], tokens));
+	for (const turn of trial.turns ?? []) {
+		if (!turn.byModel) continue;
+		for (const [model, entry] of Object.entries(turn.byModel)) add(model, entry.tokens);
+		const named = turn.subcalls?.byModel ?? {};
+		for (const [model, tokens] of Object.entries(named)) add(model, tokens);
+		const unnamed = Object.values(named).reduce(
+			(rest, tokens) =>
+				Object.fromEntries(
+					Object.entries(rest).map(([key, value]) => [key, value - (tokens[key] ?? 0)]),
+				),
+			sumTokens(turn.subcalls?.tokens),
+		);
+		if (Object.values(unnamed).some((value) => value > 0)) add(build, unnamed);
+	}
+	if (Object.keys(byModel).length === 0) {
+		add(trial.model, sumTokens(trial.totals?.tokens, trial.totals?.subcallTokens));
+	}
+	return byModel;
+}
+
+function trialCost(trial, peakInputTokens) {
+	// Fast mode bills the build model's requests at twice its standard rates.
+	const fast = trial.model.split(":").slice(1).includes("fast") ? buildModelOf(trial.model) : null;
+	const parts = Object.entries(tokensByModel(trial)).map(([model, tokens]) => {
+		const { low, high } = costRange(model, tokens, peakInputTokens);
+		const rate = model === fast ? 2 : 1;
+		return { model, low: low * rate, high: high * rate };
+	});
+	return {
+		low: parts.reduce((sum, part) => sum + part.low, 0),
+		high: parts.reduce((sum, part) => sum + part.high, 0),
+		byModel: Object.fromEntries(parts.map((part) => [part.model, part.low])),
+	};
+}
+
+/** Minutes each model ran steps for, over the trial's first-build turns. */
+function buildMsByModel(trial) {
+	const byModel = {};
+	for (const turn of trial.turns ?? []) {
+		if (turn.kind !== "initial-build" || !turn.byModel) continue;
+		for (const [model, entry] of Object.entries(turn.byModel)) {
+			byModel[model] = (byModel[model] ?? 0) + entry.ms;
+		}
+	}
+	return byModel;
+}
+
 const rows = trials.map((trial) => {
 	const turns = trial.turns ?? [];
 	const ofKind = (kind) => turns.filter((turn) => turn.kind === kind);
@@ -112,7 +185,7 @@ const rows = trials.map((trial) => {
 	const shots = (trial.shots ?? []).filter((page) => !page.error);
 	const phone = shots.find((page) => page.path === "/" && page.viewport === "mobile");
 	const peakInputTokens = Math.max(0, ...turns.map((turn) => turn.peakInputTokens ?? 0));
-	const cost = costRange(trial.model, tokens, peakInputTokens);
+	const cost = trialCost(trial, peakInputTokens);
 	return {
 		trialId: trial.trialId,
 		block: trial.block,
@@ -137,6 +210,9 @@ const rows = trials.map((trial) => {
 		peakInputTokens,
 		costLowUsd: cost.low,
 		costHighUsd: cost.high,
+		costLowUsdByModel: cost.byModel,
+		delegateCalls: turns.reduce((sum, turn) => sum + (turn.tools?.delegate?.calls ?? 0), 0),
+		buildMsByModel: buildMsByModel(trial),
 		pages: shots.filter((page) => page.viewport === "desktop").length,
 		brokenImages: shots.reduce((sum, page) => sum + (page.brokenImages ?? 0), 0),
 		mobileOverflowPx: phone?.horizontalOverflowPx ?? null,
@@ -326,7 +402,16 @@ const table = (header, body) =>
 		`| ${header.map(() => "---").join(" | ")} |`,
 		...body.map((r) => `| ${r.join(" | ")} |`),
 	].join("\n");
-const short = (model) => model.split("/").pop();
+const short = (model) =>
+	model
+		.split("+")
+		.map((driver) =>
+			driver
+				.split(">")
+				.map((id) => id.split("/").pop())
+				.join(" → "),
+		)
+		.join(" + ");
 
 function pairTable(result, unit, scale) {
 	return table(

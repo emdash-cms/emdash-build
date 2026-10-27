@@ -62,7 +62,13 @@ import {
 	typeDeclarationsForModel,
 	type DeployResult,
 } from "./tools.js";
-import { buildInterviewPrompt, buildHoldingPrompt, buildBuildPrompt } from "./prompts.js";
+import {
+	buildInterviewPrompt,
+	buildHoldingPrompt,
+	buildBuildPrompt,
+	buildHelperPrompt,
+} from "./prompts.js";
+import { createDelegateTool, DELEGATE, driverToolNames } from "./helpers.js";
 import {
 	recordBuilderMilestone,
 	recordPersonalizationMilestone,
@@ -141,10 +147,13 @@ import {
 	builderProvider,
 	builderProviderOptions,
 	createBuilderModel,
+	localDefaultChoice,
+	parseBuilderLineup,
 	prepareBuildTurnStep,
 	requestedReasoningEffort,
 	turnInputMessages,
 } from "./model.js";
+import { DesignHandoff, HAND_OFF_DESIGN, prepareSplitBuildStep } from "./design-handoff.js";
 import {
 	McpToolFailureGuard,
 	ToolInputWhitespaceGuard,
@@ -5586,6 +5595,42 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * Blank sites otherwise need one model step and one Artifacts checkpoint for
 	 * every field; this keeps the same schema authority while checkpointing once.
 	 */
+	/** Ends the designer's part of a split first build; see DesignHandoff. */
+	private buildDesignHandoffTool(handoff: DesignHandoff, signal: AbortSignal) {
+		return {
+			[HAND_OFF_DESIGN]: tool({
+				description:
+					"Finish the design phase: hand this first build to the builder model with the complete " +
+					"written design spec, saved as DESIGN.md. Call once, after the schema and the " +
+					"design-system files exist.",
+				inputSchema: z.object({
+					spec: z.string().min(400).describe("The complete design spec, in markdown."),
+				}),
+				execute: async ({ spec }) => {
+					if (handoff.handedOff)
+						return { success: false, error: "The design was already handed off." };
+					const written = await this.toolSandboxOps(signal).writeFile(
+						`${SITE_PATH}/DESIGN.md`,
+						spec,
+					);
+					if (!written.success) {
+						return {
+							success: false,
+							error: "DESIGN.md could not be written; call hand_off_design again.",
+						};
+					}
+					this.writeSecret("designHandoff", spec);
+					handoff.handOff(spec);
+					return {
+						success: true,
+						file: "DESIGN.md",
+						next: "The builder model continues the build.",
+					};
+				},
+			}),
+		};
+	}
+
 	private buildSchemaPlanTool(convergence: BuildConvergence, metrics?: TurnMetrics) {
 		const getCollection = this.mcpToolMeta("schema_get_collection");
 		const createCollection = this.mcpToolMeta("schema_create_collection");
@@ -6617,7 +6662,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * gets a short result summary out.
 	 */
 	private buildContentBatchTool(convergence: BuildConvergence, metrics?: TurnMetrics) {
-		const genModel = this.createTurnModel(metrics, "entry-body");
+		const lineup = parseBuilderLineup(this.builderModelId());
+		const bodyModelId = lineup.helper ?? lineup.build;
+		const genModel = this.createTurnModel(metrics, "entry-body", bodyModelId);
 		return {
 			create_entries_batch: tool({
 				description: [
@@ -6766,9 +6813,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									maxOutputTokens: ENTRY_BODY_MAX_OUTPUT_TOKENS,
 									providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.entryBody, {
 										reasoningSummary: false,
+										fast: lineup.fast && !lineup.helper,
 									}),
 								});
-								metrics?.addSubcall(usage);
+								metrics?.addSubcall(usage, bodyModelId);
 								// A body cut off at the token limit would publish half an article.
 								if (finishReason === "length") {
 									problem = "body generation was cut off at the length limit";
@@ -6966,9 +7014,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * The builder model, tagged for AI Gateway logs and counted against the turn.
 	 * A `purpose` marks a sub-call, whose attempts are not the current step's.
 	 */
-	private createTurnModel(metrics: TurnMetrics | undefined, purpose?: string) {
+	private createTurnModel(
+		metrics: TurnMetrics | undefined,
+		purpose?: string,
+		modelId = parseBuilderLineup(this.builderModelId()).build,
+	) {
 		return createBuilderModel(this.env, {
-			modelId: this.builderModelId(),
+			modelId,
 			metadata: {
 				session: this.name,
 				// The turn id is the client's chat request id; keep the header value safe.
@@ -6987,17 +7039,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
-	 * Pin the model a local comparison asked for, from a local dev client only.
-	 * A project keeps the first model pinned, and one that already has replies
-	 * keeps the model that wrote them: reasoning one provider returned cannot
-	 * be replayed to another.
+	 * Pin the model a local comparison asked for, or the local default, from a
+	 * local dev client only. A project keeps the first model pinned, and one that
+	 * already has replies keeps the model that wrote them: reasoning one provider
+	 * returned cannot be replayed to another.
 	 */
 	private pinBuilderModel(requested: unknown, clientHost: string | undefined): void {
-		if (typeof requested !== "string" || !clientHost || !isLocalHostname(clientHost)) return;
-		if (!builderModelChoices(this.env).includes(requested) || this.readSecret("builderModel"))
-			return;
+		const choice = typeof requested === "string" ? requested : localDefaultChoice(this.env);
+		if (!choice || !clientHost || !isLocalHostname(clientHost)) return;
+		if (!builderModelChoices(this.env).includes(choice) || this.readSecret("builderModel")) return;
 		if (this.messages.some((message) => message.role === "assistant")) return;
-		this.writeSecret("builderModel", requested);
+		this.writeSecret("builderModel", choice);
 	}
 
 	/** The model a local comparison pinned for this project, or BUILDER_MODEL_ID. */
@@ -7350,12 +7402,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				providerOptions: builderProviderOptions(
 					alreadyInterviewed
 						? BUILDER_REASONING_EFFORT.holding
-						: BUILDER_REASONING_EFFORT.interview,
-					{ promptCacheKey: this.name },
+						: (parseBuilderLineup(this.builderModelId()).effort ??
+								BUILDER_REASONING_EFFORT.interview),
+					{ promptCacheKey: this.name, fast: parseBuilderLineup(this.builderModelId()).fast },
 				),
 				abortSignal,
 				experimental_onStepStart: (event) =>
-					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
+					metrics.stepStarted({
+						effort: requestedReasoningEffort(event.providerOptions),
+						model: parseBuilderLineup(this.builderModelId()).build,
+					}),
 				onChunk: ({ chunk }) => metrics.observeChunk(chunk.type),
 				onStepFinish: (step) => {
 					this.touchBuildActivity();
@@ -7482,9 +7538,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 			);
 
+			const lineup = parseBuilderLineup(this.builderModelId());
+			const handoff =
+				tracksInitialBuild && lineup.design
+					? new DesignHandoff(lineup.design, lineup.build, this.readSecret("designHandoff"))
+					: undefined;
 			const mcpFailureGuard = new McpToolFailureGuard();
 			const directTools = {
 				...sandboxTools,
+				// Only a split build has the hand-off tool, so it stays out of the tool set's type.
+				...((handoff ? this.buildDesignHandoffTool(handoff, buildAbortSignal) : {}) as {}),
 				...this.buildMcpTools(mcpFailureGuard, convergence, metrics),
 				...this.buildSchemaPlanTool(convergence, metrics),
 				...this.buildBlockEvolutionTools(convergence, metrics),
@@ -7504,18 +7567,63 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				},
 				() => this.restoreUnreported,
 			);
+			if (lineup.helper) {
+				const helper = lineup.helper;
+				// Added outside the tool set's type, like the hand-off tool. It reports an unheard
+				// restore like every other tool, so the driver hears of it instead of starting
+				// helpers whose tools would all refuse.
+				Object.assign(
+					tools,
+					reportingRestores(
+						{
+							[DELEGATE]: createDelegateTool({
+								model: this.createTurnModel(metrics, "helper", helper),
+								system: buildHelperPrompt(),
+								tools: { ...tools },
+								providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.helper, {
+									promptCacheKey: `${this.name}-helper`,
+								}),
+								onStep: (usage) => {
+									this.touchBuildActivity();
+									metrics.addSubcall(usage, helper);
+								},
+								onToolCallFinish: (event) => {
+									this.touchBuildActivity();
+									metrics.onToolCallFinish(event);
+								},
+							}),
+						},
+						() => this.restoreUnreported,
+					),
+				);
+			}
 			const buildToolNames = Object.keys(tools) as Array<keyof typeof tools>;
 			const initialScaffoldContext = isInitialBuild
 				? await this.loadInitialScaffoldContext()
 				: undefined;
 			const templateGuidance =
 				initialScaffoldContext?.templateGuidance ?? (await this.loadTemplateGuidance());
-			const system = buildBuildPrompt({
-				templateGuidance,
-				initialScaffoldContext,
-				editMode: !tracksInitialBuild,
-				cmsScripts: CMS_SCRIPT_TOOL in tools,
-			});
+			const buildPrompt = (designRole?: "designer" | "builder") =>
+				buildBuildPrompt({
+					templateGuidance,
+					initialScaffoldContext,
+					editMode: !tracksInitialBuild,
+					cmsScripts: CMS_SCRIPT_TOOL in tools && !lineup.helper,
+					designRole,
+					helpers: Boolean(lineup.helper),
+					batched: lineup.batchedSteps,
+				});
+			const system = buildPrompt(handoff?.role());
+			const roles = handoff && {
+				designer: {
+					model: this.createTurnModel(metrics, undefined, handoff.designer),
+					system: buildPrompt("designer"),
+				},
+				builder: {
+					model: this.createTurnModel(metrics, undefined, handoff.builder),
+					system: buildPrompt("builder"),
+				},
+			};
 
 			const onBuildFinish = async (...args: unknown[]) => {
 				await finish(...args);
@@ -7575,7 +7683,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const history = await convertToModelMessages(this.messages);
 			const modelMessages = turnInputMessages(
 				tracksInitialBuild ? history : compactFollowUpContext(history),
-				builderProvider(this.builderModelId()),
+				builderProvider(handoff?.modelId() ?? lineup.build),
 			);
 			if (tracksInitialBuild) {
 				this.setState({ ...this.state, buildStarted: true, initialBuildInFlight: true });
@@ -7584,7 +7692,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			metrics.streamStarted({ promptChars: system.length, toolCount: buildToolNames.length });
 			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
-				model: this.createTurnModel(metrics),
+				model: handoff && roles ? roles[handoff.role()].model : this.createTurnModel(metrics),
 				system,
 				messages: modelMessages,
 				tools,
@@ -7592,14 +7700,40 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				// turn. Keep text and tool history intact; prepareStep only drops
 				// superseded screenshot bytes. Interview turns are capped at 2.
 				stopWhen: stepCountIs(BUILD_STEP_CAP),
-				prepareStep: ({ messages, stepNumber }) =>
-					prepareBuildTurnStep(convergence, messages, buildToolNames, {
+				prepareStep: ({ messages, stepNumber }) => {
+					const step = {
 						initialBuild: tracksInitialBuild,
 						stepNumber,
-						provider: builderProvider(this.builderModelId()),
-					}),
+						...(lineup.routineEffort ? { routineEffort: lineup.routineEffort } : {}),
+						...(lineup.effort ? { effort: lineup.effort } : {}),
+					};
+					if (handoff && roles) {
+						return prepareSplitBuildStep(
+							handoff,
+							roles,
+							convergence,
+							messages,
+							buildToolNames,
+							step,
+						);
+					}
+					// A driver with helpers delegates content, settings, menus, and photos.
+					const stepTools = lineup.helper
+						? driverToolNames(buildToolNames, convergence.nextUnresolvedFailure()?.toolName)
+						: buildToolNames;
+					return {
+						...prepareBuildTurnStep(convergence, messages, stepTools, {
+							...step,
+							provider: builderProvider(lineup.build),
+						}),
+						...(lineup.helper ? { activeTools: stepTools } : {}),
+					};
+				},
 				experimental_onStepStart: (event) =>
-					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
+					metrics.stepStarted({
+						effort: requestedReasoningEffort(event.providerOptions),
+						model: handoff?.modelId() ?? lineup.build,
+					}),
 				onStepFinish: (step) => {
 					convergence.finishStep(step);
 					if (tracksInitialBuild) {
@@ -7629,8 +7763,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				maxRetries: 5,
 				maxOutputTokens: 32768,
 				// prepareStep sets each step's effort over these options.
-				providerOptions: builderProviderOptions(BUILDER_REASONING_EFFORT.build, {
+				providerOptions: builderProviderOptions(lineup.effort ?? BUILDER_REASONING_EFFORT.build, {
 					promptCacheKey: this.name,
+					// A split build's designer may be another model.
+					fast: lineup.fast && !handoff,
 				}),
 				abortSignal: buildAbortSignal,
 				onChunk: ({ chunk }) => {

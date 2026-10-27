@@ -13,6 +13,7 @@ import {
 	builderProvider,
 	builderProviderOptions,
 	createBuilderModel,
+	parseBuilderLineup,
 	prepareBuildTurnStep,
 	turnInputMessages,
 } from "../src/worker/model.js";
@@ -99,12 +100,38 @@ describe("builder model configuration", () => {
 			build: "medium",
 			followUp: "medium",
 			entryBody: "low",
+			helper: "low",
 		});
 		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 0 })).toBe("high");
 		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 1 })).toBe("medium");
 		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 40 })).toBe("medium");
 		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 0 })).toBe("medium");
 		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 3 })).toBe("medium");
+	});
+
+	it("lowers routine effort for a `:low` choice but still plans at high effort", () => {
+		const { routineEffort } = parseBuilderLineup("anthropic/claude-opus-5.5:low");
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 0, routineEffort })).toBe(
+			"high",
+		);
+		expect(buildStepReasoningEffort({ initialBuild: true, stepNumber: 1, routineEffort })).toBe(
+			"low",
+		);
+		expect(buildStepReasoningEffort({ initialBuild: false, stepNumber: 0, routineEffort })).toBe(
+			"low",
+		);
+	});
+
+	it("runs every step at low effort for an `:all-low` choice, the plan included", () => {
+		const { effort } = parseBuilderLineup("openai/gpt-6.1-terra:all-low:batched");
+		expect(effort).toBe("low");
+		for (const step of [
+			{ initialBuild: true, stepNumber: 0 },
+			{ initialBuild: true, stepNumber: 5 },
+			{ initialBuild: false, stepNumber: 0 },
+		]) {
+			expect(buildStepProviderOptions({ ...step, effort }).openai.reasoningEffort).toBe("low");
+		}
 	});
 
 	it("restricts a step's callable tools through the provider, not the tools sent", () => {
@@ -175,6 +202,133 @@ describe("builder model configuration", () => {
 		expect(turnInputMessages([brief, ack], "anthropic")).toEqual([brief]);
 		expect(turnInputMessages([brief, ack], "openai")).toEqual([brief, ack]);
 		expect(turnInputMessages([brief, call, result], "anthropic")).toEqual([brief, call, result]);
+	});
+
+	it("replays each provider only its own reasoning", () => {
+		const claudeThought = {
+			type: "reasoning" as const,
+			text: "Serif display type.",
+			providerOptions: { anthropic: { signature: "sig" } },
+		};
+		const lunaThought = {
+			type: "reasoning" as const,
+			text: "",
+			providerOptions: { openai: { itemId: "rs_1" } },
+		};
+		const call = { type: "tool-call" as const, toolCallId: "toolu_1", toolName: "exec", input: {} };
+		const designed = { role: "assistant" as const, content: [claudeThought, call] };
+		const built = { role: "assistant" as const, content: [lunaThought, call] };
+		const result = {
+			role: "tool" as const,
+			content: [
+				{
+					type: "tool-result" as const,
+					toolCallId: "toolu_1",
+					toolName: "exec",
+					output: { type: "text" as const, value: "ok" },
+				},
+			],
+		};
+
+		expect(turnInputMessages([designed, result, built, result], "openai")).toEqual([
+			{ role: "assistant", content: [call] },
+			result,
+			built,
+			result,
+		]);
+		expect(turnInputMessages([designed, result, built, result], "anthropic")).toEqual([
+			designed,
+			result,
+			{ role: "assistant", content: [call] },
+			result,
+		]);
+	});
+
+	it("reads a split choice as a design model handing off to a build model", () => {
+		expect(parseBuilderLineup("openai/gpt-6-luna")).toEqual({ build: "openai/gpt-6-luna" });
+		expect(parseBuilderLineup("anthropic/claude-opus-5.5>openai/gpt-6-luna")).toEqual({
+			design: "anthropic/claude-opus-5.5",
+			build: "openai/gpt-6-luna",
+		});
+		expect(parseBuilderLineup("anthropic/claude-opus-5.5+anthropic/claude-haiku-5.5")).toEqual({
+			build: "anthropic/claude-opus-5.5",
+			helper: "anthropic/claude-haiku-5.5",
+		});
+	});
+
+	it("reads speed tags after the models", () => {
+		expect(parseBuilderLineup("anthropic/claude-opus-5.5:fast")).toEqual({
+			build: "anthropic/claude-opus-5.5",
+			fast: true,
+		});
+		expect(parseBuilderLineup("anthropic/claude-opus-5.5+anthropic/claude-haiku-5.5:low")).toEqual({
+			build: "anthropic/claude-opus-5.5",
+			helper: "anthropic/claude-haiku-5.5",
+			routineEffort: "low",
+		});
+		expect(parseBuilderLineup("openai/gpt-6-luna:batched")).toEqual({
+			build: "openai/gpt-6-luna",
+			batchedSteps: true,
+		});
+		expect(parseBuilderLineup("openai/gpt-6.1-terra:all-low:batched")).toEqual({
+			build: "openai/gpt-6.1-terra",
+			effort: "low",
+			batchedSteps: true,
+		});
+		expect(() => parseBuilderLineup("anthropic/claude-opus-5.5:quick")).toThrow(/quick/);
+	});
+
+	it("asks Claude for fast output on every step of a `:fast` build", async () => {
+		const requests: Array<{ headers: Headers; body: Record<string, unknown> }> = [];
+		const replies = [
+			{ type: "tool_use", id: "toolu_1", name: "write_file", input: {} },
+			{ type: "text", text: "Done." },
+		];
+		const fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+			requests.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+			const content = replies.shift()!;
+			return new Response(
+				JSON.stringify({
+					id: `msg_${requests.length}`,
+					type: "message",
+					role: "assistant",
+					model: "claude-opus-5-5",
+					content: [content],
+					stop_reason: content.type === "tool_use" ? "tool_use" : "end_turn",
+					stop_sequence: null,
+					usage: { input_tokens: 1, output_tokens: 1 },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		};
+		const { generateText } = await import("ai");
+		const lineup = parseBuilderLineup("anthropic/claude-opus-5.5:fast:low");
+		const tools = {
+			write_file: tool({ inputSchema: z.object({}), execute: async () => ({ success: true }) }),
+		};
+		await generateText({
+			model: createBuilderModel(env, { fetch, modelId: lineup.build }),
+			prompt: "Build",
+			tools,
+			stopWhen: stepCountIs(2),
+			providerOptions: builderProviderOptions("medium", { fast: lineup.fast }),
+			prepareStep: ({ messages, stepNumber }) =>
+				prepareBuildTurnStep(new BuildConvergence(), messages, ["write_file"], {
+					initialBuild: true,
+					stepNumber,
+					provider: "anthropic",
+					routineEffort: lineup.routineEffort,
+				}),
+		});
+
+		expect(requests.map((request) => request.body.speed)).toEqual(["fast", "fast"]);
+		expect(requests.every((r) => r.headers.get("anthropic-beta")?.includes("fast-mode"))).toBe(
+			true,
+		);
+		expect(
+			requests.map((request) => (request.body.output_config as { effort?: string }).effort),
+		).toEqual(["high", "low"]);
+		expect(requests[1]?.body.thinking).toEqual({ type: "adaptive", display: "summarized" });
 	});
 
 	it("sends Claude to the gateway's Anthropic endpoint, billed by the gateway", async () => {
@@ -248,6 +402,39 @@ describe("builder model configuration", () => {
 			"write_file",
 			"view_preview",
 		]);
+	});
+
+	it("sends OpenAI models to the gateway's OpenAI endpoint when the provider route is set", async () => {
+		const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+		const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			requests.push({
+				url: String(input),
+				headers: new Headers(init?.headers),
+				body: JSON.parse(String(init?.body)),
+			});
+			return completedResponse();
+		};
+		const { generateText } = await import("ai");
+
+		await generateText({
+			model: createBuilderModel(
+				{ ...env, AI_GATEWAY_OPENAI_ROUTE: "provider" },
+				{ fetch, modelId: "openai/gpt-6.1-terra", metadata: { session: "s1" } },
+			),
+			prompt: "Build",
+			providerOptions: builderProviderOptions("low"),
+		});
+
+		const [request] = requests;
+		expect(request?.url).toBe(
+			"https://gateway.ai.cloudflare.com/v1/account/gateway/openai/responses",
+		);
+		expect(request?.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+		expect(request?.headers.has("authorization")).toBe(false);
+		expect(JSON.parse(request?.headers.get("cf-aig-metadata") ?? "null")).toEqual({
+			session: "s1",
+		});
+		expect(request?.body).toMatchObject({ model: "gpt-6.1-terra", reasoning: { effort: "low" } });
 	});
 
 	it("applies a per-step effort through prepareStep", async () => {

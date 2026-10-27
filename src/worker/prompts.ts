@@ -14,9 +14,14 @@
  * and are not duplicated here.
  */
 
+import batchedSteps from "./prompts/build-batched.md?raw";
 import blankBuildPrompt from "./prompts/build-blank.md?raw";
 import blocksContract from "./prompts/blocks-contract.md?raw";
 import blocksFollowUp from "./prompts/blocks-follow-up.md?raw";
+import designBuilder from "./prompts/design-builder.md?raw";
+import designDesigner from "./prompts/design-designer.md?raw";
+import helperPrompt from "./prompts/helper.md?raw";
+import helperDriver from "./prompts/helper-driver.md?raw";
 import followUpPrompt from "./prompts/build-follow-up.md?raw";
 import interviewHeader from "./prompts/interview.md?raw";
 import interviewBlank from "./prompts/interview-blank.md?raw";
@@ -49,6 +54,17 @@ export interface BuildPromptOptions {
 	editMode?: boolean;
 	/** `run_cms_script` is available this turn. */
 	cmsScripts?: boolean;
+	/** This model's part in a first build split between a designer and a builder. */
+	designRole?: "designer" | "builder";
+	/** `delegate` hands tasks to a helper model this turn. */
+	helpers?: boolean;
+	/** A first build maps its workflow onto as few model steps as it can. */
+	batched?: boolean;
+}
+
+/** The system prompt of a helper running one delegated task. */
+export function buildHelperPrompt(): string {
+	return helperPrompt;
 }
 
 const CMS_PROGRAMS = [
@@ -77,9 +93,17 @@ export function buildBuildPrompt({
 	initialScaffoldContext,
 	editMode = false,
 	cmsScripts = false,
+	designRole,
+	helpers = false,
+	batched = false,
 }: BuildPromptOptions): string {
 	if (editMode) {
-		return [followUpPrompt, ...(cmsScripts ? [CMS_PROGRAMS] : []), blocksFollowUp].join("\n\n");
+		return [
+			followUpPrompt,
+			...(cmsScripts ? [CMS_PROGRAMS] : []),
+			blocksFollowUp,
+			...(helpers ? [helperDriver] : []),
+		].join("\n\n");
 	}
 
 	const sections = [
@@ -91,7 +115,11 @@ export function buildBuildPrompt({
 	}
 	if (initialScaffoldContext) sections.push(initialScaffoldSection(initialScaffoldContext));
 	if (cmsScripts) sections.push(CMS_PROGRAMS);
+	// The step plan uploads photos and creates content in one program.
+	if (batched && cmsScripts) sections.push(batchedSteps);
 	// Runtime-owned and last so stale guidance pinned in recovered sessions cannot override it.
 	sections.push(blocksContract);
+	if (designRole) sections.push(designRole === "designer" ? designDesigner : designBuilder);
+	if (helpers) sections.push(helperDriver);
 	return sections.join("\n\n");
 }

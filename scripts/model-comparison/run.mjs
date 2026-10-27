@@ -25,6 +25,8 @@ const { values } = parseArgs({
 		},
 		briefs: { type: "string", default: "stargazing,bakery,editorial" },
 		reps: { type: "string", default: "3" },
+		// Run only the first n blocks of the schedule.
+		"max-blocks": { type: "string" },
 		seed: { type: "string", default: "20261021" },
 		url: { type: "string", default: "http://localhost:5173" },
 		"timeout-min": { type: "string", default: "60" },
@@ -32,6 +34,8 @@ const { values } = parseArgs({
 		"rerun-block": { type: "string", multiple: true, default: [] },
 		// Restart Colima when amd64 emulation has broken (Rosetta's binfmt handler can go stale).
 		"heal-emulation": { type: "boolean", default: false },
+		// Start each block only once the app has idle-stopped the earlier blocks' sandboxes.
+		"wait-idle": { type: "boolean", default: false },
 	},
 });
 if (!values.run) throw new Error("Pass --run <name>; results go to .model-comparison/<name>/.");
@@ -76,6 +80,7 @@ if (!existsSync(designFile)) {
 			blocks.push({ block: blocks.length + 1, rep, brief, launchOrder: shuffle(models, random) });
 		}
 	}
+	if (values["max-blocks"]) blocks.splice(Number(values["max-blocks"]));
 	writeFileSync(
 		designFile,
 		JSON.stringify(
@@ -157,7 +162,12 @@ if (values["rerun-excluded"]) {
 }
 if (rerunBlocks.size > 0) supersedeBlocks(rerunBlocks, "requested");
 
-const slug = (model) => model.replace(/[^a-z0-9.]+/gi, "-");
+// `a>b` and `a+b` are different arms, so they need different trial ids.
+const slug = (model) =>
+	model
+		.replaceAll(">", "-to-")
+		.replaceAll("+", "-with-")
+		.replace(/[^a-z0-9.]+/gi, "-");
 // The gateway lists "claude-opus-5.5" and may report Anthropic's own "claude-opus-5-5".
 const bareModel = (id) => String(id).split("/").pop().toLowerCase().replaceAll(".", "-");
 
@@ -213,6 +223,10 @@ function classify(result, modelCheck) {
 	const networkFailure = turns.some(
 		(turn) => turn.outcome === "error" && (turn.modelHttp?.failures?.["0"] ?? 0) > 0,
 	);
+	// The provider can end a stream with its own capacity error.
+	const providerOverloaded = turns.some(
+		(turn) => turn.outcome === "error" && /overloaded/i.test(turn.error ?? ""),
+	);
 	if (!modelCheck.verified) return { status: "excluded", why: modelCheck.why };
 	if (result.ok === true) return { status: "delivered" };
 	if (turns.length === 0) return { status: "excluded", why: "no turn ran" };
@@ -220,6 +234,7 @@ function classify(result, modelCheck) {
 		return { status: "excluded", why: "provisioning" };
 	if (authFailures) return { status: "excluded", why: "gateway auth" };
 	if (networkFailure) return { status: "excluded", why: "network" };
+	if (providerOverloaded) return { status: "excluded", why: "provider overloaded" };
 	return { status: "failed" };
 }
 
@@ -231,8 +246,15 @@ function checkModel(result, model) {
 	if (!labels.every((id) => id === model)) {
 		return { verified: false, labels, served, why: `worker built with ${labels.join(", ")}` };
 	}
-	// The gateway may add a date suffix to the id it reports.
-	if (served.length === 0 || !served.every((id) => bareModel(id).startsWith(bareModel(model)))) {
+	// The gateway may add a date suffix to the id it reports. A split choice
+	// (`<design>><build>`) is served by either of its models; a helper
+	// (`<build>+<helper>`) runs inside tools, so its steps are not reported here.
+	// Speed tags (`:fast`, `:low`) change requests, not models.
+	const allowed = model.split(":")[0].split(/[>+]/).map(bareModel);
+	if (
+		served.length === 0 ||
+		!served.every((id) => allowed.some((bare) => bareModel(id).startsWith(bare)))
+	) {
 		return {
 			verified: false,
 			labels,
@@ -330,6 +352,38 @@ function ensureEmulation() {
 	if (!emulationWorks()) throw new Error("amd64 emulation is still broken after a Colima restart.");
 }
 
+// A block's sandboxes keep running for the app's 10-minute idle stop after their
+// last capture. With --wait-idle the next block waits for that stop (up to 20
+// minutes), so it starts on an idle machine and no block inherits another's load.
+function runningSandboxes() {
+	try {
+		return execFileSync(
+			"docker",
+			["ps", "--filter", "name=workerd-emdash-build-Sandbox-", "--format", "{{.Names}}"],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 },
+		)
+			.split("\n")
+			.filter((name) => name && !name.endsWith("-proxy")).length;
+	} catch (error) {
+		console.error(`could not list sandboxes, so not waiting: ${error.message}`);
+		return 0;
+	}
+}
+
+async function waitForIdleMachine(block, attempt) {
+	const started = Date.now();
+	let running = runningSandboxes();
+	if (running > 0) console.error(`waiting for ${running} sandbox(es) from earlier blocks to stop`);
+	while (running > 0 && Date.now() - started < 20 * 60_000) {
+		await new Promise((resolve) => setTimeout(resolve, 15_000));
+		running = runningSandboxes();
+	}
+	appendFileSync(
+		join(root, "block-starts.jsonl"),
+		`${JSON.stringify({ block: block.block, attempt, startedAt: new Date().toISOString(), waitedMs: Date.now() - started, stillRunning: running })}\n`,
+	);
+}
+
 // Emulation can break mid-block: running processes go on, but every new one in
 // the sandbox fails, and a build still running then crashes (its turn ends in
 // an error such as a failed checkpoint). A block with such a crash reruns
@@ -338,6 +392,7 @@ function ensureEmulation() {
 for (const block of design.blocks) {
 	for (let attempt = 1; ; attempt += 1) {
 		if (block.launchOrder.every((model) => done.has(trialIdFor(block, model)))) break;
+		if (values["wait-idle"]) await waitForIdleMachine(block, attempt);
 		ensureEmulation();
 		console.error(`block ${block.block}/${design.blocks.length}: ${block.brief} rep ${block.rep}`);
 		await Promise.all(block.launchOrder.map((model) => runTrial(block, model)));

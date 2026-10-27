@@ -7,4 +7,11 @@ AI_GATEWAY_TOKEN=
 UNSPLASH_ACCESS_KEY=
 
 # Optional, local only. Gateway model ids a project may pin for scripts/model-comparison.
-# BUILDER_MODEL_CHOICES=openai/gpt-6-luna,anthropic/claude-haiku-5.5,anthropic/claude-opus-5.5
+# BUILDER_MODEL_CHOICES=openai/gpt-6-luna,openai/gpt-6.1-terra:all-low,anthropic/claude-haiku-5.5,anthropic/claude-opus-5.5
+
+# Optional, local only. `provider` sends OpenAI models to the gateway's OpenAI endpoint,
+# which serves new models before the unified API lists them.
+# AI_GATEWAY_OPENAI_ROUTE=provider
+
+# Optional, local only. The choice from BUILDER_MODEL_CHOICES that a new project started in the app pins.
+# BUILDER_MODEL_DEFAULT=openai/gpt-6.1-terra:all-low

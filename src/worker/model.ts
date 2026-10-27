@@ -18,6 +18,52 @@ export function builderModelChoices(env: { BUILDER_MODEL_CHOICES?: string }): st
 }
 
 /**
+ * The choice a new local project pins when its first request names none, from
+ * `BUILDER_MODEL_DEFAULT`, so the app's own UI can try a comparison model.
+ * Deployed config leaves it empty.
+ */
+export function localDefaultChoice(env: { BUILDER_MODEL_DEFAULT?: string }): string | undefined {
+	return env.BUILDER_MODEL_DEFAULT?.trim() || undefined;
+}
+
+/**
+ * The models behind one builder choice. A choice is a gateway model id,
+ * `<design>><build>`, or `<build>+<helper>`, optionally followed by speed
+ * tags: `:fast`, `:low`, `:all-low`, or `:batched`. A design model plans a first build and writes its
+ * design system, then hands off to the build model. A helper model runs the
+ * build model's delegated tasks and entry bodies.
+ */
+export interface BuilderLineup {
+	build: string;
+	design?: string;
+	helper?: string;
+	/** `:fast`: the build model's own requests ask for fast output (Claude Opus only). */
+	fast?: true;
+	/** `:low`: effort for every build step after a first build's plan. */
+	routineEffort?: BuilderReasoningEffort;
+	/** `:all-low`: effort for every interview and build step, a first build's plan included. */
+	effort?: BuilderReasoningEffort;
+	/** `:batched`: the build prompt maps a first build onto as few steps as it can. */
+	batchedSteps?: true;
+}
+
+export function parseBuilderLineup(choice: string): BuilderLineup {
+	const [models = choice, ...tags] = choice.split(":");
+	const unknown = tags.filter((tag) => !["fast", "low", "all-low", "batched"].includes(tag));
+	if (unknown.length > 0) throw new Error(`Unknown builder choice tags: ${unknown.join(", ")}`);
+	const [driver = models, helper] = models.split("+");
+	const [design, build] = driver.split(">");
+	return {
+		...(build ? { design, build } : { build: driver }),
+		...(helper ? { helper } : {}),
+		...(tags.includes("fast") ? { fast: true as const } : {}),
+		...(tags.includes("low") ? { routineEffort: "low" as const } : {}),
+		...(tags.includes("all-low") ? { effort: "low" as const } : {}),
+		...(tags.includes("batched") ? { batchedSteps: true as const } : {}),
+	};
+}
+
+/**
  * The API a gateway model id is served through. Claude models go to the
  * gateway's Anthropic Messages endpoint: its Responses translation turns effort
  * into budgeted thinking, which Claude 5.5 models reject.
@@ -34,6 +80,8 @@ function anthropicModelId(modelId: string): string {
 }
 
 /**
+ * The conversation as `provider` can take it. Reasoning is replayable only to
+ * the provider that produced it, so a split build drops the other provider's.
  * Claude 5.5 models take no assistant prefill, but a first build that follows
  * an interview without questions continues the interview's own reply. For
  * Claude the turn's input ends at the latest user or tool message; the reply
@@ -43,10 +91,20 @@ export function turnInputMessages(
 	messages: ModelMessage[],
 	provider: BuilderProvider,
 ): ModelMessage[] {
-	if (provider !== "anthropic") return messages;
-	let end = messages.length;
-	while (end > 0 && messages[end - 1]?.role === "assistant") end -= 1;
-	return messages.slice(0, end);
+	const own = messages.map((message) =>
+		message.role === "assistant" && Array.isArray(message.content)
+			? {
+					...message,
+					content: message.content.filter(
+						(part) => part.type !== "reasoning" || part.providerOptions?.[provider] !== undefined,
+					),
+				}
+			: message,
+	);
+	if (provider !== "anthropic") return own;
+	let end = own.length;
+	while (end > 0 && own[end - 1]?.role === "assistant") end -= 1;
+	return own.slice(0, end);
 }
 
 export type BuilderReasoningEffort = "low" | "medium" | "high";
@@ -69,6 +127,8 @@ export const BUILDER_REASONING_EFFORT = {
 	followUp: "medium",
 	/** Drafting entry bodies inside create_entries_batch. */
 	entryBody: "low",
+	/** A helper running one delegated CMS or media task. */
+	helper: "low",
 } as const satisfies Record<string, BuilderReasoningEffort>;
 
 export function builderProviderOptions(
@@ -76,10 +136,13 @@ export function builderProviderOptions(
 	{
 		reasoningSummary = true,
 		promptCacheKey,
+		fast = false,
 	}: {
 		reasoningSummary?: boolean;
 		/** Routes a session's requests to the same prompt cache. */
 		promptCacheKey?: string;
+		/** Fast output, at twice the price; Claude Opus only. */
+		fast?: boolean;
 	} = {},
 ) {
 	// Each provider reads only its own key, so one value serves every model.
@@ -96,6 +159,7 @@ export function builderProviderOptions(
 			effort,
 			// Automatic caching of the growing prefix, as OpenAI caches without being asked.
 			cacheControl: { type: "ephemeral" },
+			...(fast ? { speed: "fast" as const } : {}),
 		} satisfies AnthropicLanguageModelOptions,
 	};
 }
@@ -109,15 +173,21 @@ export function builderProviderOptions(
 export function buildStepReasoningEffort(step: {
 	initialBuild: boolean;
 	stepNumber: number;
+	routineEffort?: BuilderReasoningEffort;
+	effort?: BuilderReasoningEffort;
 }): BuilderReasoningEffort {
-	if (!step.initialBuild) return BUILDER_REASONING_EFFORT.followUp;
-	return step.stepNumber === 0 ? BUILDER_REASONING_EFFORT.plan : BUILDER_REASONING_EFFORT.build;
+	if (step.effort) return step.effort;
+	if (step.initialBuild && step.stepNumber === 0) return BUILDER_REASONING_EFFORT.plan;
+	if (step.routineEffort) return step.routineEffort;
+	return step.initialBuild ? BUILDER_REASONING_EFFORT.build : BUILDER_REASONING_EFFORT.followUp;
 }
 
 /** A build step's provider options, merged by the SDK over the turn's base options. */
 export function buildStepProviderOptions(step: {
 	initialBuild: boolean;
 	stepNumber: number;
+	routineEffort?: BuilderReasoningEffort;
+	effort?: BuilderReasoningEffort;
 	allowedTools?: { toolNames: string[]; mode: "auto" | "required" };
 }) {
 	const forced = step.allowedTools?.mode === "required";
@@ -146,7 +216,13 @@ export function prepareBuildTurnStep<TOOL_NAME extends string>(
 	convergence: BuildConvergence,
 	messages: ModelMessage[],
 	toolNames: readonly TOOL_NAME[],
-	step: { initialBuild: boolean; stepNumber: number; provider: BuilderProvider },
+	step: {
+		initialBuild: boolean;
+		stepNumber: number;
+		provider: BuilderProvider;
+		routineEffort?: BuilderReasoningEffort;
+		effort?: BuilderReasoningEffort;
+	},
 ) {
 	const { allowedTools, ...prepared } = prepareBuildStep(convergence, messages, toolNames);
 	const forcedTool =
@@ -222,7 +298,13 @@ function jsonBody(init: RequestInit | undefined): Record<string, unknown> | unde
 	}
 }
 
-type GatewayEnv = Pick<Env, "AI_GATEWAY_TOKEN" | "AI_GATEWAY_ACCOUNT_ID" | "AI_GATEWAY_ID">;
+type GatewayEnv = Pick<Env, "AI_GATEWAY_TOKEN" | "AI_GATEWAY_ACCOUNT_ID" | "AI_GATEWAY_ID"> & {
+	/**
+	 * Local only. `provider` sends OpenAI models to the gateway's OpenAI endpoint
+	 * instead of its unified API, which lists new models days after OpenAI does.
+	 */
+	AI_GATEWAY_OPENAI_ROUTE?: string;
+};
 
 export interface BuilderModelOptions {
 	/** A gateway model id from `builderModelChoices`; BUILDER_MODEL_ID otherwise. */
@@ -290,6 +372,21 @@ export function createBuilderModel(env: GatewayEnv, options: BuilderModelOptions
 				return attempt(input, { ...init, headers });
 			},
 		}).messages(anthropicModelId(modelId));
+	}
+	if (env.AI_GATEWAY_OPENAI_ROUTE === "provider") {
+		return createOpenAI({
+			baseURL: `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/openai`,
+			apiKey: "gateway-billed",
+			headers: {
+				"cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}`,
+				...(options.metadata ? { "cf-aig-metadata": JSON.stringify(options.metadata) } : {}),
+			},
+			fetch: (input, init) => {
+				const headers = new Headers(init?.headers);
+				headers.delete("authorization");
+				return gatewayFetch(input, { ...init, headers });
+			},
+		}).responses(modelId.replace(/^openai\//, ""));
 	}
 	const gateway = createOpenAI({
 		apiKey: env.AI_GATEWAY_TOKEN,

@@ -4,13 +4,21 @@
 // tool, an edited history, and an image in a user message. Every request goes
 // through the worker's createBuilderModel and provider options.
 // Run: node --import ./scripts/model-comparison/ts-resolve.mjs scripts/model-comparison/probe.mjs [models] [checks]
-import { generateText, stepCountIs, tool } from "ai";
+import { generateText, stepCountIs, streamText, tool } from "ai";
 import { z } from "zod";
+import { BuildConvergence } from "../../src/worker/build-convergence.ts";
+import {
+	DesignHandoff,
+	HAND_OFF_DESIGN,
+	prepareSplitBuildStep,
+} from "../../src/worker/design-handoff.ts";
+import { createDelegateTool, DELEGATE } from "../../src/worker/helpers.ts";
 import {
 	buildStepProviderOptions,
 	builderProvider,
 	builderProviderOptions,
 	createBuilderModel,
+	parseBuilderLineup,
 } from "../../src/worker/model.ts";
 import { devVars } from "./dev-vars.mjs";
 
@@ -166,7 +174,192 @@ const checks = {
 		}),
 };
 
+// A split build's hand-off on the real providers: the designer's tool calls and
+// results reach the builder, the designer's reasoning does not, and the
+// builder acts on the written spec.
+async function handoffCheck(lineup) {
+	const handoff = new DesignHandoff(lineup.design, lineup.build);
+	const answers = [];
+	const tools = {
+		write_files: tool({
+			description: "Write source files.",
+			inputSchema: z.object({
+				files: z.array(z.object({ path: z.string(), content: z.string() })),
+			}),
+			execute: async ({ files }) => ({ success: true, written: files.map((file) => file.path) }),
+		}),
+		[HAND_OFF_DESIGN]: tool({
+			description: "Hand the build to the builder with the written design spec.",
+			inputSchema: z.object({ spec: z.string() }),
+			execute: async ({ spec }) => {
+				handoff.handOff(spec);
+				return { success: true };
+			},
+		}),
+		record_answer: tool({
+			description: "Record the builder's answer.",
+			inputSchema: z.object({ accent: z.string(), stylesheet: z.string() }),
+			execute: async (answer) => {
+				answers.push(answer);
+				return { recorded: true };
+			},
+		}),
+	};
+	const toolNames = Object.keys(tools);
+	const system = (role) =>
+		role === "designer"
+			? "You are the designer. Write /src/styles/global.css with write_files, choosing one accent colour as a hex token, then call hand_off_design with a short spec naming that accent. Do not call record_answer."
+			: "You are the builder. The designer handed off above. Call record_answer with the accent hex from the spec and the stylesheet path it wrote, then reply in one sentence.";
+	const roles = {
+		designer: {
+			model: createBuilderModel(env, { modelId: lineup.design }),
+			system: system("designer"),
+		},
+		builder: {
+			model: createBuilderModel(env, { modelId: lineup.build }),
+			system: system("builder"),
+		},
+	};
+	const convergence = new BuildConvergence();
+	const served = [];
+	const result = await generateText({
+		model: roles.designer.model,
+		prompt: "A one-page site for a small bakery.",
+		tools,
+		stopWhen: stepCountIs(8),
+		providerOptions: builderProviderOptions("medium"),
+		prepareStep: ({ messages, stepNumber }) =>
+			prepareSplitBuildStep(handoff, roles, convergence, messages, toolNames, {
+				initialBuild: true,
+				stepNumber,
+			}),
+		onStepFinish: (step) => served.push(step.response?.modelId),
+	});
+	return { result, served, answers, handedOff: handoff.handedOff };
+}
+
+// A helper lineup on the real providers: the driver delegates, the helper
+// runs the task with its own tool call, and the driver reads its report.
+async function delegateCheck(lineup) {
+	const created = [];
+	const helperSteps = [];
+	const delegate = createDelegateTool({
+		model: createBuilderModel(env, { modelId: lineup.helper }),
+		system: "You are a helper. Do the task with your tools, then report the ids you created.",
+		tools: {
+			content_create: tool({
+				description: "Create a CMS entry.",
+				inputSchema: z.object({ collection: z.string(), title: z.string(), status: z.string() }),
+				execute: async (entry) => {
+					created.push(entry);
+					return { success: true, id: "01HELPERENTRY" };
+				},
+			}),
+		},
+		providerOptions: builderProviderOptions("low"),
+		onStep: (usage) => helperSteps.push(usage.outputTokens),
+	});
+	const result = await generateText({
+		model: createBuilderModel(env, { modelId: lineup.build }),
+		system:
+			"You build sites. Delegate content to helpers with the delegate tool; you have no CMS tools yourself.",
+		prompt:
+			"Have a helper create one published entry titled 'Sourdough loaf' in the `products` collection, then tell me the id it reported.",
+		tools: { [DELEGATE]: delegate },
+		stopWhen: stepCountIs(4),
+		providerOptions: builderProviderOptions("medium"),
+	});
+	return { result, created, helperSteps };
+}
+
+// Fast mode on the real gateway: the same long answer with and without it,
+// alternating, timed from the first answer token to the last. The raw stream's
+// usage says which speed the API served.
+async function speedCheck(lineup) {
+	const runs = [];
+	for (const fast of [false, true, false, true]) {
+		let served;
+		const model = createBuilderModel(env, {
+			modelId: lineup.build,
+			fetch: async (input, init) => {
+				const response = await fetch(input, init);
+				response
+					.clone()
+					.text()
+					.then((text) => (served = text.match(/"speed":"(\w+)"/)?.[1] ?? "not reported"));
+				return response;
+			},
+		});
+		const started = Date.now();
+		let firstText;
+		const result = streamText({
+			model,
+			// A different prompt each run, so the gateway's response cache cannot answer.
+			prompt: `Describe one week in a small neighbourhood bakery, day by day, in about 900 words of plain prose. (Run ${runs.length + 1} at ${Date.now()}.)`,
+			maxOutputTokens: 4000,
+			providerOptions: builderProviderOptions("low", { reasoningSummary: false, fast }),
+			onChunk: ({ chunk }) => {
+				if (chunk.type === "text-delta") firstText ??= Date.now();
+			},
+		});
+		const usage = await result.totalUsage;
+		const finished = Date.now();
+		runs.push({
+			fast,
+			served,
+			outputTokens: usage.outputTokens,
+			firstTextMs: firstText - started,
+			tokensPerSecond: Math.round(usage.outputTokens / ((finished - firstText) / 1000)),
+		});
+	}
+	return runs;
+}
+
 for (const id of models) {
+	const lineup = parseBuilderLineup(id);
+	if (lineup.fast) {
+		try {
+			for (const run of await speedCheck(lineup)) {
+				console.log(JSON.stringify({ model: id, check: "speed", ok: true, ...run }));
+			}
+		} catch (error) {
+			const detail = String(error?.responseBody ?? error?.message ?? error).slice(0, 600);
+			console.log(JSON.stringify({ model: id, check: "speed", ok: false, error: detail }));
+		}
+		continue;
+	}
+	if (lineup.helper) {
+		const started = Date.now();
+		let outcome;
+		try {
+			const { result, created, helperSteps } = await delegateCheck(lineup);
+			outcome = { ...summarize(result, started), created, helperSteps };
+		} catch (error) {
+			outcome = {
+				ok: false,
+				ms: Date.now() - started,
+				error: String(error?.responseBody ?? error?.message ?? error).slice(0, 600),
+			};
+		}
+		console.log(JSON.stringify({ model: id, check: "delegate", ...outcome }));
+		continue;
+	}
+	if (lineup.design) {
+		const started = Date.now();
+		let outcome;
+		try {
+			const { result, served, handedOff, answers } = await handoffCheck(lineup);
+			outcome = { ...summarize(result, started), served, handedOff, answers };
+		} catch (error) {
+			outcome = {
+				ok: false,
+				ms: Date.now() - started,
+				error: String(error?.responseBody ?? error?.message ?? error).slice(0, 600),
+			};
+		}
+		console.log(JSON.stringify({ model: id, check: "handoff", ...outcome }));
+		continue;
+	}
 	const model = createBuilderModel(env, { modelId: id });
 	for (const [check, run] of Object.entries(checks)) {
 		if (only && !only.includes(check)) continue;

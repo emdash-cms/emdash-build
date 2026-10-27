@@ -91,6 +91,18 @@ describe("builder template prototype", () => {
 		}
 	});
 
+	it("adds the step plan to a batched first build that has CMS programs", () => {
+		const heading = "## Fewer model steps";
+		expect(buildBuildPrompt({ cmsScripts: true })).not.toContain(heading);
+		// The plan creates content inside one program.
+		expect(buildBuildPrompt({ batched: true })).not.toContain(heading);
+		expect(buildBuildPrompt({ editMode: true, cmsScripts: true, batched: true })).not.toContain(
+			heading,
+		);
+		const prompt = buildBuildPrompt({ cmsScripts: true, batched: true });
+		expect(prompt.indexOf(heading)).toBeGreaterThan(prompt.indexOf("## CMS programs"));
+	});
+
 	it("puts initial block guidance after stale pinned and snapshot guidance", () => {
 		const prompt = buildBuildPrompt({
 			templateGuidance: "Obsolete pinned Custom Portable Text marker.",

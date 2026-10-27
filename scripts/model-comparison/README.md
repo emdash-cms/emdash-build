@@ -47,4 +47,12 @@ These scripts run the comparison described in [PLAN.md](PLAN.md). Results go to 
    node scripts/model-comparison/review.mjs --run 2026-10-models
    ```
 
+9. Optional, for a 2×2 run: `factorial.mjs` forms the two main effects, their interaction, and the simple effects per block, with exact Wilcoxon p-values and Hodges–Lehmann intervals, and checks each arm's effort and prompt size. List the four arms in the order A0B0, A0B1, A1B0, A1B1.
+
+   ```bash
+   node scripts/model-comparison/factorial.mjs --run terra-luna --cells openai/gpt-6-luna,openai/gpt-6-luna:batched,openai/gpt-6.1-terra:all-low,openai/gpt-6.1-terra:all-low:batched
+   ```
+
+With four or more arms, pass `--wait-idle` to `run.mjs`. Each block then starts only after the app has stopped the earlier blocks' sandboxes, which otherwise linger for 10 minutes and can exhaust Colima's memory. `oom-check.mjs --run <name>` lists trials in which a sandbox command was killed for memory. Rerun those blocks with `--rerun-block`. A model that the gateway's unified API does not list yet can still run through its OpenAI endpoint with `AI_GATEWAY_OPENAI_ROUTE=provider` in `.dev.vars`.
+
 `capture-check.mjs` and `stats-check.mjs` check the screenshot capture and the statistics against known answers. Run them after changing either one.

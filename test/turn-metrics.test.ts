@@ -491,6 +491,65 @@ describe("step timing", () => {
 		expect(record?.modelWaitMs).toBe(11_500);
 	});
 
+	it("keeps the message of a plain error object a provider streamed", () => {
+		const metrics = newMetrics();
+		metrics.noteError({ message: "Our servers are currently overloaded.", statusCode: 503 });
+		expect(metrics.finish("error")?.error).toBe("Our servers are currently overloaded.");
+	});
+
+	it("keeps sub-call tokens by the model that ran them", () => {
+		const metrics = newMetrics();
+		metrics.addSubcall(stepUsage(10), "helper");
+		metrics.addSubcall(stepUsage(20), "helper");
+		metrics.addSubcall(stepUsage(5));
+
+		const record = metrics.finish("finished");
+		expect(record?.subcalls.calls).toBe(3);
+		expect(record?.subcalls.byModel).toEqual({
+			helper: { input: 2_000, cachedInput: 1_600, output: 600, reasoning: 30 },
+		});
+	});
+
+	it("splits a turn's steps, time and tokens by the model each step requested", () => {
+		const time = clock();
+		const metrics = new TurnMetrics({
+			turnId: "turn-split",
+			kind: "initial-build",
+			resumed: false,
+			model: "designer>builder",
+			stepCap: 256,
+			now: time.now,
+		});
+		metrics.stepStarted({ effort: "high", model: "designer" });
+		time.advance(40_000);
+		metrics.onStep({ usage: stepUsage(250) });
+		metrics.stepStarted({ effort: "medium", model: "builder" });
+		time.advance(5_000);
+		metrics.onStep({ usage: stepUsage(20) });
+		metrics.stepStarted({ effort: "medium", model: "builder" });
+		time.advance(7_000);
+		metrics.onStep({ usage: stepUsage(30) });
+
+		const record = metrics.finish("finished");
+		expect(record?.byModel).toEqual({
+			designer: {
+				steps: 1,
+				ms: 40_000,
+				tokens: { input: 1_000, cachedInput: 800, output: 300, reasoning: 250 },
+			},
+			builder: {
+				steps: 2,
+				ms: 12_000,
+				tokens: { input: 2_000, cachedInput: 1_600, output: 600, reasoning: 50 },
+			},
+		});
+		expect(record?.stepTimings.map((step) => step.model)).toEqual([
+			"designer",
+			"builder",
+			"builder",
+		]);
+	});
+
 	it("records a step that streamed nothing and one whose start was not observed", () => {
 		const time = clock();
 		const metrics = newMetrics(time.now);
