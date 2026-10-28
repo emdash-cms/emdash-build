@@ -77,6 +77,7 @@ import {
 } from "./readiness.js";
 import { equalTokenDigest } from "./project-auth.js";
 import type { ClientRecoveryState } from "../shared/client-recovery.js";
+import { EXPORTED_SITE_NODE_VERSIONS } from "../shared/exported-site.js";
 import { previewTokenForRoute, previewTokenFromUrl } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 import {
@@ -369,7 +370,7 @@ Astro + EmDash project. Your content and uploaded media come along (in
 
 ## Run it locally
 
-You need Node 22+ and pnpm.
+You need Node ${EXPORTED_SITE_NODE_VERSIONS} and pnpm.
 
 \`\`\`sh
 pnpm install
