@@ -27,14 +27,24 @@ interface SetupHarness {
 	): Promise<unknown>;
 }
 
+/** What a build turn reads from the sandbox, stubbed. */
+interface BuildHarness {
+	createTurnModel(): unknown;
+	provisionSite(): Promise<ProvisionResult>;
+	loadInitialScaffoldContext(): Promise<undefined>;
+	loadTemplateGuidance(): Promise<undefined>;
+	backupSite(): Promise<undefined>;
+	restartInterruptedTurn(payload: unknown): Promise<void>;
+}
+
 const brief: UIMessage = {
 	id: "brief",
 	role: "user",
 	parts: [{ type: "text", text: "Build a bakery site" }],
 };
 
-/** An interview that asks nothing, so the build starts once setup is done. */
-function interviewModel() {
+/** A model that replies with text and calls no tools, so an interview asks nothing. */
+function replyModel() {
 	return new MockLanguageModelV3({
 		doStream: async () => ({
 			stream: new ReadableStream({
@@ -124,7 +134,7 @@ describe("setup interrupted by a restart", () => {
 		// The brief's turn starts setup, which is still waiting for a slot when the instance goes.
 		await runInDurableObject(agent, async (instance) => {
 			const harness = instance as unknown as SetupHarness;
-			harness.createTurnModel = interviewModel;
+			harness.createTurnModel = replyModel;
 			harness.provisionSite = () => new Promise(() => {});
 			instance.setState({ ...instance.state, appHost: "localhost:5173" });
 			await instance.saveMessages([brief]);
@@ -187,7 +197,7 @@ describe("setup interrupted by a restart", () => {
 		expect(resumed.provisions).toHaveLength(1);
 
 		await runInDurableObject(agent, async (instance) => {
-			(instance as unknown as SetupHarness).createTurnModel = interviewModel;
+			(instance as unknown as SetupHarness).createTurnModel = replyModel;
 			await instance.persistMessages([
 				...instance.messages,
 				{ id: "more", role: "user", parts: [{ type: "text", text: "Add a menu page" }] },
@@ -286,7 +296,7 @@ describe("setup interrupted by a restart", () => {
 		expect(resumed.autoStarts).toEqual([["brief"]]);
 	});
 
-	it("leaves the build of a ready site to a turn that chat recovery runs again", async () => {
+	it("leaves the build of a ready site to the turn that chat recovery runs again", async () => {
 		const agent = await newProject("33333333-3333-4333-8333-000000000006");
 		await leaveProject(
 			agent,
@@ -300,13 +310,31 @@ describe("setup interrupted by a restart", () => {
 			},
 		);
 		const outcome = await runInDurableObject(agent, async (instance) => {
-			const resumed = recordResumes(instance);
-			await instance.onStart();
-			return {
-				autoStarts: [...resumed.autoStarts],
-				recovery: instance.getSchedules().map(({ callback }) => callback),
+			const harness = instance as unknown as BuildHarness;
+			const model = replyModel();
+			harness.createTurnModel = () => model;
+			harness.provisionSite = async () => ({ ready: true });
+			harness.loadInitialScaffoldContext = async () => undefined;
+			harness.loadTemplateGuidance = async () => undefined;
+			harness.backupSite = async () => undefined;
+			let turns = 0;
+			const saveMessages = instance.saveMessages.bind(instance);
+			instance.saveMessages = (...args: Parameters<BuilderAgent["saveMessages"]>) => {
+				turns += 1;
+				return saveMessages(...args);
 			};
+
+			await instance.onStart();
+			const autoStarts = turns;
+			// Chat recovery scheduled the interrupted turn to run again; run it as the alarm would.
+			const [recovery] = instance.getSchedules();
+			await harness.restartInterruptedTurn(recovery?.payload);
+			const builds = model.doStreamCalls.map(({ tools }) =>
+				tools?.some((tool) => tool.name === "write_file"),
+			);
+			return { autoStarts, builds };
 		});
-		expect(outcome).toEqual({ autoStarts: [], recovery: ["restartInterruptedTurn"] });
+		// One build, the recovered turn's, with the build's tools.
+		expect(outcome).toEqual({ autoStarts: 0, builds: [true] });
 	});
 });
