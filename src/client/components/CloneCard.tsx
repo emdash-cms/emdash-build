@@ -173,7 +173,7 @@ export function CloneCard({
 					</div>
 					<div className="flex flex-wrap items-center gap-2">
 						<span className="min-w-0 flex-1 text-xs text-text-tertiary">
-							Includes your content and media. Needs Node {EXPORTED_SITE_NODE_VERSIONS} and pnpm.
+							Includes your content and media. Needs pnpm and Node {EXPORTED_SITE_NODE_VERSIONS}.
 							{expires ? ` Link expires around ${expires}.` : ""}
 						</span>
 						<button

@@ -370,7 +370,7 @@ Astro + EmDash project. Your content and uploaded media come along (in
 
 ## Run it locally
 
-You need Node ${EXPORTED_SITE_NODE_VERSIONS} and pnpm.
+You need pnpm and Node ${EXPORTED_SITE_NODE_VERSIONS}.
 
 \`\`\`sh
 pnpm install
