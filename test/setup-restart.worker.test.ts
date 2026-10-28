@@ -190,7 +190,7 @@ describe("setup interrupted by a restart", () => {
 		expect(steps.find(({ step }) => step.includes("pkill"))?.cwd).toBeUndefined();
 	});
 
-	it("does not set up twice when a message arrives during resumed setup", async () => {
+	it("does not set up again when a message arrives during resumed setup", async () => {
 		const agent = await newProject("33333333-3333-4333-8333-000000000002");
 		await leaveProject(agent, { initialGeneration: { id: "brief", status: "awaiting_answers" } });
 		const resumed = await restart(agent);
@@ -204,9 +204,18 @@ describe("setup interrupted by a restart", () => {
 			]);
 			const turn = await instance.onChatMessage(async () => {}, { requestId: "more" });
 			await turn.text();
-			// PartyServer runs onStart again after one that threw.
-			await instance.onStart();
 		});
+		expect(resumed.provisions).toHaveLength(1);
+	});
+
+	it("does not set up again when onStart runs again after one that threw", async () => {
+		const agent = await newProject("33333333-3333-4333-8333-000000000003");
+		await leaveProject(agent, { initialGeneration: { id: "brief", status: "preparing" } });
+		const resumed = await restart(agent);
+		expect(resumed.provisions).toHaveLength(1);
+
+		// PartyServer runs onStart again after one that threw.
+		await runInDurableObject(agent, (instance) => instance.onStart());
 		expect(resumed.provisions).toHaveLength(1);
 	});
 
