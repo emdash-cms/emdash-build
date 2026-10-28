@@ -53,8 +53,7 @@ import {
 	scrubStagedContentCommand,
 	stripStorageFromAstroConfig,
 	stripR2FromWrangler,
-	ensureSsrOptimizeDep,
-	ensurePreviewHmr,
+	ensureBuilderViteConfig,
 	previewScreenshotCommand,
 	readFilesFromSandbox,
 	refreshLiveTypes,
@@ -3281,8 +3280,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const cfg = await sandbox.readFile(astroPath, { encoding: "utf-8" });
 		if (!cfg.success) return;
 		const base = stripSandboxPlugin ? stripSandboxFromAstroConfig(cfg.content) : cfg.content;
-		const optimized = ensureSsrOptimizeDep(base, SSR_OPTIMIZE_DEPS, SSR_OPTIMIZE_EXCLUDES);
-		const patched = ensurePreviewHmr(optimized);
+		const patched = ensureBuilderViteConfig(base, SSR_OPTIMIZE_DEPS, SSR_OPTIMIZE_EXCLUDES);
 		if (patched !== cfg.content) await sandbox.writeFile(astroPath, patched);
 	}
 

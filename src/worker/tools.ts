@@ -624,11 +624,7 @@ export function scrubStagedContentCommand(stagedPath: string): string {
  * already has one for astro-iconset) and inserts a fresh `vite` block
  * otherwise. Idempotent: deps and options already present are left alone.
  */
-export function ensureSsrOptimizeDep(
-	src: string,
-	deps: string[],
-	excludedDeps: string[] = [],
-): string {
+function ensureSsrOptimizeDep(src: string, deps: string[], excludedDeps: string[] = []): string {
 	let output = src;
 	const missing = deps.filter((d) => !output.includes(`"${d}"`));
 	const list = missing.map((d) => `"${d}"`).join(", ");
@@ -677,7 +673,7 @@ export function ensureSsrOptimizeDep(
  * instead of trying the container-local `localhost:4321`. The preview URL is
  * supplied in `.dev.vars` before Astro starts and differs per session.
  */
-export function ensurePreviewHmr(src: string): string {
+function ensurePreviewHmr(src: string): string {
 	if (src.includes("EMDASH_PREVIEW_URL")) return src;
 	const declaration = [
 		"const emdashPreviewUrl = process.env.EMDASH_PREVIEW_URL",
@@ -707,6 +703,15 @@ export function ensurePreviewHmr(src: string): string {
 		"\t\t\t: undefined,",
 	].join("\n");
 	return `${output.slice(0, objectStart + 1)}${hmr}${output.slice(objectStart + 1)}`;
+}
+
+/** Reapply the builder's Vite settings that model-authored config edits must keep. */
+export function ensureBuilderViteConfig(
+	src: string,
+	deps: string[],
+	excludedDeps: string[],
+): string {
+	return ensurePreviewHmr(ensureSsrOptimizeDep(src, deps, excludedDeps));
 }
 
 /**
