@@ -184,19 +184,19 @@ export default defineConfig({
 		});
 	}
 
-	it.fails("keeps the scaffold's Vite plugins alongside preview HMR and the SSR optimizer", () => {
+	it("keeps the scaffold's Vite plugins alongside preview HMR and the SSR optimizer", () => {
 		const vite = loadViteConfig(ensureBuilderViteConfig(scaffold, deps, excludes));
 		expectBuilderSettings(vite);
 		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
 	});
 
-	it.fails("repairs a saved config whose builder settings sit in a second vite key", () => {
+	it("repairs a saved config whose builder settings sit in a second vite key", () => {
 		const vite = loadViteConfig(ensureBuilderViteConfig(savedWithSecondVite, deps, excludes));
 		expectBuilderSettings(vite);
 		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
 	});
 
-	it.fails("repairs a saved config edited above its second vite key", () => {
+	it("repairs a saved config edited above its second vite key", () => {
 		const vite = loadViteConfig(ensureBuilderViteConfig(editedAboveSecondVite, deps, excludes));
 		expectBuilderSettings(vite);
 		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
