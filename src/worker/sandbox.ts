@@ -509,6 +509,10 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		return this.runtime().stopProcess(id);
 	}
 
+	stopProcesses(prefix: string) {
+		return this.runtime().stopProcesses(prefix);
+	}
+
 	async exposePort(port: number, options: { hostname: string; token: string }) {
 		await writePortToken(this.ctx.storage, port, options.token, "preview");
 		return { url: previewUrl(port, this.name, options.hostname, options.token) };

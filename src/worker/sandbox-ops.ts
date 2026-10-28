@@ -101,6 +101,8 @@ export interface SandboxOps {
 	waitForProcessExit(id: string, timeoutMs: number): Promise<{ exitCode: number }>;
 	/** Stop a process. Stopping one that has exited, or was never started, does nothing. */
 	stopProcess(id: string): Promise<void>;
+	/** Stop every process whose id starts with `prefix`, including any whose id the caller lost. */
+	stopProcesses(prefix: string): Promise<void>;
 
 	/** Serve `port` on its stable preview URL (the token is part of the URL) and return that URL. */
 	exposePort(port: number, options: { hostname: string; token: string }): Promise<{ url: string }>;

@@ -4925,7 +4925,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			if (prepared.success) {
 				// Setup interrupted by a restart may have left its dev server running,
-				// which would keep port 4321 and write into the new site's state.
+				// which would keep port 4321 and write into the new site's state. A new
+				// instance has lost that server's id, so stop every dev server.
+				await sandbox.stopProcesses(DEV_SERVER_PROCESS_PREFIX);
 				await this.stopDevServer();
 				this.sendConsole(`$ extract prepared ${templateDir}`);
 				const copied = await sandbox.exec(

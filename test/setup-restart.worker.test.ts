@@ -146,10 +146,10 @@ describe("setup interrupted by a restart", () => {
 		expect(resumed.autoStarts).toEqual([["brief", expect.any(String)]]);
 	});
 
-	it("stops a dev server that interrupted setup left before extracting the new site", async () => {
+	it("stops the dev servers an interrupted setup left before extracting the new site", async () => {
 		const agent = testEnv.BuilderAgent.getByName("33333333-3333-4333-8333-000000000005");
-		const commands = await runInDurableObject(agent, async (instance) => {
-			const commands: { command: string; cwd?: string }[] = [];
+		const steps = await runInDurableObject(agent, async (instance) => {
+			const steps: { step: string; cwd?: string }[] = [];
 			const harness = instance as unknown as {
 				waitForSandbox(): Promise<{ ok: boolean }>;
 				sandboxOps(): unknown;
@@ -158,24 +158,26 @@ describe("setup interrupted by a restart", () => {
 			harness.waitForSandbox = async () => ({ ok: true });
 			harness.sandboxOps = () => ({
 				exec: async (command: string, options?: { cwd?: string }) => {
-					commands.push({ command, cwd: options?.cwd });
+					steps.push({ step: command, cwd: options?.cwd });
 					// The new site's extraction fails, so setup ends there.
 					const success = !command.startsWith("rm -rf");
 					return { success, exitCode: success ? 0 : 1, stdout: "", stderr: "" };
 				},
 				stopProcess: async () => {},
+				stopProcesses: async (prefix: string) => void steps.push({ step: `stop ${prefix}*` }),
 			});
 			await expect(harness.provisionSite("localhost:5173")).resolves.toMatchObject({
 				ready: false,
 			});
-			return commands;
+			return steps;
 		});
-		const stop = commands.findIndex(({ command }) => command.includes("pkill"));
-		const extract = commands.findIndex(({ command }) => command.startsWith("rm -rf"));
+		// This instance never started a dev server, so it must stop them by their ids' prefix.
+		const stop = steps.findIndex(({ step }) => step === "stop dev-*");
+		const extract = steps.findIndex(({ step }) => step.startsWith("rm -rf"));
 		expect(stop).toBeGreaterThanOrEqual(0);
 		expect(stop).toBeLessThan(extract);
-		// Before extraction there may be no site directory to run it in.
-		expect(commands[stop]?.cwd).toBeUndefined();
+		// Before extraction there may be no site directory to run in.
+		expect(steps.find(({ step }) => step.includes("pkill"))?.cwd).toBeUndefined();
 	});
 
 	it("does not set up twice when a message arrives during resumed setup", async () => {

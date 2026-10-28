@@ -978,6 +978,23 @@ describe("background processes", { timeout: 30_000 }, () => {
 		await expect(runtime.followProcessLogs("never-started")).rejects.toThrow("not running");
 	});
 
+	it("stops every process whose id has a prefix, and leaves the others as they are", async () => {
+		const { runtime } = await running();
+
+		await runtime.startProcess("dev-done", "exit 0");
+		await runtime.waitForProcessExit("dev-done", 5_000);
+		await runtime.startProcess("dev-old", "sleep 30");
+		await runtime.startProcess("dev-new", "sleep 30");
+		await runtime.startProcess("build-1", "sleep 30");
+		await runtime.stopProcesses("dev-");
+
+		await expect(runtime.waitForProcessExit("dev-old", 1_000)).resolves.toEqual({ exitCode: 143 });
+		await expect(runtime.waitForProcessExit("dev-new", 1_000)).resolves.toEqual({ exitCode: 143 });
+		await expect(runtime.waitForProcessExit("dev-done", 1_000)).resolves.toEqual({ exitCode: 0 });
+		await expect(runtime.waitForProcessExit("build-1", 1_000)).rejects.toThrow("did not exit");
+		await runtime.stopProcess("build-1");
+	});
+
 	it("opens a quick tunnel, reuses it while it runs, and closes it", async () => {
 		const { container, runtime } = await running();
 
