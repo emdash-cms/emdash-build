@@ -8,12 +8,11 @@ export function artifactsGitEnv(token: string): Record<string, string> {
 }
 
 /**
- * Artifacts accepts the token as the basic-auth password (the username
- * is ignored), per the docs: https://x:<token>@.../repo.git. This keeps
- * the user's clone to a single paste with no header gymnastics.
+ * The token goes in a header, not the URL. Its `?expires=` suffix breaks Git's
+ * URL parsing and zsh globbing, and a URL credential stays in `.git/config`.
  */
 export function artifactsCloneCommand(remote: string, token: string): string {
-	return `git clone ${remote.replace(/^https:\/\//, `https://x:${token}@`)} my-site`;
+	return `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} my-site`;
 }
 
 export function redactArtifactsToken(text: string): string {
