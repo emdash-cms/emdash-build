@@ -5,7 +5,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export interface CloneInfo {
 	ok: boolean;
 	reason?: string;
-	cloneUrl?: string;
 	repoUrl?: string;
 	command?: string;
 	expiresAt?: string;
