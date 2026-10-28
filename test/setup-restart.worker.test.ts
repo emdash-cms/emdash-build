@@ -336,7 +336,9 @@ describe("setup interrupted by a restart", () => {
 			await instance.onStart();
 			const autoStarts = turns;
 			// Chat recovery scheduled the interrupted turn to run again; run it as the alarm would.
-			const [recovery] = instance.getSchedules();
+			const recovery = instance
+				.getSchedules()
+				.find(({ callback }) => callback === "restartInterruptedTurn");
 			await harness.restartInterruptedTurn(recovery?.payload);
 			const builds = model.doStreamCalls.map(({ tools }) =>
 				tools?.some((tool) => tool.name === "write_file"),
