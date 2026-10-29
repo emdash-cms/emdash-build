@@ -775,6 +775,19 @@ export class SandboxRuntime implements ContainerOps {
 		await this.script(STOP_PROCESS, id, "5").catch(() => undefined);
 	}
 
+	async stopProcesses(prefix: string): Promise<void> {
+		if (!this.container.running) return;
+		// The process directories are the container's process table.
+		const root = this.deps.processRoot ?? PROCESS_ROOT;
+		const listed = await this.exec(`ls ${shellQuote(root)}`, { timeout: 15_000 }).catch(
+			() => undefined,
+		);
+		const ids = listed?.success
+			? listed.stdout.split("\n").filter((id) => id.startsWith(prefix))
+			: [];
+		await Promise.all(ids.map((id) => this.stopProcess(id)));
+	}
+
 	private async tunnelUrl(id: string): Promise<string | undefined> {
 		const found = await this.exec(
 			`grep -o -E ${shellQuote(TUNNEL_URL.source)} ${shellQuote(`${this.dir(id)}/output.log`)}`,

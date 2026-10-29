@@ -1518,6 +1518,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private stopPromise: Promise<void> | null = null;
 	/** Set by restartInterruptedTurn for the one turn it enqueues. */
 	private restartingInterruptedTurn = false;
+	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
+	private recoveringTurn = false;
 
 	private latestUserMessageId(): string | undefined {
 		return [...this.messages].reverse().find((message) => message.role === "user")?.id;
@@ -3433,7 +3435,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				"for attempt in $(seq 1 20); do " +
 				"if ! timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/4321' 2>/dev/null; then exit 0; fi; " +
 				"sleep 0.1; done; exit 1",
-			{ cwd: SITE_PATH, timeout: 5000 },
+			// Not the site's directory: setup stops a server before the site exists.
+			{ timeout: 5000 },
 		);
 		if (!stopped.success) throw new Error("The previous dev server did not stop cleanly.");
 	}
@@ -4933,6 +4936,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				signal,
 			});
 			if (prepared.success) {
+				// Setup interrupted by a restart may have left its dev server running,
+				// which would keep port 4321 and write into the new site's state. A new
+				// instance has lost that server's id, so stop every dev server.
+				await sandbox.stopProcesses(DEV_SERVER_PROCESS_PREFIX);
+				await this.stopDevServer();
 				this.sendConsole(`$ extract prepared ${templateDir}`);
 				const copied = await sandbox.exec(
 					`rm -rf ${SITE_PATH} && mkdir -p ${SITE_PATH} && tar -xzf ${preparedArchive} -C ${SITE_PATH}`,
@@ -7104,6 +7112,53 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return new Response(null);
 	}
 
+	/** Set up a new site in the background; once it is ready, the first build starts. */
+	private startProvisioning(hostname: string): void {
+		this.setState({ ...this.state, provisionError: undefined });
+		this.sendStatus("Setting up your site...");
+		const controller = new AbortController();
+		this.provisionController = controller;
+		const pending = this.withOwnerActivity("provision", () =>
+			this.provisionSite(hostname, controller.signal),
+		);
+		this.provisionPromise = pending;
+		// When provisioning succeeds, trigger a fresh turn so the build
+		// starts on its own. saveMessages waits for any active interview
+		// turn (and any queued user turns) to finish first; the build
+		// path in runChatTurn no-ops this turn if a queued user message
+		// already ran the build by then.
+		pending
+			.then((result) => {
+				if (!result.ready && this.provisionPromise === pending) this.provisionPromise = null;
+				if (
+					shouldAutoStartInitialBuild(
+						result.ready,
+						this.buildStarted,
+						this.state.initialGeneration?.status,
+					)
+				) {
+					this.sendStatus("");
+					return this.saveMessages((messages) => [...messages]);
+				}
+				if (!result.ready && !result.stopped) this.setInitialGenerationStatus("failed");
+				if (
+					["stopping", "stopped", "failed"].includes(this.state.initialGeneration?.status ?? "")
+				) {
+					this.sendStatus("");
+				}
+			})
+			.catch((err) => {
+				if (this.provisionPromise === pending) this.provisionPromise = null;
+				const message = err instanceof Error ? err.message : String(err);
+				this.sendConsole(`ERROR: auto-start build failed: ${message}`);
+				console.error("[BuilderAgent] auto-start build failed:", err);
+			})
+			.finally(() => {
+				if (this.provisionController === controller) this.provisionController = null;
+				this.settledProvision = pending;
+			});
+	}
+
 	override async onChatMessage(
 		onFinish: Parameters<typeof AIChatAgent.prototype.onChatMessage>[0],
 		options?: OnChatMessageOptions,
@@ -7243,51 +7298,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		// provision means a longer interview rather than a stall.
 		if (!this.state.siteReady) {
 			// Kick off provisioning if it isn't running, or retry after a failure.
-			if (!this.provisionPromise || this.state.provisionError) {
-				this.setState({ ...this.state, provisionError: undefined });
-				this.sendStatus("Setting up your site...");
-				const controller = new AbortController();
-				this.provisionController = controller;
-				const pending = this.withOwnerActivity("provision", () =>
-					this.provisionSite(hostname, controller.signal),
-				);
-				this.provisionPromise = pending;
-				// When provisioning succeeds, trigger a fresh turn so the build
-				// starts on its own. saveMessages waits for any active interview
-				// turn (and any queued user turns) to finish first; the build
-				// path below no-ops this turn if a queued user message already
-				// ran the build by then.
-				pending
-					.then((result) => {
-						if (!result.ready && this.provisionPromise === pending) this.provisionPromise = null;
-						if (
-							shouldAutoStartInitialBuild(
-								result.ready,
-								this.buildStarted,
-								this.state.initialGeneration?.status,
-							)
-						) {
-							this.sendStatus("");
-							return this.saveMessages((messages) => [...messages]);
-						}
-						if (!result.ready && !result.stopped) this.setInitialGenerationStatus("failed");
-						if (
-							["stopping", "stopped", "failed"].includes(this.state.initialGeneration?.status ?? "")
-						) {
-							this.sendStatus("");
-						}
-					})
-					.catch((err) => {
-						if (this.provisionPromise === pending) this.provisionPromise = null;
-						const message = err instanceof Error ? err.message : String(err);
-						this.sendConsole(`ERROR: auto-start build failed: ${message}`);
-						console.error("[BuilderAgent] auto-start build failed:", err);
-					})
-					.finally(() => {
-						if (this.provisionController === controller) this.provisionController = null;
-						this.settledProvision = pending;
-					});
-			}
+			if (!this.provisionPromise || this.state.provisionError) this.startProvisioning(hostname);
 			const isUserTurn = this.messages[this.messages.length - 1]?.role === "user";
 			const submission = isUserTurn
 				? readQuestionnaireSubmission(this.messages, this.messages.length - 1)
@@ -7668,6 +7679,31 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (this.state.initialGeneration?.status === "stopping") {
 			this.setInitialGenerationStatus("stopped", this.state.initialGeneration.terminalMessageId);
 		}
+		this.resumeInterruptedSetup();
+	}
+
+	/**
+	 * A new site's setup, and the build it starts once the site is ready, run
+	 * outside any chat turn, so chat recovery does not bring them back after a
+	 * deploy or an eviction. A new instance resumes them itself. A stopped or
+	 * failed first generation waits for the user's next message, and setup
+	 * never runs for a site that was ready: the build turn recovers that one.
+	 */
+	private resumeInterruptedSetup(): void {
+		const status = this.state.initialGeneration?.status;
+		if (!this.getOwnerRecord() || this.provisionPromise) return;
+		if (!this.state.siteReady) {
+			if (status === "preparing" || status === "awaiting_answers") {
+				this.startProvisioning(this.recoveryHostname());
+			}
+			return;
+		}
+		// Ready before the restart, but the build it starts was not under way yet.
+		// An interrupted turn that chat recovery runs again starts it instead.
+		if (status !== "preparing" || this.state.buildStarted || this.recoveringTurn) return;
+		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
+			console.error("[BuilderAgent] auto-start build failed:", error),
+		);
 	}
 
 	/**
@@ -7694,6 +7730,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				{ idempotent: true },
 			);
 		}
+		if (plan !== "skip") this.recoveringTurn = true;
 		return plan === "continue" ? {} : { continue: false };
 	}
 
