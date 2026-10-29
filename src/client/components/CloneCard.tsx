@@ -1,6 +1,7 @@
 import { Popover } from "@cloudflare/kumo";
 import { DownloadSimple } from "@phosphor-icons/react/DownloadSimple";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { EXPORTED_SITE_NODE_VERSIONS } from "../../shared/exported-site.js";
 
 export interface CloneInfo {
 	ok: boolean;
@@ -172,7 +173,7 @@ export function CloneCard({
 					</div>
 					<div className="flex flex-wrap items-center gap-2">
 						<span className="min-w-0 flex-1 text-xs text-text-tertiary">
-							Includes your content and media. Needs Node 22+ and pnpm.
+							Includes your content and media. Needs pnpm and Node {EXPORTED_SITE_NODE_VERSIONS}.
 							{expires ? ` Link expires around ${expires}.` : ""}
 						</span>
 						<button
