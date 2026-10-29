@@ -20,17 +20,15 @@ function lockedNodeRanges(lockfile: string): Map<string, string> {
 	);
 	const ranges = new Map<string, string>();
 	for (const entry of packages.split(/\n(?=  \S)/)) {
+		const name = entry
+			.trim()
+			.split("\n")[0]!
+			.replace(/^'|'?:$/g, "");
 		const node = entry.match(/^ {4}engines: \{[^}]*\bnode: '?([^,}']+)/m)?.[1];
-		const cpu = entry.match(/^ {4}cpu: \[([^\]]*)\]/m)?.[1];
-		// Builds for 32-bit and other rare CPUs never install where a site runs.
-		if (!node || (cpu && !/\b(x64|arm64)\b/.test(cpu))) continue;
-		ranges.set(
-			entry
-				.trim()
-				.split("\n")[0]!
-				.replace(/^'|'?:$/g, ""),
-			node.trim(),
-		);
+		// sharp's optional 32-bit Windows build supports only Node 20, and pnpm
+		// skips an optional build that cannot install.
+		if (!node || name.startsWith("@img/sharp-win32-ia32@")) continue;
+		ranges.set(name, node.trim());
 	}
 	return ranges;
 }
