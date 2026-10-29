@@ -37,8 +37,11 @@ describe("Artifacts Git authentication", () => {
 
 describe("Artifacts clone command", () => {
 	const token = "art_v2_0123abcd_example?expires=1893456000";
+	const inherited = { ...process.env };
+	// A Git hook exports GIT_DIR and GIT_INDEX_FILE, which would aim setup at the caller's repository.
+	for (const key of Object.keys(inherited)) if (key.startsWith("GIT_")) delete inherited[key];
 	const env = {
-		...process.env,
+		...inherited,
 		GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_TERMINAL_PROMPT: "0",
