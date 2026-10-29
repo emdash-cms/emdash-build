@@ -611,8 +611,8 @@ export function scrubStagedContentCommand(stagedPath: string): string {
 }
 
 function viteObjectStart(src: string): number {
-	const viteStart = src.indexOf("vite:");
-	return viteStart === -1 ? -1 : src.indexOf("{", viteStart);
+	const match = /(?:^|[{,])\s*vite\s*:\s*\{/m.exec(src);
+	return match ? match.index + match[0].length - 1 : -1;
 }
 
 /**

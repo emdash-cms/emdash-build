@@ -146,6 +146,10 @@ describe("builder Vite configuration", () => {
 		"export default defineConfig({\n",
 		'export default defineConfig({\n\tsite: "https://example.com",\n',
 	);
+	const commentMentioningVite = scaffold.replace(
+		"\tvite: {",
+		"\t// Tailwind lives in vite: { plugins } so public pages get its styles.\n\tvite: {",
+	);
 	const withoutVite = `import { defineConfig } from "astro/config";
 
 export default defineConfig({
@@ -202,12 +206,24 @@ export default defineConfig({
 		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
 	});
 
+	it("leaves a comment that mentions vite: alone", () => {
+		const vite = loadViteConfig(ensureBuilderViteConfig(commentMentioningVite, deps, excludes));
+		expectBuilderSettings(vite);
+		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
+	});
+
 	it("adds a vite block to a config without one", () => {
 		expectBuilderSettings(loadViteConfig(ensureBuilderViteConfig(withoutVite, deps, excludes)));
 	});
 
 	it("is idempotent", () => {
-		for (const source of [scaffold, savedWithSecondVite, editedAboveSecondVite, withoutVite]) {
+		for (const source of [
+			scaffold,
+			savedWithSecondVite,
+			editedAboveSecondVite,
+			commentMentioningVite,
+			withoutVite,
+		]) {
 			const once = ensureBuilderViteConfig(source, deps, excludes);
 			expect(ensureBuilderViteConfig(once, deps, excludes)).toBe(once);
 		}
