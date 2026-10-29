@@ -37,7 +37,6 @@ describe("Artifacts Git authentication", () => {
 
 describe("Artifacts clone command", () => {
 	const token = "art_v2_0123abcd_example?expires=1893456000";
-	const shells = ["bash", "zsh"].filter((shell) => spawnSync(shell, ["-c", "true"]).status === 0);
 	const env = {
 		...process.env,
 		GIT_CONFIG_GLOBAL: "/dev/null",
@@ -96,13 +95,16 @@ describe("Artifacts clone command", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it.each(shells)(
-		"clones when pasted into %s and keeps the token out of the clone",
-		async (shell) => {
-			const cwd = mkdtempSync(join(root, `${shell}-`));
-			await run(shell, ["-c", artifactsCloneCommand(remote, token)], { cwd, env });
-			expect(readFileSync(join(cwd, "my-site/README.md"), "utf8")).toBe("site\n");
-			expect(readFileSync(join(cwd, "my-site/.git/config"), "utf8")).not.toContain("art_v2_");
-		},
-	);
+	for (const shell of ["bash", "zsh"]) {
+		const installed = spawnSync(shell, ["-c", "true"]).status === 0;
+		it.skipIf(!installed)(
+			`clones when pasted into ${shell} and keeps the token out of the clone`,
+			async () => {
+				const cwd = mkdtempSync(join(root, `${shell}-`));
+				await run(shell, ["-c", artifactsCloneCommand(remote, token)], { cwd, env });
+				expect(readFileSync(join(cwd, "my-site/README.md"), "utf8")).toBe("site\n");
+				expect(readFileSync(join(cwd, "my-site/.git/config"), "utf8")).not.toContain("art_v2_");
+			},
+		);
+	}
 });
