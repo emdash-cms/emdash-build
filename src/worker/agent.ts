@@ -1497,9 +1497,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private consoleBuffer: string[] = [];
 	private devServerErrors: Array<{ at: number; text: string }> = [];
 
-	/** Process id of the running `pnpm dev` server, for a clean restart. */
-	private devServerProcessId?: string;
-
 	/**
 	 * Set when a build turn actually runs. Guards the auto-started build turn
 	 * that fires when background provisioning finishes (turns are otherwise
@@ -3329,7 +3326,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		this.sendConsole(archivedModules.success ? "$ pnpm dev (prepared archive)" : "$ pnpm dev");
 		const devServer = `${DEV_SERVER_PROCESS_PREFIX}${crypto.randomUUID().slice(0, 8)}`;
 		await sandbox.startProcess(devServer, devCommand, { cwd: SITE_PATH });
-		this.devServerProcessId = devServer;
 		const stopOnAbort = () => void sandbox.stopProcess(devServer);
 		signal?.addEventListener("abort", stopOnAbort, { once: true });
 		if (signal?.aborted) stopOnAbort();
@@ -3425,14 +3421,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
-	/** Kill the tracked `pnpm dev` process if running. Safe to call when stopped. */
+	/**
+	 * Stop every dev server the builder started and wait for port 4321 to close.
+	 * Safe to call when stopped. Servers are found by their process ids' prefix:
+	 * after a deploy or an eviction, the new instance has lost the id of the
+	 * server an earlier one started.
+	 */
 	private async stopDevServer(): Promise<void> {
 		const sandbox = this.sandboxOps();
-		if (this.devServerProcessId) await sandbox.stopProcess(this.devServerProcessId);
-		this.devServerProcessId = undefined;
+		await sandbox.stopProcesses(DEV_SERVER_PROCESS_PREFIX);
 		const stopped = await sandbox.exec(
-			"pkill -f '[a]stro dev' || true; " +
-				"for attempt in $(seq 1 20); do " +
+			"for attempt in $(seq 1 20); do " +
 				"if ! timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/4321' 2>/dev/null; then exit 0; fi; " +
 				"sleep 0.1; done; exit 1",
 			// Not the site's directory: setup stops a server before the site exists.
@@ -3442,7 +3441,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
-	 * Cleanly restart the dev server: kill the tracked `pnpm dev` process and
+	 * Cleanly restart the dev server: stop the builder's `pnpm dev` processes and
 	 * start a fresh one. The agent owns the dev-server lifecycle, so this is the
 	 * sanctioned way to pick up a newly-installed dependency or recover a stuck
 	 * server -- the model must never start/kill it via `exec` (port conflicts).
@@ -3464,7 +3463,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.sendConsole(`Warning: dev server restart lost its transport: ${message}`);
-			this.devServerProcessId = undefined;
 			try {
 				const recovered = await abortableWait(
 					this.recoverSite(this.recoveryHostname(), true),
@@ -4937,9 +4935,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			if (prepared.success) {
 				// Setup interrupted by a restart may have left its dev server running,
-				// which would keep port 4321 and write into the new site's state. A new
-				// instance has lost that server's id, so stop every dev server.
-				await sandbox.stopProcesses(DEV_SERVER_PROCESS_PREFIX);
+				// which would keep port 4321 and write into the new site's state.
 				await this.stopDevServer();
 				this.sendConsole(`$ extract prepared ${templateDir}`);
 				const copied = await sandbox.exec(

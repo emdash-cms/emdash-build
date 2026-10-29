@@ -89,23 +89,27 @@ describe("Builder production snapshot preparation", () => {
 		await reset();
 	});
 
-	it("stops an untracked Astro listener before starting another dev server", async () => {
+	it("stops dev servers by their id prefix, then waits for the port to close", async () => {
 		const agent = testEnv.BuilderAgent.getByName(PROJECT_ID);
 		await runInDurableObject(agent, async (instance) => {
 			const exec = vi.fn(async () => ({ success: true, stdout: "", stderr: "" }));
-			const stopProcess = vi.fn(async () => undefined);
+			const stopProcesses = vi.fn(async () => undefined);
 			const harness = instance as unknown as {
-				devServerProcessId?: string;
-				sandboxOps: () => { exec: typeof exec; stopProcess: typeof stopProcess };
+				sandboxOps: () => { exec: typeof exec; stopProcesses: typeof stopProcesses };
 				stopDevServer(): Promise<void>;
 			};
-			harness.devServerProcessId = undefined;
-			harness.sandboxOps = () => ({ exec, stopProcess });
+			harness.sandboxOps = () => ({ exec, stopProcesses });
 
 			await harness.stopDevServer();
 
-			expect(stopProcess).not.toHaveBeenCalled();
-			expect(exec).toHaveBeenCalledWith(expect.stringContaining("pkill"), { timeout: 5000 });
+			expect(stopProcesses).toHaveBeenCalledWith("dev-");
+			expect(exec).toHaveBeenCalledOnce();
+			expect(exec).toHaveBeenCalledWith(expect.stringContaining("/dev/tcp/127.0.0.1/4321"), {
+				timeout: 5000,
+			});
+			expect(stopProcesses.mock.invocationCallOrder[0]).toBeLessThan(
+				exec.mock.invocationCallOrder[0]!,
+			);
 		});
 	});
 
