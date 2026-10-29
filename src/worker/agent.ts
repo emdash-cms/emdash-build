@@ -2560,7 +2560,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
 		const remote = await this.resolveArtifactsRemote(repo);
-		const clone = artifactsCloneCommand(remote, tok.plaintext);
+		const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
 		const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
 		return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
 	}

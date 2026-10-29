@@ -11,8 +11,8 @@ export function artifactsGitEnv(token: string): Record<string, string> {
  * The token goes in a header, not the URL. Its `?expires=` suffix breaks Git's
  * URL parsing and zsh globbing, and a URL credential stays in `.git/config`.
  */
-export function artifactsCloneCommand(remote: string, token: string): string {
-	return `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} my-site`;
+export function artifactsCloneCommand(remote: string, token: string, directory: string): string {
+	return `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} ${directory}`;
 }
 
 export function redactArtifactsToken(text: string): string {

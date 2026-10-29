@@ -101,7 +101,7 @@ describe("Artifacts clone command", () => {
 			`clones when pasted into ${shell} and keeps the token out of the clone`,
 			async () => {
 				const cwd = mkdtempSync(join(root, `${shell}-`));
-				await run(shell, ["-c", artifactsCloneCommand(remote, token)], { cwd, env });
+				await run(shell, ["-c", artifactsCloneCommand(remote, token, "my-site")], { cwd, env });
 				expect(readFileSync(join(cwd, "my-site/README.md"), "utf8")).toBe("site\n");
 				expect(readFileSync(join(cwd, "my-site/.git/config"), "utf8")).not.toContain("art_v2_");
 			},
