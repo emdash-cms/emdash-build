@@ -12,7 +12,38 @@ async function scaffoldNodeRange(): Promise<string> {
 	return manifest.engines.node;
 }
 
+/** `engines.node` of each locked package, keyed by its lockfile name. */
+function lockedNodeRanges(lockfile: string): Map<string, string> {
+	const packages = lockfile.slice(
+		lockfile.indexOf("\npackages:\n"),
+		lockfile.indexOf("\nsnapshots:\n"),
+	);
+	const ranges = new Map<string, string>();
+	for (const entry of packages.split(/\n(?=  \S)/)) {
+		const node = entry.match(/^ {4}engines: \{[^}]*\bnode: '?([^,}']+)/m)?.[1];
+		const cpu = entry.match(/^ {4}cpu: \[([^\]]*)\]/m)?.[1];
+		// Builds for 32-bit and other rare CPUs never install where a site runs.
+		if (!node || (cpu && !/\b(x64|arm64)\b/.test(cpu))) continue;
+		ranges.set(
+			entry
+				.trim()
+				.split("\n")[0]!
+				.replace(/^'|'?:$/g, ""),
+			node.trim(),
+		);
+	}
+	return ranges;
+}
+
 describe("exported site Node requirement", () => {
+	it("accepts no Node version a locked dependency rejects", async () => {
+		const range = await scaffoldNodeRange();
+		const ranges = lockedNodeRanges(await readScaffold("pnpm-lock.yaml"));
+		expect(ranges.size).toBeGreaterThan(0);
+		const rejecting = [...ranges].filter(([, dependency]) => !semver.subset(range, dependency));
+		expect(rejecting).toEqual([]);
+	});
+
 	it("states each Node line the scaffold accepts", async () => {
 		const lines = (await scaffoldNodeRange()).split("||").map((range) => {
 			const floor = semver.minVersion(range)!;
