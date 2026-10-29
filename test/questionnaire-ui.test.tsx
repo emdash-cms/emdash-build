@@ -11,12 +11,20 @@ import type { ClarifyingQuestion } from "../src/shared/questionnaire.js";
 const questions: ClarifyingQuestion[] = [
 	{
 		question: "Which tone fits best?",
-		options: ["Editorial", "Playful"],
+		why: "Sets the type, colour, and voice across every page.",
+		options: [
+			{
+				label: "Editorial",
+				description: "Serif headlines and generous margins, like a print magazine.",
+				recommended: true,
+			},
+			{ label: "Playful", description: "Rounded type and bright colour blocks." },
+		],
 		allow_custom: true,
 	},
 	{
 		question: "Which pages matter most?",
-		options: ["About", "Journal", "Contact"],
+		options: [{ label: "About" }, { label: "Journal" }, { label: "Contact" }],
 		allow_multiple: true,
 		allow_custom: true,
 	},
@@ -98,6 +106,29 @@ describe("ClarifyingQuestions", () => {
 		for (const button of screen.getAllByRole("button")) {
 			expect(button.getAttribute("type")).toBe("button");
 		}
+	});
+
+	it("shows why, descriptions, and the recommendation without preselecting it", async () => {
+		const user = userEvent.setup();
+		renderQuestions();
+
+		const why = screen.getByText("Sets the type, colour, and voice across every page.");
+		expect(screen.getByRole("group").getAttribute("aria-describedby")).toBe(why.id);
+		const editorial = screen.getByRole("radio", { name: "Editorial" }) as HTMLInputElement;
+		expect(editorial.checked).toBe(false);
+		expect(screen.getByRole("button", { name: "Next" }).hasAttribute("disabled")).toBe(true);
+		const description = editorial.getAttribute("aria-describedby")!.split(" ");
+		expect(description.map((id) => document.getElementById(id)?.textContent)).toEqual([
+			"Recommended",
+			"Serif headlines and generous margins, like a print magazine.",
+		]);
+		expect(screen.getAllByText("Recommended")).toHaveLength(1);
+		expect(screen.getByText("Rounded type and bright colour blocks.")).toBeTruthy();
+
+		await user.click(
+			screen.getByText("Serif headlines and generous margins, like a print magazine."),
+		);
+		expect(editorial.checked).toBe(true);
 	});
 
 	it("keeps space between the progress counter and close action", () => {

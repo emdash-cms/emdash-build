@@ -26,7 +26,7 @@ import { ImageSources } from "../src/worker/image-sources.js";
 import { capturedPreviewShotId } from "../src/worker/readiness.js";
 import {
 	createTools,
-	ensurePreviewHmr,
+	ensureBuilderViteConfig,
 	reportingRestores,
 	guardProtectedFiles,
 	MODEL_COMMAND_TIMEOUT_MS,
@@ -114,26 +114,119 @@ describe("preview screenshot", () => {
 	});
 });
 
-describe("preview HMR configuration", () => {
-	const config = `import { defineConfig } from "astro/config";
+describe("builder Vite configuration", () => {
+	const scaffold = readFileSync(
+		new URL("../prototype/builder-cloudflare/astro.config.mjs", import.meta.url),
+		"utf8",
+	);
+	const deps = ["emdash > zod"];
+	const excludes = ["astro/app/manifest"];
+	const savedWithSecondVite = scaffold.replace(
+		"export default defineConfig({",
+		[
+			"const emdashPreviewUrl = process.env.EMDASH_PREVIEW_URL",
+			"\t? new URL(process.env.EMDASH_PREVIEW_URL)",
+			"\t: undefined;",
+			"export default defineConfig({",
+			"\tvite: {",
+			"\t\tserver: emdashPreviewUrl",
+			"\t\t\t? {",
+			"\t\t\t\thmr: {",
+			'\t\t\t\t\tprotocol: emdashPreviewUrl.protocol === "https:" ? "wss" : "ws",',
+			"\t\t\t\t\thost: emdashPreviewUrl.hostname,",
+			"\t\t\t\t\tclientPort: Number(",
+			'\t\t\t\t\t\temdashPreviewUrl.port || (emdashPreviewUrl.protocol === "https:" ? 443 : 80),',
+			"\t\t\t\t\t),",
+			"\t\t\t\t},",
+			"\t\t\t}",
+			'\t\t\t: undefined, ssr: { optimizeDeps: { noDiscovery: true, ignoreOutdatedRequests: true, exclude: ["astro/app/manifest"], include: ["emdash > zod"] } } },',
+		].join("\n"),
+	);
+	const editedAboveSecondVite = savedWithSecondVite.replace(
+		"export default defineConfig({\n",
+		'export default defineConfig({\n\tsite: "https://example.com",\n',
+	);
+	const commentMentioningVite = scaffold.replace(
+		"\tvite: {",
+		"\t// Tailwind lives in vite: { plugins } so public pages get its styles.\n\tvite: {",
+	);
+	const withoutVite = `import { defineConfig } from "astro/config";
 
 export default defineConfig({
-	vite: {
-		ssr: { optimizeDeps: { include: [] } },
-	},
+	output: "server",
 });`;
 
-	it("routes the Vite client through the session preview URL", () => {
-		const output = ensurePreviewHmr(config);
-		expect(output).toContain("process.env.EMDASH_PREVIEW_URL");
-		expect(output).toContain('protocol: emdashPreviewUrl.protocol === "https:" ? "wss" : "ws"');
-		expect(output).toContain("host: emdashPreviewUrl.hostname");
-		expect(output).toContain("clientPort: Number(");
+	function loadViteConfig(source: string) {
+		const imports = [...source.matchAll(/^import\s+(.+?)\s+from\s+"[^"]+";$/gm)].flatMap(
+			([, clause = ""]) =>
+				clause
+					.replace(/[{}]/g, "")
+					.split(",")
+					.map((name) => name.trim()),
+		);
+		const stubs = imports.map((name) =>
+			name === "defineConfig"
+				? "const defineConfig = (config) => config;"
+				: `const ${name} = (...args) => ({ ${name}: args });`,
+		);
+		const body = source.replace(/^import\s.+;$/gm, "").replace("export default", "return");
+		const env = { EMDASH_PREVIEW_URL: "https://4321-project-token.build.example.com/" };
+		return new Function("process", [...stubs, body].join("\n"))({ env }).vite;
+	}
+
+	function expectBuilderSettings(vite: { server?: unknown; ssr?: unknown }) {
+		expect(vite.server).toEqual({
+			hmr: { protocol: "wss", host: "4321-project-token.build.example.com", clientPort: 443 },
+		});
+		expect(vite.ssr).toEqual({
+			optimizeDeps: {
+				noDiscovery: true,
+				ignoreOutdatedRequests: true,
+				exclude: excludes,
+				include: deps,
+			},
+		});
+	}
+
+	it("keeps the scaffold's Vite plugins alongside preview HMR and the SSR optimizer", () => {
+		const vite = loadViteConfig(ensureBuilderViteConfig(scaffold, deps, excludes));
+		expectBuilderSettings(vite);
+		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
+	});
+
+	it("repairs a saved config whose builder settings sit in a second vite key", () => {
+		const vite = loadViteConfig(ensureBuilderViteConfig(savedWithSecondVite, deps, excludes));
+		expectBuilderSettings(vite);
+		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
+	});
+
+	it("repairs a saved config edited above its second vite key", () => {
+		const vite = loadViteConfig(ensureBuilderViteConfig(editedAboveSecondVite, deps, excludes));
+		expectBuilderSettings(vite);
+		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
+	});
+
+	it("leaves a comment that mentions vite: alone", () => {
+		const vite = loadViteConfig(ensureBuilderViteConfig(commentMentioningVite, deps, excludes));
+		expectBuilderSettings(vite);
+		expect(vite.plugins).toEqual([{ tailwindcss: [] }]);
+	});
+
+	it("adds a vite block to a config without one", () => {
+		expectBuilderSettings(loadViteConfig(ensureBuilderViteConfig(withoutVite, deps, excludes)));
 	});
 
 	it("is idempotent", () => {
-		const once = ensurePreviewHmr(config);
-		expect(ensurePreviewHmr(once)).toBe(once);
+		for (const source of [
+			scaffold,
+			savedWithSecondVite,
+			editedAboveSecondVite,
+			commentMentioningVite,
+			withoutVite,
+		]) {
+			const once = ensureBuilderViteConfig(source, deps, excludes);
+			expect(ensureBuilderViteConfig(once, deps, excludes)).toBe(once);
+		}
 	});
 });
 

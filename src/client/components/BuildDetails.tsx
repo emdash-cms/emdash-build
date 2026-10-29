@@ -152,12 +152,14 @@ function parseSetupAnswers(text: string) {
 	].map((match) => ({ question: match[1]?.trim() ?? "", answer: match[2]?.trim() ?? "" }));
 }
 
+/** The visual direction when a question names it; otherwise the first answer beyond the name. */
 export function setupAnswerSummaryForDetails(messages: ChatMessage[], selectedId: string | null) {
 	const text = setupAnswerForDetails(messages, selectedId);
 	if (!text) return undefined;
 	const answers = parseSetupAnswers(text);
 	return (
-		answers.find(({ question }) => /\b(design|direction|style|visual)\b/i.test(question)) ??
+		answers.find(({ question }) => /\b(design|direction|style|visual|look)\b/i.test(question)) ??
+		answers.find(({ question }) => !/\b(name|called)\b/i.test(question)) ??
 		answers[0]
 	);
 }

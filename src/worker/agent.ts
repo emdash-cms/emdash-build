@@ -22,7 +22,7 @@ import {
 	type ConnectionContext,
 	type WSMessage,
 } from "agents";
-import { artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
+import { artifactsCloneCommand, artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
 import {
 	isAdminPreviewPath,
 	normalizePreviewPath,
@@ -53,8 +53,7 @@ import {
 	scrubStagedContentCommand,
 	stripStorageFromAstroConfig,
 	stripR2FromWrangler,
-	ensureSsrOptimizeDep,
-	ensurePreviewHmr,
+	ensureBuilderViteConfig,
 	previewScreenshotCommand,
 	readFilesFromSandbox,
 	refreshLiveTypes,
@@ -77,6 +76,7 @@ import {
 } from "./readiness.js";
 import { equalTokenDigest } from "./project-auth.js";
 import type { ClientRecoveryState } from "../shared/client-recovery.js";
+import { EXPORTED_SITE_NODE_VERSIONS } from "../shared/exported-site.js";
 import { previewTokenForRoute, previewTokenFromUrl } from "./recovery.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
 import {
@@ -257,13 +257,11 @@ interface CloneInfo {
 	ok: boolean;
 	/** Why the clone is unavailable (only when `ok` is false). */
 	reason?: string;
-	/** Git remote with the read token embedded as basic-auth (only when `ok`). */
-	cloneUrl?: string;
 	/** Tokenless remote, for reference. */
 	repoUrl?: string;
 	/** Full paste-ready command block (clone + cd + install + dev). */
 	command?: string;
-	/** ISO timestamp when the embedded read token expires. */
+	/** ISO timestamp when the command's read token expires. */
 	expiresAt?: string;
 }
 
@@ -369,7 +367,7 @@ Astro + EmDash project. Your content and uploaded media come along (in
 
 ## Run it locally
 
-You need Node 22+ and pnpm.
+You need pnpm and Node ${EXPORTED_SITE_NODE_VERSIONS}.
 
 \`\`\`sh
 pnpm install
@@ -2541,8 +2539,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * Mint a short-lived read token and return a ready-to-run `git clone`
 	 * command for this session's source (the Artifacts repo). Called by the
 	 * client on demand -- the token is returned only to the caller, never
-	 * broadcast or persisted, and the embedded read token expires within the
-	 * hour. The clone contains the full site plus its local D1/R2 state, so
+	 * broadcast or persisted, and the read token expires within the hour.
+	 * The clone contains the full site plus its local D1/R2 state, so
 	 * `pnpm install && pnpm dev` boots it with content in place.
 	 *
 	 * Registered as a client-callable via `callable()` at the bottom of this
@@ -2564,12 +2562,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
 		const remote = await this.resolveArtifactsRemote(repo);
-		// Artifacts accepts the token as the basic-auth password (the username
-		// is ignored), per the docs: https://x:<token>@.../repo.git. This keeps
-		// the user's clone to a single paste with no header gymnastics.
-		const cloneUrl = remote.replace(/^https:\/\//, `https://x:${tok.plaintext}@`);
-		const command = `git clone ${cloneUrl} my-site\ncd my-site\npnpm install\npnpm dev`;
-		return { ok: true, cloneUrl, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
+		const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
+		return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
 	}
 
 	/**
@@ -3283,8 +3278,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const cfg = await sandbox.readFile(astroPath, { encoding: "utf-8" });
 		if (!cfg.success) return;
 		const base = stripSandboxPlugin ? stripSandboxFromAstroConfig(cfg.content) : cfg.content;
-		const optimized = ensureSsrOptimizeDep(base, SSR_OPTIMIZE_DEPS, SSR_OPTIMIZE_EXCLUDES);
-		const patched = ensurePreviewHmr(optimized);
+		const patched = ensureBuilderViteConfig(base, SSR_OPTIMIZE_DEPS, SSR_OPTIMIZE_EXCLUDES);
 		if (patched !== cfg.content) await sandbox.writeFile(astroPath, patched);
 	}
 
@@ -3509,19 +3503,23 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?.throwIfAborted();
 		this.sendStatus("Connecting to CMS...");
 		const mcpUrl = `${exposedUrl}_emdash/api/mcp`;
+		// An attempt can wait out the client's own timeouts, so retrying stops after half
+		// a minute as well as after ten attempts.
+		const retryUntil = Date.now() + 30_000;
 
-		const existingServers = this.getMcpServers();
-		for (const [id] of Object.entries(existingServers.servers)) {
-			signal?.throwIfAborted();
-			try {
-				await this.removeMcpServer(id);
-			} catch {
-				// ignore
-			}
-		}
 		try {
 			await this.retry(
-				() => {
+				async () => {
+					// Each attempt starts clean: addMcpServer would otherwise return the server a
+					// failed attempt left registered, with no tools, or refuse one that never connected.
+					for (const id of Object.keys(this.getMcpServers().servers)) {
+						signal?.throwIfAborted();
+						try {
+							await this.removeMcpServer(id);
+						} catch {
+							// ignore
+						}
+					}
 					signal?.throwIfAborted();
 					return this.addMcpServer("emdash", mcpUrl, {
 						transport: {
@@ -3530,7 +3528,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						},
 					});
 				},
-				{ maxAttempts: 10, baseDelayMs: 3000, maxDelayMs: 3000 },
+				{
+					maxAttempts: 10,
+					baseDelayMs: 3000,
+					maxDelayMs: 3000,
+					shouldRetry: () => !signal?.aborted && Date.now() < retryUntil,
+				},
 			);
 			signal?.throwIfAborted();
 			this.sendConsole("Connected to EmDash MCP server.");
@@ -3605,7 +3608,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const exposed = await this.exposePreview(hostname);
 			const tunnelChanged =
 				this.usesQuickTunnelPreview() && previousUrl !== undefined && previousUrl !== exposed.url;
-			if (workerEntryChanged || tunnelChanged) {
+			const restarted = workerEntryChanged || tunnelChanged;
+			if (restarted) {
 				this.sendConsole(
 					workerEntryChanged
 						? "Applying the current protected preview runtime..."
@@ -3615,7 +3619,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				await this.startDevServer(exposed.url);
 			}
 			await this.refreshPreviewCache("/", true);
-			if (this.recoveryReconnectMcp) {
+			const reconnectRequested = this.recoveryReconnectMcp;
+			if (reconnectRequested) {
 				const token = this.getApiToken();
 				if (token && !(await this.connectMcp(exposed.url, token))) {
 					return { ready: false, error: "The CMS connection did not recover.", untouched: true };
@@ -3630,6 +3635,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			this.markMilestone("previewReady");
 			this.broadcast(JSON.stringify({ type: "reload" }));
+			if (restarted && !reconnectRequested) {
+				// After a builder restart the saved connection reconnects in the background,
+				// which can fail while the server is down, and a new tunnel moves the server.
+				// As after a restore, the preview is back first and a failed reconnect leaves it so.
+				const token = this.getApiToken();
+				if (token) await this.connectMcp(exposed.url, token);
+			}
 			return { ready: true, previewUrl: exposed.url };
 		}
 
@@ -7418,7 +7430,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			// ai-chat waits for MCP only before a client's message, not before a turn
 			// that chat recovery runs again. After a restart the saved connection
-			// reconnects in the background, which a warm recovery leaves to it.
+			// reconnects in the background, which a recovery that keeps the dev server
+			// leaves to it.
 			await unlessAborted(this.mcp.waitForConnections(this.waitForMcpConnections), abortSignal);
 			if (abortSignal?.aborted) {
 				markChatTurnFinished(this);

@@ -610,6 +610,11 @@ export function scrubStagedContentCommand(stagedPath: string): string {
 	);
 }
 
+function viteObjectStart(src: string): number {
+	const match = /(?:^|[{,])\s*vite\s*:\s*\{/m.exec(src);
+	return match ? match.index + match[0].length - 1 : -1;
+}
+
 /**
  * Configure the astro.config SSR dependency optimizer for stable Worker dev.
  *
@@ -619,16 +624,8 @@ export function scrubStagedContentCommand(stagedPath: string): string {
  * Pre-bundle the one CJS dependency EmDash needs, disable further discovery,
  * and tolerate an already-issued request for an older graph while the explicit
  * bundle settles.
- *
- * Merges into an existing include array when present (the marketing template
- * already has one for astro-iconset) and inserts a fresh `vite` block
- * otherwise. Idempotent: deps and options already present are left alone.
  */
-export function ensureSsrOptimizeDep(
-	src: string,
-	deps: string[],
-	excludedDeps: string[] = [],
-): string {
+function ensureSsrOptimizeDep(src: string, deps: string[], excludedDeps: string[] = []): string {
 	let output = src;
 	const missing = deps.filter((d) => !output.includes(`"${d}"`));
 	const list = missing.map((d) => `"${d}"`).join(", ");
@@ -666,9 +663,14 @@ export function ensureSsrOptimizeDep(
 		}
 		return output;
 	}
+	const optimizeDeps = `{ noDiscovery: true, ignoreOutdatedRequests: true, exclude: [${missingExcludes.map((d) => `"${d}"`).join(", ")}], include: [${list}] }`;
+	const viteObject = viteObjectStart(output);
+	if (viteObject !== -1) {
+		return `${output.slice(0, viteObject + 1)}\n\t\tssr: { optimizeDeps: ${optimizeDeps} },${output.slice(viteObject + 1)}`;
+	}
 	return output.replace(
 		/defineConfig\(\s*\{/,
-		`defineConfig({\n\tvite: { ssr: { optimizeDeps: { noDiscovery: true, ignoreOutdatedRequests: true, exclude: [${missingExcludes.map((d) => `"${d}"`).join(", ")}], include: [${list}] } } },`,
+		`defineConfig({\n\tvite: { ssr: { optimizeDeps: ${optimizeDeps} } },`,
 	);
 }
 
@@ -677,7 +679,7 @@ export function ensureSsrOptimizeDep(
  * instead of trying the container-local `localhost:4321`. The preview URL is
  * supplied in `.dev.vars` before Astro starts and differs per session.
  */
-export function ensurePreviewHmr(src: string): string {
+function ensurePreviewHmr(src: string): string {
 	if (src.includes("EMDASH_PREVIEW_URL")) return src;
 	const declaration = [
 		"const emdashPreviewUrl = process.env.EMDASH_PREVIEW_URL",
@@ -689,8 +691,7 @@ export function ensurePreviewHmr(src: string): string {
 		"export default defineConfig(",
 		`${declaration}export default defineConfig(`,
 	);
-	const viteStart = output.indexOf("vite:");
-	const objectStart = viteStart === -1 ? -1 : output.indexOf("{", viteStart);
+	const objectStart = viteObjectStart(output);
 	if (objectStart === -1) return output;
 	const hmr = [
 		"",
@@ -707,6 +708,43 @@ export function ensurePreviewHmr(src: string): string {
 		"\t\t\t: undefined,",
 	].join("\n");
 	return `${output.slice(0, objectStart + 1)}${hmr}${output.slice(objectStart + 1)}`;
+}
+
+const LEGACY_PREVIEW_URL_DECLARATION = [
+	"const emdashPreviewUrl = process.env.EMDASH_PREVIEW_URL",
+	"\t? new URL(process.env.EMDASH_PREVIEW_URL)",
+	"\t: undefined;",
+	"",
+].join("\n");
+
+const LEGACY_VITE_ENTRY = [
+	"\tvite: {",
+	"\t\tserver: emdashPreviewUrl",
+	"\t\t\t? {",
+	"\t\t\t\thmr: {",
+	'\t\t\t\t\tprotocol: emdashPreviewUrl.protocol === "https:" ? "wss" : "ws",',
+	"\t\t\t\t\thost: emdashPreviewUrl.hostname,",
+	"\t\t\t\t\tclientPort: Number(",
+	'\t\t\t\t\t\temdashPreviewUrl.port || (emdashPreviewUrl.protocol === "https:" ? 443 : 80),',
+	"\t\t\t\t\t),",
+	"\t\t\t\t},",
+	"\t\t\t}",
+	'\t\t\t: undefined, ssr: { optimizeDeps: { noDiscovery: true, ignoreOutdatedRequests: true, exclude: ["astro/app/manifest"], include: ["emdash > zod"] } } },',
+	"",
+].join("\n");
+
+function dropLegacyViteEntry(src: string): string {
+	if (!src.includes(LEGACY_VITE_ENTRY)) return src;
+	return src.replace(LEGACY_VITE_ENTRY, "").replace(LEGACY_PREVIEW_URL_DECLARATION, "");
+}
+
+/** Reapply the builder's Vite settings that model-authored config edits must keep. */
+export function ensureBuilderViteConfig(
+	src: string,
+	deps: string[],
+	excludedDeps: string[],
+): string {
+	return ensurePreviewHmr(ensureSsrOptimizeDep(dropLegacyViteEntry(src), deps, excludedDeps));
 }
 
 /**
