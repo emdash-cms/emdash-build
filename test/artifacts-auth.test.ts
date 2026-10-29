@@ -38,10 +38,19 @@ describe("Artifacts Git authentication", () => {
 describe("Artifacts clone command", () => {
 	const token = "art_v2_0123abcd_example?expires=1893456000";
 	const shells = ["bash", "zsh"].filter((shell) => spawnSync(shell, ["-c", "true"]).status === 0);
+	const env = {
+		...process.env,
+		GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_TERMINAL_PROMPT: "0",
+		// The test server speaks plain HTTP, so Git maps the https remote onto it.
+		GIT_CONFIG_COUNT: "1",
+		GIT_CONFIG_KEY_0: "url.http://.insteadOf",
+		GIT_CONFIG_VALUE_0: "https://",
+	};
 	let root: string;
 	let server: Server;
 	let remote: string;
-	let env: NodeJS.ProcessEnv;
 
 	beforeAll(async () => {
 		root = mkdtempSync(join(tmpdir(), "emdash-clone-"));
@@ -60,7 +69,7 @@ describe("Artifacts clone command", () => {
 					"git -C session.git update-server-info",
 				].join("\n"),
 			],
-			{ cwd: root },
+			{ cwd: root, env },
 		);
 
 		// Artifacts accepts the read token as a bearer header or as the basic-auth password.
@@ -78,20 +87,10 @@ describe("Artifacts clone command", () => {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const { port } = server.address() as AddressInfo;
 		remote = `https://127.0.0.1:${port}/session.git`;
-		// The test server speaks plain HTTP, so Git maps the https remote onto it.
-		env = {
-			...process.env,
-			GIT_CONFIG_GLOBAL: "/dev/null",
-			GIT_CONFIG_NOSYSTEM: "1",
-			GIT_TERMINAL_PROMPT: "0",
-			GIT_CONFIG_COUNT: "1",
-			GIT_CONFIG_KEY_0: "url.http://.insteadOf",
-			GIT_CONFIG_VALUE_0: "https://",
-		};
 	});
 
 	afterAll(async () => {
-		await new Promise((resolve) => server?.close(resolve));
+		if (server) await new Promise((resolve) => server.close(resolve));
 		rmSync(root, { recursive: true, force: true });
 	});
 
