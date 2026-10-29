@@ -6,7 +6,6 @@ import { EXPORTED_SITE_NODE_VERSIONS } from "../../shared/exported-site.js";
 export interface CloneInfo {
 	ok: boolean;
 	reason?: string;
-	cloneUrl?: string;
 	repoUrl?: string;
 	command?: string;
 	expiresAt?: string;

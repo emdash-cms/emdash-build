@@ -22,7 +22,7 @@ import {
 	type ConnectionContext,
 	type WSMessage,
 } from "agents";
-import { artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
+import { artifactsCloneCommand, artifactsGitEnv, redactArtifactsToken } from "./artifacts-auth.js";
 import {
 	isAdminPreviewPath,
 	normalizePreviewPath,
@@ -257,13 +257,11 @@ interface CloneInfo {
 	ok: boolean;
 	/** Why the clone is unavailable (only when `ok` is false). */
 	reason?: string;
-	/** Git remote with the read token embedded as basic-auth (only when `ok`). */
-	cloneUrl?: string;
 	/** Tokenless remote, for reference. */
 	repoUrl?: string;
 	/** Full paste-ready command block (clone + cd + install + dev). */
 	command?: string;
-	/** ISO timestamp when the embedded read token expires. */
+	/** ISO timestamp when the command's read token expires. */
 	expiresAt?: string;
 }
 
@@ -2539,8 +2537,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * Mint a short-lived read token and return a ready-to-run `git clone`
 	 * command for this session's source (the Artifacts repo). Called by the
 	 * client on demand -- the token is returned only to the caller, never
-	 * broadcast or persisted, and the embedded read token expires within the
-	 * hour. The clone contains the full site plus its local D1/R2 state, so
+	 * broadcast or persisted, and the read token expires within the hour.
+	 * The clone contains the full site plus its local D1/R2 state, so
 	 * `pnpm install && pnpm dev` boots it with content in place.
 	 *
 	 * Registered as a client-callable via `callable()` at the bottom of this
@@ -2562,12 +2560,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
 		const remote = await this.resolveArtifactsRemote(repo);
-		// Artifacts accepts the token as the basic-auth password (the username
-		// is ignored), per the docs: https://x:<token>@.../repo.git. This keeps
-		// the user's clone to a single paste with no header gymnastics.
-		const cloneUrl = remote.replace(/^https:\/\//, `https://x:${tok.plaintext}@`);
-		const command = `git clone ${cloneUrl} my-site\ncd my-site\npnpm install\npnpm dev`;
-		return { ok: true, cloneUrl, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
+		const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
+		return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
 	}
 
 	/**
