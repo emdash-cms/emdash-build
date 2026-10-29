@@ -43,6 +43,8 @@ describe("Artifacts clone command", () => {
 		GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_TERMINAL_PROMPT: "0",
+		NO_PROXY: "127.0.0.1",
+		no_proxy: "127.0.0.1",
 		// The test server speaks plain HTTP, so Git maps the https remote onto it.
 		GIT_CONFIG_COUNT: "1",
 		GIT_CONFIG_KEY_0: "url.http://.insteadOf",
