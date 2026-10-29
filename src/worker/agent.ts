@@ -3500,19 +3500,23 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		signal?.throwIfAborted();
 		this.sendStatus("Connecting to CMS...");
 		const mcpUrl = `${exposedUrl}_emdash/api/mcp`;
+		// An attempt can wait out the client's own timeouts, so retrying stops after half
+		// a minute as well as after ten attempts.
+		const retryUntil = Date.now() + 30_000;
 
-		const existingServers = this.getMcpServers();
-		for (const [id] of Object.entries(existingServers.servers)) {
-			signal?.throwIfAborted();
-			try {
-				await this.removeMcpServer(id);
-			} catch {
-				// ignore
-			}
-		}
 		try {
 			await this.retry(
-				() => {
+				async () => {
+					// Each attempt starts clean: addMcpServer would otherwise return the server a
+					// failed attempt left registered, with no tools, or refuse one that never connected.
+					for (const id of Object.keys(this.getMcpServers().servers)) {
+						signal?.throwIfAborted();
+						try {
+							await this.removeMcpServer(id);
+						} catch {
+							// ignore
+						}
+					}
 					signal?.throwIfAborted();
 					return this.addMcpServer("emdash", mcpUrl, {
 						transport: {
@@ -3521,7 +3525,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 						},
 					});
 				},
-				{ maxAttempts: 10, baseDelayMs: 3000, maxDelayMs: 3000 },
+				{
+					maxAttempts: 10,
+					baseDelayMs: 3000,
+					maxDelayMs: 3000,
+					shouldRetry: () => !signal?.aborted && Date.now() < retryUntil,
+				},
 			);
 			signal?.throwIfAborted();
 			this.sendConsole("Connected to EmDash MCP server.");
@@ -3596,7 +3605,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const exposed = await this.exposePreview(hostname);
 			const tunnelChanged =
 				this.usesQuickTunnelPreview() && previousUrl !== undefined && previousUrl !== exposed.url;
-			if (workerEntryChanged || tunnelChanged) {
+			const restarted = workerEntryChanged || tunnelChanged;
+			if (restarted) {
 				this.sendConsole(
 					workerEntryChanged
 						? "Applying the current protected preview runtime..."
@@ -3606,7 +3616,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				await this.startDevServer(exposed.url);
 			}
 			await this.refreshPreviewCache("/", true);
-			if (this.recoveryReconnectMcp) {
+			const reconnectRequested = this.recoveryReconnectMcp;
+			if (reconnectRequested) {
 				const token = this.getApiToken();
 				if (token && !(await this.connectMcp(exposed.url, token))) {
 					return { ready: false, error: "The CMS connection did not recover.", untouched: true };
@@ -3621,6 +3632,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			this.markMilestone("previewReady");
 			this.broadcast(JSON.stringify({ type: "reload" }));
+			if (restarted && !reconnectRequested) {
+				// After a builder restart the saved connection reconnects in the background,
+				// which can fail while the server is down, and a new tunnel moves the server.
+				// As after a restore, the preview is back first and a failed reconnect leaves it so.
+				const token = this.getApiToken();
+				if (token) await this.connectMcp(exposed.url, token);
+			}
 			return { ready: true, previewUrl: exposed.url };
 		}
 
@@ -7398,6 +7416,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.recordTurnMetrics(metrics.finish("error", { error: recovered.error }));
 					return this.errorTurn(friendlyTurnError(recovered.error));
 				}
+			}
+			// ai-chat waits for MCP only before a client's message, not before a turn
+			// that chat recovery runs again. After a restart the saved connection
+			// reconnects in the background, which a recovery that keeps the dev server
+			// leaves to it.
+			await unlessAborted(this.mcp.waitForConnections(this.waitForMcpConnections), abortSignal);
+			if (abortSignal?.aborted) {
+				markChatTurnFinished(this);
+				return this.finishNoopChat(options?.requestId);
 			}
 			this.sendStatus("");
 

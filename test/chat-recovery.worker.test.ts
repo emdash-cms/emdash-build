@@ -2,6 +2,7 @@ import { env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatRecoveryContext, ChatRecoveryOptions } from "@cloudflare/ai-chat";
 import type { UIMessage } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
 import type { BuilderAgent } from "../src/worker/agent.js";
 import { markChatTurnFinished } from "../src/worker/turn-gate.js";
 import { TurnMetrics } from "../src/worker/turn-metrics.js";
@@ -20,6 +21,60 @@ interface RecoveryHarness {
 	saveMessages(update: (messages: UIMessage[]) => UIMessage[]): Promise<unknown>;
 	registerProjectForCurrentOwner(): Promise<void>;
 	waitUntilStable(options: { timeout: number }): Promise<boolean>;
+}
+
+interface RecoveredBuildHarness extends RecoveryHarness {
+	_chatRecoveryContinue(data?: { targetAssistantId?: string }): Promise<void>;
+	backupSite(): Promise<string | undefined>;
+	createTurnModel(): unknown;
+	getMcpServers(): unknown;
+	loadTemplateGuidance(): Promise<string | undefined>;
+	provisionSite(): Promise<{ ready: boolean }>;
+}
+
+/** An established site whose edit was under way when the instance went. */
+async function leaveEditUnderWay(instance: BuilderAgent, partial?: UIMessage) {
+	await instance.persistMessages([
+		{ id: "brief", role: "user", parts: [{ type: "text", text: "Build a bakery site" }] },
+		{ id: "built", role: "assistant", parts: [{ type: "text", text: "Built the site." }] },
+		{ id: "edit", role: "user", parts: [{ type: "text", text: "Add an events page" }] },
+		...(partial ? [partial] : []),
+	]);
+	instance.setState({
+		...instance.state,
+		siteReady: true,
+		buildStarted: true,
+		complete: true,
+		initialGeneration: { id: "brief", status: "ready" },
+	});
+}
+
+/** Reports the tools each model call offers, and replies with text. */
+function replyModel(onCall: (toolNames: string[]) => void) {
+	return new MockLanguageModelV3({
+		doStream: async ({ tools }) => {
+			onCall((tools ?? []).map((tool) => tool.name));
+			return {
+				stream: new ReadableStream({
+					start(controller) {
+						controller.enqueue({ type: "stream-start", warnings: [] });
+						controller.enqueue({ type: "text-start", id: "reply" });
+						controller.enqueue({ type: "text-delta", id: "reply", delta: "Added the page." });
+						controller.enqueue({ type: "text-end", id: "reply" });
+						controller.enqueue({
+							type: "finish",
+							finishReason: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+								outputTokens: { total: 1, text: 1, reasoning: 0 },
+							},
+						});
+						controller.close();
+					},
+				}),
+			};
+		},
+	});
 }
 
 describe("chat recovery", () => {
@@ -265,5 +320,120 @@ describe("chat recovery", () => {
 			expect(observed).toEqual([true, false]);
 			expect(harness.restartingInterruptedTurn).toBe(false);
 		});
+	});
+
+	it.each<{
+		plan: string;
+		id: string;
+		partial?: UIMessage;
+		recover(harness: RecoveredBuildHarness): Promise<void>;
+	}>([
+		{
+			plan: "restart",
+			id: "11111111-1111-4111-8111-00000000000c",
+			recover: (harness) =>
+				harness.restartInterruptedTurn({ afterMessageId: "edit", pastGate: true }),
+		},
+		{
+			plan: "retry",
+			id: "11111111-1111-4111-8111-00000000000d",
+			recover: (harness) =>
+				harness.restartInterruptedTurn({ afterMessageId: "edit", pastGate: false }),
+		},
+		{
+			plan: "continue",
+			id: "11111111-1111-4111-8111-00000000000e",
+			partial: {
+				id: "partial",
+				role: "assistant",
+				parts: [{ type: "text", text: "Adding an events page." }],
+			},
+			recover: (harness) => harness._chatRecoveryContinue({ targetAssistantId: "partial" }),
+		},
+	])(
+		"waits for MCP to reconnect before a recovered build reads its tools: $plan",
+		async ({ id, partial, recover }) => {
+			const agent = testEnv.BuilderAgent.getByName(id);
+			await agent.initializeOwnership(`guest-${id}`);
+			const steps = await runInDurableObject(agent, async (instance) => {
+				const harness = instance as unknown as RecoveredBuildHarness;
+				await leaveEditUnderWay(instance, partial);
+				const steps: unknown[] = [];
+				// The container is warm, so recovery leaves the saved CMS connection to its
+				// background reconnect, which is still under way.
+				harness.provisionSite = async () => {
+					steps.push("recover the site");
+					return { ready: true };
+				};
+				let reconnected = false;
+				(
+					instance.mcp as { waitForConnections(options?: unknown): Promise<void> }
+				).waitForConnections = async (options) => {
+					steps.push(["wait for MCP", options]);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					reconnected = true;
+				};
+				const cmsTool = { name: "schema_list_collections", inputSchema: { type: "object" } };
+				harness.getMcpServers = () => ({
+					prompts: [],
+					resources: [],
+					servers: {},
+					tools: reconnected ? [cmsTool] : [],
+				});
+				harness.loadTemplateGuidance = async () => undefined;
+				harness.backupSite = async () => undefined;
+				harness.createTurnModel = () => replyModel((tools) => steps.push(["build with", tools]));
+
+				await recover(harness);
+				return steps;
+			});
+
+			// The wait comes after recovery, which reconnects MCP itself on a cold site.
+			expect(steps).toEqual([
+				"recover the site",
+				["wait for MCP", { timeout: 20_000 }],
+				["build with", expect.arrayContaining(["schema_list_collections"])],
+			]);
+		},
+	);
+
+	it("ends a build stopped while it waits for MCP, before it builds its tools", async () => {
+		const id = "11111111-1111-4111-8111-00000000000f";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(`guest-${id}`);
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as RecoveredBuildHarness;
+			await leaveEditUnderWay(instance);
+			const steps: string[] = [];
+			const stop = new AbortController();
+			harness.provisionSite = async () => {
+				steps.push("recover the site");
+				return { ready: true };
+			};
+			// The reconnect hangs, and the user stops the turn while it waits.
+			(
+				instance.mcp as { waitForConnections(options?: unknown): Promise<void> }
+			).waitForConnections = () => {
+				steps.push("wait for MCP");
+				setTimeout(() => stop.abort(), 0);
+				return new Promise<void>(() => {});
+			};
+			harness.getMcpServers = () => {
+				steps.push("read the CMS tools");
+				return { prompts: [], resources: [], servers: {}, tools: [] };
+			};
+			harness.createTurnModel = () => {
+				steps.push("call the model");
+				return replyModel(() => {});
+			};
+
+			const reply = await instance.onChatMessage(async () => {}, {
+				requestId: "stopped-edit",
+				abortSignal: stop.signal,
+			});
+			return { steps, reply: await reply.text() };
+		});
+
+		expect(outcome).toEqual({ steps: ["recover the site", "wait for MCP"], reply: "" });
 	});
 });
