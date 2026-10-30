@@ -173,7 +173,6 @@ describe("setup interrupted by a restart", () => {
 					const success = !command.startsWith("rm -rf");
 					return { success, exitCode: success ? 0 : 1, stdout: "", stderr: "" };
 				},
-				stopProcess: async () => {},
 				stopProcesses: async (prefix: string) => void steps.push({ step: `stop ${prefix}*` }),
 			});
 			await expect(harness.provisionSite("localhost:5173")).resolves.toMatchObject({
@@ -186,8 +185,11 @@ describe("setup interrupted by a restart", () => {
 		const extract = steps.findIndex(({ step }) => step.startsWith("rm -rf"));
 		expect(stop).toBeGreaterThanOrEqual(0);
 		expect(stop).toBeLessThan(extract);
-		// Before extraction there may be no site directory to run in.
-		expect(steps.find(({ step }) => step.includes("pkill"))?.cwd).toBeUndefined();
+		// Before extraction there may be no site directory to run the port check in.
+		expect(steps.find(({ step }) => step.includes("/dev/tcp/127.0.0.1/4321"))).toEqual({
+			step: expect.any(String),
+			cwd: undefined,
+		});
 	});
 
 	it("does not set up again when a message arrives during resumed setup", async () => {
