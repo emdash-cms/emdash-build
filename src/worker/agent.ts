@@ -1714,8 +1714,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const pinnedShotId = this.state.initialGeneration?.previewShotId ?? "";
 			this.sql`INSERT OR REPLACE INTO builder_preview_thumbnails (shot_id, base64, created_at)
 				VALUES (${shotId}, ${shot.base64}, ${Date.now()})`;
-			this
-				.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
+			this.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
 				SELECT shot_id FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} ORDER BY created_at DESC, rowid DESC LIMIT ${PREVIEW_THUMBNAIL_LIMIT}
 			)`;
 		} catch {
@@ -2116,8 +2115,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}>`SELECT v FROM builder_secrets WHERE k = 'creationDigest'`[0]?.v;
 		if (!recordedCreation) {
 			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('ownerDigest', ${ownerKey})`;
-			this
-				.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
+			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
 			return this.authorizeProject(ownerKey);
 		}
 		if (!equalTokenDigest(recordedCreation, creationDigest)) return false;
@@ -7199,8 +7197,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (resuming) markChatTurnStarted(this);
 		if (options?.requestId) {
 			// Chat turns run one at a time: any other chat row belongs to an interrupted turn.
-			this
-				.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
+			this.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
 			this.beginOwnerActivity(`chat:${options.requestId}`, "chat");
 			this.activeTurnRequestId = options.requestId;
 		}
