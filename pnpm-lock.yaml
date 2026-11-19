@@ -53,12 +53,6 @@ importers:
       ogl:
         specifier: ^1.0.11
         version: 1.0.11
-      openai:
-        specifier: ^6.32.0
-        version: 6.32.0(ws@8.21.3)(zod@4.4.3)
-      partysocket:
-        specifier: ^1.1.16
-        version: 1.1.16(react@19.2.4)
       react:
         specifier: ^19.2.4
         version: 19.2.4
@@ -2530,18 +2524,6 @@ packages:
   oniguruma-to-es@4.3.6:
     resolution: {integrity: sha512-csuQ9x3Yr0cEIs/Zgx/OEt9iBw9vqIunAPQkx19R/fiMq2oGVTgcMqO/V3Ybqefr1TBvosI6jU539ksaBULJyA==}
 
-  openai@6.32.0:
-    resolution: {integrity: sha512-j3k+BjydAf8yQlcOI7WUQMQTbbF5GEIMAE2iZYCOzwwB3S2pCheaWYp+XZRNAch4jWVc52PMDGRRjutao3lLCg==}
-    hasBin: true
-    peerDependencies:
-      ws: ^8.18.0
-      zod: ^3.25 || ^4.0
-    peerDependenciesMeta:
-      ws:
-        optional: true
-      zod:
-        optional: true
-
   oxfmt@0.41.0:
     resolution: {integrity: sha512-sKLdJZdQ3bw6x9qKiT7+eID4MNEXlDHf5ZacfIircrq6Qwjk0L6t2/JQlZZrVHTXJawK3KaMuBoJnEJPcqCEdg==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -2558,14 +2540,6 @@ packages:
     resolution: {integrity: sha512-t2B3mhTL1IOxCsj8rZgn4TxTuub7oLhypjc1/fGPNsbgnn9OsHms6uR3QEd5bFJ/7xrFo771j3DdUlll8cxgBg==}
     peerDependencies:
       '@cloudflare/workers-types': ^4.20260424.1 || ^5.20260703.1
-
-  partysocket@1.1.16:
-    resolution: {integrity: sha512-d7xFv+ZC7x0p/DAHWJ5FhxQhimIx+ucyZY+kxL0cKddLBmK9c4p2tEA/L+dOOrWm6EYrRwrBjKQV0uSzOY9x1w==}
-    peerDependencies:
-      react: '>=17'
-    peerDependenciesMeta:
-      react:
-        optional: true
 
   partysocket@1.1.19:
     resolution: {integrity: sha512-hPwsXSdUc8PKNCinET6TD3JQOxzQ2JaP0bUZQXBVl6UM8UuLn1odgf1LcJXHy4UHSQwWL/RU3AnyhEsGM+W+sg==}
@@ -5169,11 +5143,6 @@ snapshots:
       regex: 6.1.0
       regex-recursion: 6.0.2
 
-  openai@6.32.0(ws@8.21.3)(zod@4.4.3):
-    optionalDependencies:
-      ws: 8.21.3
-      zod: 4.4.3
-
   oxfmt@0.41.0:
     dependencies:
       tinypool: 2.1.0
@@ -5208,12 +5177,6 @@ snapshots:
     dependencies:
       '@cloudflare/workers-types': 5.20260924.1
       nanoid: 5.1.11
-
-  partysocket@1.1.16(react@19.2.4):
-    dependencies:
-      event-target-polyfill: 0.0.4
-    optionalDependencies:
-      react: 19.2.4
 
   partysocket@1.1.19(react@19.2.4):
     dependencies:
