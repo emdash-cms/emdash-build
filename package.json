@@ -56,9 +56,9 @@
 		"zod": "^4.6.7"
 	},
 	"devDependencies": {
-		"@cloudflare/vite-plugin": "^1.60.0",
+		"@cloudflare/vite-plugin": "^1.70.1",
 		"@cloudflare/vitest-pool-workers": "0.22.0",
-		"@cloudflare/workers-types": "5.20260924.1",
+		"@cloudflare/workers-types": "5.20261118.1",
 		"@tailwindcss/vite": "^4.3.5",
 		"@testing-library/react": "^16.3.3",
 		"@testing-library/user-event": "^14.6.12",
@@ -74,7 +74,7 @@
 		"typescript": "^7.0.2",
 		"vite": "^8.3.8",
 		"vitest": "^4.1.0",
-		"wrangler": "4.139.0",
+		"wrangler": "4.164.0",
 		"ws": "^8.21.3"
 	},
 	"engines": {
