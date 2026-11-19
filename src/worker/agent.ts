@@ -522,13 +522,20 @@ function builtSnapshotContentType(path: string): string {
 
 /**
  * True if an Artifacts binding error means the repo doesn't exist yet. The
- * structured `.code` ("NOT_FOUND") is stripped when the error crosses the RPC
+ * structured `.code` ("NOT_FOUND") can be lost when the error crosses the RPC
  * boundary into the Worker, so fall back to matching the message.
  */
 function isArtifactsNotFound(err: unknown): boolean {
 	const e = err as { code?: string; message?: string } | undefined;
 	if (e?.code === "NOT_FOUND") return true;
 	return typeof e?.message === "string" && /not found/i.test(e.message);
+}
+
+/** True if the repo is still being created, by its code or, without one, its message. */
+function isArtifactsCreateInProgress(err: unknown): boolean {
+	const e = err as { code?: string; message?: string } | undefined;
+	if (typeof e?.code === "string") return e.code === "CREATE_IN_PROGRESS";
+	return typeof e?.message === "string" && /being created|create in progress/i.test(e.message);
 }
 
 function isChatRequestMessage(message: WSMessage): boolean {
@@ -2549,6 +2556,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		try {
 			repo = await this.env.ARTIFACTS.get(this.name);
 		} catch (err) {
+			// The first checkpoint creates the repo; get() refuses until that finishes.
+			if (isArtifactsCreateInProgress(err)) {
+				return {
+					ok: false,
+					reason: "Your first snapshot is still being saved. Try again in a moment.",
+				};
+			}
 			if (isArtifactsNotFound(err)) {
 				return { ok: false, reason: "No snapshot saved yet. Make a change first, then clone." };
 			}
