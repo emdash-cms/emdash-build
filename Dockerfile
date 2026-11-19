@@ -14,7 +14,7 @@ FROM node:24-slim
 ARG AGENT_BROWSER_VERSION
 
 # The file helper that Sandbox SDK 1.0's Files runs; its tag must match the package.
-COPY --from=docker.io/cloudflare/sandbox:1.0.0 /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
+COPY --from=docker.io/cloudflare/sandbox:1.0.3 /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
 COPY --from=docker.io/cloudflare/cloudflared:2026.3.0 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
 # git/curl, tini (the container's init) plus the system libraries headless
