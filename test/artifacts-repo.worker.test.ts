@@ -1,5 +1,5 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuilderAgent } from "../src/worker/agent.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
@@ -24,8 +24,23 @@ type Harness = {
 };
 
 describe("Artifacts repo remote", () => {
+	// Each test swaps the binding on the env every instance shares; the next one gets it back.
+	let restoreArtifacts: (() => void) | undefined;
+	const useArtifacts = (harness: Harness, binding: unknown) => {
+		const original = harness.env.ARTIFACTS;
+		restoreArtifacts ??= () => {
+			harness.env.ARTIFACTS = original;
+		};
+		harness.env.ARTIFACTS = binding;
+	};
+
 	beforeEach(async () => {
 		await reset();
+	});
+
+	afterEach(() => {
+		restoreArtifacts?.();
+		restoreArtifacts = undefined;
 	});
 
 	it("reads the remote through info() when none is stored, then keeps it", async () => {
@@ -33,7 +48,7 @@ describe("Artifacts repo remote", () => {
 		await runInDurableObject(agent, async (instance) => {
 			const harness = instance as unknown as Harness;
 			const repo = repoHandle(async () => ({ remote: REMOTE }));
-			harness.env.ARTIFACTS = { get: async () => repo };
+			useArtifacts(harness, { get: async () => repo });
 
 			expect(await harness.getArtifactsRepoForRead()).toEqual({
 				remote: REMOTE,
@@ -57,7 +72,7 @@ describe("Artifacts repo remote", () => {
 			const repo = repoHandle(async () => {
 				throw new Error("info() should not be called");
 			});
-			harness.env.ARTIFACTS = { get: async () => repo };
+			useArtifacts(harness, { get: async () => repo });
 
 			expect(await harness.getArtifactsRepoForRead()).toEqual({
 				remote: REMOTE,
@@ -66,4 +81,34 @@ describe("Artifacts repo remote", () => {
 			expect(repo.info).not.toHaveBeenCalled();
 		});
 	});
+
+	it.each([
+		{ how: "by its code", id: "103", code: "CREATE_IN_PROGRESS" as string | undefined },
+		// A binding error that crossed RPC may keep only its message.
+		{ how: "by its message alone", id: "104", code: undefined },
+	])(
+		"answers the clone panel while the first snapshot's repo is still being created, told $how",
+		async ({ id, code }) => {
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-000000000${id}`);
+			await runInDurableObject(agent, async (instance) => {
+				const harness = instance as unknown as Harness & {
+					getCloneInfo: () => Promise<{ ok: boolean; reason?: string }>;
+				};
+				instance.setState({ ...instance.state, siteReady: true });
+				useArtifacts(harness, {
+					get: async () => {
+						throw Object.assign(
+							new Error("Repository is still being created"),
+							code ? { code } : {},
+						);
+					},
+				});
+
+				expect(await harness.getCloneInfo()).toEqual({
+					ok: false,
+					reason: "Your first snapshot is still being saved. Try again in a moment.",
+				});
+			});
+		},
+	);
 });
