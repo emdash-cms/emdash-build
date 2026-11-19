@@ -6,7 +6,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import type { D1Migration } from "@cloudflare/vitest-pool-workers";
+import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountAuthStore } from "../src/worker/account-auth.js";
 import type { BuilderAgent } from "../src/worker/agent.js";

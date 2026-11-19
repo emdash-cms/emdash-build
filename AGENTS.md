@@ -14,7 +14,7 @@ Read `SPEC.md` for product context. Its blank-builder note and the architecture 
 - **LLM**: Workers AI binding, streaming via the Vercel AI SDK (`ai` package)
 - **Frontend**: React 19 + Tailwind CSS 4 + `@cloudflare/kumo` component library
 - **Build**: Vite + `@cloudflare/vite-plugin` (single build for Worker + SPA)
-- **Test**: Vitest 4.1 + `@cloudflare/vitest-pool-workers`
+- **Test**: Vitest 5 + `@cloudflare/vitest-plugin`
 - **Formatting**: oxfmt (tabs for indentation)
 
 ## Directory Structure
