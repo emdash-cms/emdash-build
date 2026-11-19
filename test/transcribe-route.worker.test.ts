@@ -1,6 +1,6 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import type { D1Migration } from "@cloudflare/vitest-pool-workers";
+import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	createGuestToken,
