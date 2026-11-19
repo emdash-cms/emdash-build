@@ -2454,14 +2454,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
-	 * The Artifacts repo handle from `get()` is an RPC stub, so `repo.remote` is
-	 * a promise, not the URL string -- it must be awaited. We also persist it so
-	 * later backups don't depend on the stub at all.
+	 * The repo handle from `get()` carries no metadata properties; its remote comes
+	 * from `info()`, a round trip. We persist it so later backups don't ask again.
 	 */
-	private async resolveArtifactsRemote(repo: { remote: string }): Promise<string> {
+	private async resolveArtifactsRemote(repo: Pick<ArtifactsRepo, "info">): Promise<string> {
 		const stored = this.getStoredArtifactsRemote();
 		if (stored) return stored;
-		const remote = await repo.remote;
+		const { remote } = await repo.info();
 		this.persistArtifactsRemote(remote);
 		return remote;
 	}
