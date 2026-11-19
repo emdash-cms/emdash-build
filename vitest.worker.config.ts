@@ -8,7 +8,7 @@ export default defineConfig({
 		cloudflareTest({
 			main: "./src/worker/index.ts",
 			miniflare: {
-				compatibilityDate: "2026-03-24",
+				compatibilityDate: "2026-11-01",
 				compatibilityFlags: ["nodejs_compat"],
 				d1Databases: ["AUTH_DB"],
 				r2Buckets: ["SITE_MEDIA", "WFP_RELEASES"],
