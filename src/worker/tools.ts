@@ -28,6 +28,8 @@ import { isSandboxInterruption, RESTORED, type SandboxOps } from "./sandbox-ops.
 export const SITE_PATH = "/home/user/site";
 
 const READ_FILES_MAX_PATHS = 12;
+/** How many times the AI SDK converts one tool result for the model. */
+const MODEL_OUTPUT_CONVERSIONS = 1;
 const READ_FILE_MAX_BYTES = 48 * 1024;
 const READ_FILES_MAX_BYTES = 128 * 1024;
 const READ_FILE_TIMEOUT_MS = 5_000;
@@ -819,7 +821,8 @@ type PreviewModelOutput =
 	| {
 			type: "content";
 			value: Array<
-				{ type: "text"; text: string } | { type: "file-data"; data: string; mediaType: string }
+				| { type: "text"; text: string }
+				| { type: "file"; mediaType: string; data: { type: "data"; data: string } }
 			>;
 	  };
 
@@ -1422,11 +1425,11 @@ export function createTools(
 		callbacks.runSandboxRead ??
 		(<T>(operation: (sandbox: SandboxOps) => Promise<T>) => operation(currentSandbox()));
 	const convergence = options.convergence ?? new BuildConvergence(options.abortSignal);
-	// AI SDK 6 converts an intermediate tool result twice: once for the
-	// completed step and once for the next model request. Retain each image for
-	// both conversions, then release it. The result itself only contains a UUID,
-	// so screenshot bytes are never persisted in chat history. The optional
-	// callback keeps a bounded copy separately for the details UI.
+	// AI SDK 7 converts a tool result for the model once, and hands the same
+	// converted message to every later step. Retain each image until then, and
+	// release it. The result itself only contains a UUID, so screenshot bytes
+	// are never persisted in chat history. The optional callback keeps a
+	// bounded copy separately for the details UI.
 	const previewShots = new Map<
 		string,
 		{
@@ -1471,10 +1474,7 @@ export function createTools(
 		});
 		return { shotId, revision: observation.revision };
 	};
-	/**
-	 * The model's view of a captured shot. The SDK converts a result twice, so
-	 * the bytes are kept for two conversions and then released.
-	 */
+	/** The model's view of a captured shot; the bytes go once the SDK has converted it. */
 	const deliverPreviewShot = (shotId: string): PreviewModelOutput => {
 		const shot = previewShots.get(shotId);
 		if (!shot) {
@@ -1493,7 +1493,7 @@ export function createTools(
 		if (shot.modelOutput) {
 			shot.conversions += 1;
 			const converted = shot.modelOutput;
-			if (shot.conversions >= 2) previewShots.delete(shotId);
+			if (shot.conversions >= MODEL_OUTPUT_CONVERSIONS) previewShots.delete(shotId);
 			return converted;
 		}
 		shot.conversions += 1;
@@ -1506,7 +1506,7 @@ export function createTools(
 				value:
 					"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
 			};
-			if (shot.conversions >= 2) previewShots.delete(shotId);
+			if (shot.conversions >= MODEL_OUTPUT_CONVERSIONS) previewShots.delete(shotId);
 			return shot.modelOutput;
 		}
 		if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
@@ -1514,11 +1514,15 @@ export function createTools(
 			type: "content" as const,
 			value: [
 				{ type: "text" as const, text: PREVIEW_IMAGE_CAPTION },
-				{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
+				{
+					type: "file" as const,
+					mediaType: shot.mediaType,
+					data: { type: "data" as const, data: shot.base64 },
+				},
 			],
 		};
 		shot.modelOutput = converted;
-		if (shot.conversions >= 2) previewShots.delete(shotId);
+		if (shot.conversions >= MODEL_OUTPUT_CONVERSIONS) previewShots.delete(shotId);
 		return converted;
 	};
 	const trackedMutation = async <T>(
@@ -2459,7 +2463,7 @@ export function createTools(
 					return { success: true as const, ...captured };
 				}),
 			// Hand the first-build screenshot to the multimodal coordinator,
-			// not as JSON. `file-data` carries base64 image bytes inline.
+			// not as JSON. The `file` part carries base64 image bytes inline.
 			toModelOutput: ({ output }) => {
 				const o = output as
 					| { success: true; shotId: string; revision: number }

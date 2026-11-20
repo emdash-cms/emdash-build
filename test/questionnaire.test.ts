@@ -61,7 +61,7 @@ describe("questionnaire parsing", () => {
 	});
 
 	it("exposes a no-op interview tool that echoes bounded question input", async () => {
-		const questionTool = createAskQuestionsTool() as {
+		const questionTool = createAskQuestionsTool() as unknown as {
 			inputSchema: { safeParse: (input: unknown) => { success: boolean } };
 			execute?: (input: { questions: ClarifyingQuestion[] }) => Promise<unknown>;
 		};

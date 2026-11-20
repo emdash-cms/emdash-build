@@ -84,6 +84,19 @@ const MAX_ERROR_CHARS = 300;
 const MAX_STEP_TIMINGS = 64;
 /** Stream parts that mean the model has finished thinking and started its answer. */
 const OUTPUT_CHUNK_TYPES = new Set(["text-delta", "tool-input-start", "tool-call"]);
+/**
+ * Parts the model streamed, as onChunk saw them before AI SDK 7. It now also
+ * hands on the stream's own step and block markers, which are not the model's.
+ */
+const MODEL_CHUNK_TYPES = new Set([
+	"text-delta",
+	"reasoning-delta",
+	"source",
+	"file",
+	"tool-input-start",
+	"tool-input-delta",
+	"tool-call",
+]);
 
 function emptyTokens(): TokenTotals {
 	return { input: 0, cachedInput: 0, output: 0, reasoning: 0 };
@@ -175,7 +188,7 @@ export class TurnMetrics {
 	/** A streamed part of the current step; tool results arrive after the model finished. */
 	observeChunk(type: string): void {
 		const step = this.currentStep;
-		if (!step || type === "tool-result" || type === "raw") return;
+		if (!step || !MODEL_CHUNK_TYPES.has(type)) return;
 		const now = this.now();
 		step.firstChunkAt ??= now;
 		if (OUTPUT_CHUNK_TYPES.has(type)) step.firstOutputAt ??= now;
