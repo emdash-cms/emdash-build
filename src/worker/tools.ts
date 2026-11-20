@@ -457,28 +457,53 @@ const scheduledPublishes = ((
 const fetchHandler = handler.fetch;
 if (!fetchHandler) throw new Error("The EmDash Worker handler is missing fetch().");
 
+const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+
+/**
+ * Whether a request comes from inside the container. The preview sends public
+ * traffic to localhost too, so the public host shows only in X-Forwarded-Host.
+ */
+function isLoopbackRequest(request: Request, url: URL): boolean {
+	if (!loopbackHosts.has(url.hostname)) return false;
+	const forwarded = request.headers.get("X-Forwarded-Host");
+	if (!forwarded) return true;
+	return forwarded
+		.split(",")
+		.every((host) => loopbackHosts.has(host.trim().replace(/:\\d+$/, "").toLowerCase()));
+}
+
+/**
+ * The path Astro routes on, decoded until it stops changing. As in Astro, the URL
+ * parser turns \`\\\` into \`/\` and resolves dot segments, and repeated slashes
+ * collapse, so \`//x\`, \`/a%5Cx\` and \`/a/%2e/x\` all name the route they reach.
+ * Null when the path will not decode.
+ */
+function routePathOf(url: URL): string | null {
+	const parsed = new URL("http://localhost/");
+	let path = url.pathname;
+	for (let pass = 0; pass < 8; pass++) {
+		let decoded: string;
+		try {
+			decoded = decodeURIComponent(path);
+		} catch {
+			return null;
+		}
+		parsed.pathname = decoded;
+		const next = parsed.pathname.replace(/\\/{2,}/g, "/");
+		if (next === path) return next.length > 1 ? next.replace(/\\/$/, "") : next;
+		path = next;
+	}
+	return null;
+}
+
 export default {
 	...handler,
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
-		let routePath = url.pathname;
-		for (let pass = 0; pass < 8; pass++) {
-			let decoded: string;
-			try {
-				decoded = decodeURIComponent(routePath);
-			} catch {
-				return new Response("Bad request", { status: 400 });
-			}
-			if (decoded === routePath) break;
-			if (pass === 7) return new Response("Bad request", { status: 400 });
-			routePath = decoded;
-		}
-		if (routePath.length > 1) routePath = routePath.replace(/\\/+$/, "");
-		if (
-			localOnlyDevRoutes.has(routePath) &&
-			url.hostname !== "localhost" &&
-			url.hostname !== "127.0.0.1"
-		) {
+		const routePath = routePathOf(url);
+		if (routePath === null) return new Response("Bad request", { status: 400 });
+		// In any letter case, though Astro's own matching minds it.
+		if (localOnlyDevRoutes.has(routePath.toLowerCase()) && !isLoopbackRequest(request, url)) {
 			return new Response("Not found", { status: 404 });
 		}
 		if (routePath === "/_emdash-build/scheduled-publishes") {
