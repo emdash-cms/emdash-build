@@ -339,6 +339,35 @@ describe("builder state", () => {
 		}
 	});
 
+	it("refreshes the open preview after a scheduled publish, unless it is restarting", async () => {
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000031");
+		const refreshes = await runInDurableObject(agent, async (instance) => {
+			const internals = instance as unknown as {
+				stateWrittenHere: boolean;
+				refreshAndReloadPreview(): Promise<void>;
+			};
+			const refreshes: boolean[] = [];
+			internals.refreshAndReloadPreview = async () => {
+				refreshes.push(instance.state.previewRestarting === true);
+			};
+			// No preview yet: nothing to refresh.
+			await instance.refreshPreviewAfterScheduledPublish();
+			// A restart refreshes the preview by itself once the dev server is back.
+			instance.setState({
+				...instance.state,
+				previewUrl: "https://preview.test",
+				previewRestarting: true,
+			});
+			await instance.refreshPreviewAfterScheduledPublish();
+			// One an evicted instance left in state is not under way.
+			internals.stateWrittenHere = false;
+			await instance.refreshPreviewAfterScheduledPublish();
+			return refreshes;
+		});
+
+		expect(refreshes).toEqual([false]);
+	});
+
 	it("reports when the site's brief was first saved as its creation time", async () => {
 		const guestKey = "created-at-guest";
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000012");

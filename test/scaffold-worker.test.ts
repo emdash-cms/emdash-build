@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { SCHEDULED_PUBLISHES_PATH } from "../src/worker/preview-cache.js";
 import { CANONICAL_WORKER_TS } from "../src/worker/tools.js";
 
 const scaffoldWorker = readFileSync(
@@ -21,5 +22,10 @@ describe("the site worker entry", () => {
 		expect(localOnly).toContain('"/_emdash/api/setup/dev-reset"');
 		// EmDash 1.3 added an unauthenticated maintenance route that its dev server calls on localhost.
 		expect(localOnly).toContain('"/_emdash/api/dev/scheduled-tasks"');
+		// The Sandbox reads what that maintenance published from the container's loopback.
+		expect(localOnly).toContain(JSON.stringify(SCHEDULED_PUBLISHES_PATH));
+		expect(CANONICAL_WORKER_TS).toContain(
+			`routePath === ${JSON.stringify(SCHEDULED_PUBLISHES_PATH)}`,
+		);
 	});
 });
