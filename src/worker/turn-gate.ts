@@ -86,6 +86,27 @@ export function closeInterruptedToolCalls(messages: readonly UIMessage[]): UIMes
 	return changed ? repaired : undefined;
 }
 
+/** A finished tool call, as the turn's metrics and error reporting read it. */
+export interface ToolCallOutcome {
+	toolCall: { toolName: string; toolCallId: string };
+	durationMs: number;
+	success: boolean;
+	output?: unknown;
+	error?: unknown;
+}
+
+/** Read AI SDK 7's tool execution end event, whose result or error sits in `toolOutput`. */
+export function toolCallOutcome(event: {
+	toolCall: { toolName: string; toolCallId: string };
+	toolExecutionMs: number;
+	toolOutput: { type: "tool-result"; output: unknown } | { type: "tool-error"; error: unknown };
+}): ToolCallOutcome {
+	const base = { toolCall: event.toolCall, durationMs: event.toolExecutionMs };
+	return event.toolOutput.type === "tool-result"
+		? { ...base, success: true, output: event.toolOutput.output }
+		: { ...base, success: false, error: event.toolOutput.error };
+}
+
 const STARTED_TURN_STASH = { chatTurnStarted: true } as const;
 const FINISHED_TURN_STASH = { chatTurnFinished: true } as const;
 
@@ -175,10 +196,11 @@ const MAX_TOOL_ERROR_CHARS = 2_000;
  * the saved history, and only Artifacts tokens are redacted, so tools must keep
  * secrets out of their errors.
  *
- * Pass `noteToolCall` to `experimental_onToolCallFinish`, which sees an
- * execution error before the stream reports it. A call the SDK refused to run
- * (bad input, unknown tool) is reported twice: as its own error type, then as
- * that error's message.
+ * Pass each call's `toolCallOutcome` to `noteToolCall` from
+ * `onToolExecutionEnd`, which sees an execution error before the stream
+ * reports it. A call the SDK refused to run (bad input, unknown tool) is
+ * reported once, as its own error type; AI SDK 6 also reported that error's
+ * message after it, which the string branch still reads.
  */
 export function replyErrors(turnErrorText: (error: unknown) => string) {
 	const toolErrors = new WeakSet<object>();

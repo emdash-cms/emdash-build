@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { stepCountIs, streamText, tool } from "ai";
+import { isStepCount, streamText, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { vi } from "vitest";
 import { z } from "zod";
@@ -142,7 +142,7 @@ describe("builder model configuration", () => {
 			model,
 			prompt: "Build",
 			tools: { noop: tool({ inputSchema: z.object({}), execute: async () => ({}) }) },
-			stopWhen: stepCountIs(3),
+			stopWhen: isStepCount(3),
 			providerOptions: builderProviderOptions("high"),
 			prepareStep: ({ stepNumber }) => ({
 				providerOptions: buildStepProviderOptions({ initialBuild: true, stepNumber }),
@@ -332,7 +332,7 @@ describe("build step requests", () => {
 			model,
 			prompt: "Build",
 			tools,
-			stopWhen: stepCountIs(3),
+			stopWhen: isStepCount(3),
 			providerOptions: builderProviderOptions("medium", { promptCacheKey: "session-1" }),
 			prepareStep: ({ messages, stepNumber }) =>
 				prepareBuildTurnStep(convergence, messages, toolNames, {

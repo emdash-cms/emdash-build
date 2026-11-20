@@ -2484,7 +2484,10 @@ describe("tools while a restore is unheard", () => {
 			() => unreported,
 		);
 		const update = () =>
-			tools.content_update.execute!({}, { toolCallId: "call", messages: [] }) as Promise<unknown>;
+			tools.content_update.execute!(
+				{},
+				{ toolCallId: "call", messages: [], context: undefined },
+			) as Promise<unknown>;
 
 		await expect(update()).rejects.toThrow(RESTORED);
 		expect(execute).not.toHaveBeenCalled();

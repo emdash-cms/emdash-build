@@ -38,9 +38,10 @@ import {
 	createUIMessageStream,
 	createUIMessageStreamResponse,
 	hasToolCall,
-	stepCountIs,
+	isStepCount,
 	jsonSchema,
 	tool,
+	toUIMessageStream,
 	type ToolSet,
 } from "ai";
 import { z } from "zod";
@@ -103,6 +104,7 @@ import {
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
 	stashedTurnMetrics,
+	toolCallOutcome,
 	type ChatRecoveryPlan,
 } from "./turn-gate.js";
 import { AccountAuthStore, type IdentityBindings } from "./account-auth.js";
@@ -6881,7 +6883,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								const { text, usage, finishReason } = await generateText({
 									model: genModel,
 									abortSignal,
-									system: [
+									instructions: [
 										"You write the BODY of a single web content entry, in markdown.",
 										voice,
 										"Rules: 3-6 substantive paragraphs of real, specific writing. Use ## and ### for",
@@ -7468,13 +7470,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
-				system: interviewSystem,
+				instructions: interviewSystem,
 				messages: interviewMessages,
 				tools: interviewTools,
 				toolChoice: alreadyInterviewed ? undefined : FIRST_INTERVIEW_TOOL_CHOICE,
 				stopWhen: alreadyInterviewed
-					? stepCountIs(2)
-					: [hasToolCall("ask_questions"), stepCountIs(2)],
+					? isStepCount(2)
+					: [hasToolCall("ask_questions"), isStepCount(2)],
 				maxRetries: 5,
 				maxOutputTokens: 8192,
 				providerOptions: builderProviderOptions(
@@ -7484,24 +7486,25 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					{ promptCacheKey: this.name },
 				),
 				abortSignal,
-				experimental_onStepStart: (event) =>
+				onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
 				onChunk: ({ chunk }) => metrics.observeChunk(chunk.type),
-				onStepFinish: (step) => {
+				onStepEnd: (step) => {
 					this.touchBuildActivity();
 					metrics.onStep(step);
 				},
-				experimental_onToolCallFinish: (event) => {
+				onToolExecutionEnd: (event) => {
 					this.touchBuildActivity();
-					metrics.onToolCallFinish(event);
-					errors.noteToolCall(event);
+					const call = toolCallOutcome(event);
+					metrics.onToolCallFinish(call);
+					errors.noteToolCall(call);
 				},
 				onAbort: () => this.recordTurnMetrics(metrics.finish("stopped")),
 				onError: ({ error }) => {
 					console.error("[BuilderAgent] interview stream error:", error);
 					metrics.noteError(error);
 				},
-				onFinish: (async (...args: unknown[]) => {
+				onEnd: (async (...args: unknown[]) => {
 					await finish(...args);
 					metrics.modelFinished((args[0] as { finishReason?: string } | undefined)?.finishReason);
 					// The reply is complete; eviction during the backup must not replay the turn.
@@ -7511,13 +7514,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(
-						replyStreamOptions(
+					toUIMessageStream({
+						stream: result.stream,
+						tools: interviewTools,
+						...replyStreamOptions(
 							errors.errorText,
 							initialGenerationId,
 							alreadyInterviewed ? "holding" : undefined,
 						),
-					),
+					}),
 				),
 			});
 		}
@@ -7721,21 +7726,21 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
-				system,
+				instructions: system,
 				messages: modelMessages,
 				tools,
 				// A full build is many tool calls; cap high so it finishes in one
 				// turn. Keep text and tool history intact; prepareStep only drops
 				// superseded screenshot bytes. Interview turns are capped at 2.
-				stopWhen: stepCountIs(BUILD_STEP_CAP),
+				stopWhen: isStepCount(BUILD_STEP_CAP),
 				prepareStep: ({ messages, stepNumber }) =>
 					prepareBuildTurnStep(convergence, messages, buildToolNames, {
 						initialBuild: tracksInitialBuild,
 						stepNumber,
 					}),
-				experimental_onStepStart: (event) =>
+				onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
-				onStepFinish: (step) => {
+				onStepEnd: (step) => {
 					convergence.finishStep(step);
 					if (tracksInitialBuild) {
 						this.setInitialGenerationStatus(
@@ -7746,13 +7751,14 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.touchBuildActivity();
 					metrics.onStep(step);
 				},
-				experimental_onToolCallFinish: (event) => {
+				onToolExecutionEnd: (event) => {
 					this.touchBuildActivity();
-					metrics.onToolCallFinish(event);
-					errors.noteToolCall(event);
-					this.noteToolCallReported(event);
+					const call = toolCallOutcome(event);
+					metrics.onToolCallFinish(call);
+					errors.noteToolCall(call);
+					this.noteToolCallReported(call);
 				},
-				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
+				// A Stop after a finished step also reaches onEnd, which logs the benchmark.
 				onAbort: () => {
 					if (convergence.currentRevision() > 0) this.dropSuggestions();
 					this.recordTurnMetrics(
@@ -7778,7 +7784,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.sendConsole(`ERROR: ${error.message}`);
 					runawayController.abort(error);
 				},
-				onFinish: onBuildFinish as any,
+				onEnd: onBuildFinish as any,
 				onError: ({ error }) => {
 					console.error("[BuilderAgent] build stream error:", error);
 					this.sendConsole(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
@@ -7788,7 +7794,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(replyStreamOptions(errors.errorText, initialGenerationId)),
+					toUIMessageStream({
+						stream: result.stream,
+						tools,
+						...replyStreamOptions(errors.errorText, initialGenerationId),
+					}),
 				),
 			});
 		} catch (err) {
@@ -8056,7 +8066,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (metrics) {
 			this.openTurnMetrics.delete(result.requestId);
 			// Records user Stops (ai-chat settles before onAbort fires) and stream
-			// failures that reach no streamText callback; onFinish/onAbort record
+			// failures that reach no streamText callback; onEnd/onAbort record
 			// the rest first, and a second finish is a no-op.
 			this.recordTurnMetrics(metrics.finishFromResponse({ ...result, status }));
 		}

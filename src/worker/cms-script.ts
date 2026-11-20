@@ -316,6 +316,8 @@ export class CmsScriptRun {
 					toolCallId: `${this.options.toolCallId}:${++this.seq}`,
 					messages: [],
 					abortSignal: this.signal,
+					// The CMS tools declare no context schema.
+					context: undefined,
 				});
 			})();
 			this.inFlight.add(call);

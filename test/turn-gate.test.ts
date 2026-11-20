@@ -3,6 +3,7 @@ import {
 	InvalidToolInputError,
 	streamText,
 	tool,
+	toUIMessageStream,
 	TypeValidationError,
 	type UIMessage,
 	type UIMessageChunk,
@@ -19,6 +20,7 @@ import {
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
 	stashedTurnMetrics,
+	toolCallOutcome,
 } from "../src/worker/turn-gate.js";
 
 const brief: UIMessage = {
@@ -249,11 +251,14 @@ describe("reply stream", () => {
 					},
 				}),
 			},
-			experimental_onToolCallFinish: errors.noteToolCall,
+			onToolExecutionEnd: (event) => errors.noteToolCall(toolCallOutcome(event)),
 			prompt: "Build",
 		});
 		const chunks: UIMessageChunk[] = [];
-		for await (const chunk of result.toUIMessageStream(replyStreamOptions(errors.errorText))) {
+		for await (const chunk of toUIMessageStream({
+			stream: result.stream,
+			...replyStreamOptions(errors.errorText),
+		})) {
 			chunks.push(chunk);
 		}
 		const errorText = (type: string, toolCallId: string) =>
@@ -270,8 +275,9 @@ describe("reply stream", () => {
 			/^Invalid input for tool read_file: [^]*expected string/,
 		);
 		expect(errorText("tool-input-error", "call-1")).not.toContain("Type validation failed");
-		expect(errorText("tool-output-error", "call-1")).toBe(errorText("tool-input-error", "call-1"));
-		expect(errorText("tool-output-error", "call-2")).toMatch(/missing_tool/);
+		// A refused call is reported once, as its input error; the call shows it as its outcome.
+		expect(errorText("tool-output-error", "call-1")).toBeUndefined();
+		expect(errorText("tool-input-error", "call-2")).toMatch(/missing_tool/);
 		expect(errors.errorText(new Error("Could not read a.astro"))).toBe("Turn failed.");
 	});
 	it("keeps the end of a long tool error, where the reason is", () => {
