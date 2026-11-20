@@ -491,6 +491,25 @@ describe("step timing", () => {
 		expect(record?.modelWaitMs).toBe(11_500);
 	});
 
+	it("times a step's first chunk from the model's output, not the stream's step markers", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({});
+		// AI SDK 7 hands every stream part to onChunk, its own markers included.
+		metrics.observeChunk("start-step");
+		time.advance(800);
+		metrics.observeChunk("text-start");
+		time.advance(200);
+		metrics.observeChunk("text-delta");
+		metrics.observeChunk("finish-step");
+		metrics.onStep({ usage: stepUsage(0) });
+
+		expect(metrics.finish("finished")?.stepTimings?.[0]).toMatchObject({
+			firstChunkMs: 1_000,
+			firstOutputMs: 1_000,
+		});
+	});
+
 	it("records a step that streamed nothing and one whose start was not observed", () => {
 		const time = clock();
 		const metrics = newMetrics(time.now);
