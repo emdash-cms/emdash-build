@@ -358,6 +358,14 @@ const MAX_TRACKED_PREVIEW_CLIENTS = 4;
 const PREVIEW_ROUTE_REFRESH_TIMEOUT_MS = 60_000;
 /** Restarts of one turn whose stream failed in place before it ends with the error. */
 const MAX_IN_PLACE_RESTARTS = 2;
+/**
+ * Restarts of one turn that evictions keep interrupting before it streams:
+ * five attempts in all, as the chat SDK allows a turn it recovers itself.
+ */
+const MAX_WAKE_RESTARTS = 4;
+/** The error a turn ends with once evictions have interrupted it too often. */
+const INTERRUPTED_TOO_OFTEN =
+	"This reply was interrupted too many times, so it stopped. Send your message again to retry.";
 const PREVIEW_THUMBNAIL_LIMIT = 6;
 
 /**
@@ -1549,6 +1557,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private stopPromise: Promise<void> | null = null;
 	/** Set by restartInterruptedTurn for the one turn it enqueues. */
 	private restartingInterruptedTurn = false;
+	/**
+	 * Set by restartInterruptedTurn when the turn it enqueues only ends a turn
+	 * evictions interrupted too often: with its error, or, superseded meanwhile,
+	 * with nothing.
+	 */
+	private givingUpInterruptedTurn?: "error" | "superseded";
 	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
 	private recoveringTurn = false;
 	/**
@@ -1557,8 +1571,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * settles it is the recovered one.
 	 */
 	private recoveredRequestPlans = new Map<string, ChatRecoveryPlan>();
-	/** In-place restarts of the turn that answers each message, since a turn last ended unrestarted. */
-	private inPlaceRestarts = new Map<string | null, number>();
 	/** onStart started the first build itself, so a recovered pre-build turn has been overtaken. */
 	private startedBuildOnStart = false;
 	/** The build onStart started has not ended yet. */
@@ -7259,6 +7271,29 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		options?: OnChatMessageOptions,
 	) {
 		if (this.stopPromise) await this.stopPromise;
+		const givingUp = this.givingUpInterruptedTurn;
+		if (givingUp) {
+			this.givingUpInterruptedTurn = undefined;
+			this.restartingInterruptedTurn = false;
+			const generationStatus = this.state.initialGeneration?.status;
+			// Nothing to end: the conversation moved on, the owner stopped the build,
+			// or the build onStart started answers it.
+			if (
+				givingUp === "superseded" ||
+				generationStatus === "stopping" ||
+				generationStatus === "stopped" ||
+				this.autoStartPending ||
+				this.startedBuildOnStart
+			) {
+				// An eviction now must not start the turn again.
+				markChatTurnFinished(this);
+				return this.finishNoopChat(options?.requestId);
+			}
+			// Not marked finished: evicted before its error is out, it is recovered as
+			// another attempt past the limit, and ends the turn again.
+			this.settleAbandonedTurn(options?.requestId ?? "", "interrupted_restarts_exceeded");
+			return this.errorTurn(INTERRUPTED_TOO_OFTEN);
+		}
 		const turnStartedAt = Date.now();
 		const resuming = options?.continuation === true || this.restartingInterruptedTurn;
 		const turnUserMessageId = this.latestUserMessageId();
@@ -7804,13 +7839,24 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (plan !== "skip" && this.startedBuildOnStart && !this.openTurnMetrics.has(ctx.requestId)) {
 			plan = "skip";
 		}
-		// A stream that fails in place again and again would restart for good: each
-		// restart is a new request, so the SDK's own budget never grows for it.
-		// Past the limit the SDK ends the request with its error.
-		if ((plan === "restart" || plan === "retry") && this.openTurnMetrics.has(ctx.requestId)) {
-			const restarts = (this.inPlaceRestarts.get(afterMessageId()) ?? 0) + 1;
-			this.inPlaceRestarts.set(afterMessageId(), restarts);
-			if (restarts > MAX_IN_PLACE_RESTARTS) return { continue: false };
+		// A turn that fails again and again would restart for good: each restart is
+		// a new request, so the SDK's own budget never grows for it.
+		if (plan === "restart" || plan === "retry") {
+			const inPlace = this.openTurnMetrics.has(ctx.requestId);
+			const restarts = this.countTurnRestart(afterMessageId(), ctx.requestId, inPlace);
+			// In place, the SDK ends the request with its error and onChatResponse settles it.
+			if (inPlace && restarts > MAX_IN_PLACE_RESTARTS) return { continue: false };
+			if (!inPlace && restarts > MAX_WAKE_RESTARTS) {
+				// After an eviction nothing of the turn runs again: a turn of its own
+				// ends it with the error, as any failed turn ends.
+				await this.schedule(
+					0,
+					"restartInterruptedTurn",
+					{ afterMessageId: afterMessageId(), giveUp: true },
+					{ idempotent: true },
+				);
+				return { continue: false };
+			}
 		}
 		this.recoveredRequestPlans.set(ctx.requestId, plan);
 		if (plan === "skip") {
@@ -7831,6 +7877,48 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		if (plan !== "skip") this.recoveringTurn = true;
 		return plan === "continue" ? {} : { continue: false };
+	}
+
+	/**
+	 * Restarts of the turn that answers a message since a turn last ended
+	 * unrestarted, this one included: those in place, or those after an
+	 * eviction, each against its own limit. Durable, since a restart after an
+	 * eviction runs on a new instance. A request recovered again, after the
+	 * instance went while recovering it, is one attempt, not two.
+	 */
+	private countTurnRestart(
+		afterMessageId: string | null,
+		requestId: string,
+		inPlace: boolean,
+	): number {
+		this.ensureTurnRestartsTable();
+		const inPlaceStep = inPlace ? 1 : 0;
+		const wakeStep = inPlace ? 0 : 1;
+		const [row] = this.sql<{ in_place: number; wake: number }>`
+			INSERT INTO builder_turn_restarts (after_message_id, request_id, in_place, wake)
+			VALUES (${afterMessageId ?? ""}, ${requestId ?? ""}, ${inPlaceStep}, ${wakeStep})
+			ON CONFLICT(after_message_id) DO UPDATE SET
+				in_place = in_place + CASE WHEN request_id = excluded.request_id THEN 0 ELSE excluded.in_place END,
+				wake = wake + CASE WHEN request_id = excluded.request_id THEN 0 ELSE excluded.wake END,
+				request_id = excluded.request_id
+			RETURNING in_place, wake
+		`;
+		return (inPlace ? row?.in_place : row?.wake) ?? 1;
+	}
+
+	/** A turn ended without a restart: every count starts again. */
+	private clearTurnRestarts(): void {
+		this.ensureTurnRestartsTable();
+		this.sql`DELETE FROM builder_turn_restarts`;
+	}
+
+	private ensureTurnRestartsTable() {
+		this.sql`CREATE TABLE IF NOT EXISTS builder_turn_restarts (
+			after_message_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			in_place INTEGER NOT NULL,
+			wake INTEGER NOT NULL
+		)`;
 	}
 
 	/** Chat recovery gave up on a turn: past its attempts, or without progress for too long. */
@@ -7871,6 +7959,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	async restartInterruptedTurn(payload?: {
 		afterMessageId?: string | null;
 		pastGate?: boolean;
+		/** End the turn with its error instead: evictions interrupted it too often. */
+		giveUp?: boolean;
 	}): Promise<void> {
 		const target = payload?.afterMessageId ?? null;
 		// Already superseded: the newer turn answers the conversation as it is now.
@@ -7878,12 +7968,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		try {
 			await this.saveMessages((messages) => {
 				// Runs inside the turn lock, immediately before this turn's onChatMessage.
-				this.restartingInterruptedTurn =
-					payload?.pastGate === true && (messages.at(-1)?.id ?? null) === target;
+				const current = (messages.at(-1)?.id ?? null) === target;
+				if (payload?.giveUp) {
+					this.givingUpInterruptedTurn = current ? "error" : "superseded";
+				} else {
+					this.restartingInterruptedTurn = payload?.pastGate === true && current;
+				}
 				return [...messages];
 			});
 		} finally {
 			this.restartingInterruptedTurn = false;
+			this.givingUpInterruptedTurn = undefined;
 		}
 	}
 
@@ -7896,7 +7991,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		// on failed, whatever ended its request.
 		const status = recovered === "skip" ? "completed" : exhausted ? "error" : result.status;
 		// A turn that ended without a restart starts the count again.
-		if (recovered !== "restart" && recovered !== "retry") this.inPlaceRestarts.clear();
+		if (recovered !== "restart" && recovered !== "retry") this.clearTurnRestarts();
 		if (result.requestId === this.activeInitialRequestId) {
 			if (recovered && recovered !== "skip" && !exhausted) {
 				// The recovered turn settles the first generation.
