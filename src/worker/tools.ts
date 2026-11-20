@@ -1178,6 +1178,8 @@ async function uploadOneMedia(
 	const safeName = (filename ?? "image").replace(/[^A-Za-z0-9._-]/g, "_");
 	const form = new FormData();
 	form.append("file", new File([bytes], safeName, { type: contentType }));
+	// EmDash 1.2 and later keep it as the media item's alt text; 1.1 ignores the field.
+	if (alt) form.append("alt", alt);
 	let upRes: Response;
 	let text: string;
 	try {

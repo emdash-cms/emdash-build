@@ -1401,6 +1401,32 @@ describe("image uploads", () => {
 		return fetchMock;
 	}
 
+	it("sends each image's alt text with its upload", async () => {
+		const fetchMock = serveImages();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			imageSources: new ImageSources(),
+		});
+		const upload = tools.upload_media.execute as (input: {
+			images: Array<{ url: string; alt?: string }>;
+		}) => Promise<unknown>;
+
+		await expect(
+			upload({
+				images: [
+					{ url: "https://example.com/bread.jpg", alt: "A sourdough loaf on a board" },
+					{ url: "https://example.com/oven.jpg" },
+				],
+			}),
+		).resolves.toMatchObject({ success: true, uploaded: 2 });
+		const forms = fetchMock.mock.calls
+			.filter(([, init]) => init?.method === "POST")
+			.map(([, init]) => init!.body as FormData);
+		// EmDash 1.2 and later store it as the media item's alt text; 1.1 ignores the field.
+		expect(forms.map((form) => form.get("alt"))).toEqual(["A sourdough loaf on a board", null]);
+	});
+
 	it("refuses a stock photo written from memory, and never fetches it", async () => {
 		const fetchMock = serveImages();
 		const convergence = new BuildConvergence();
