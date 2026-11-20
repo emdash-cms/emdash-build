@@ -195,6 +195,44 @@ describe("chat recovery", () => {
 		});
 	});
 
+	it("leaves the first build to the restart it scheduled when its stream fails in place", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000010");
+		const statuses = await runInDurableObject(agent, async (instance) => {
+			await instance.lifecycle.start();
+			const harness = instance as unknown as RecoveryHarness & {
+				activeInitialRequestId?: string;
+				onChatResponse(result: Record<string, unknown>): Promise<void>;
+			};
+			const fail = async (requestId: string) => {
+				instance.setState({
+					...instance.state,
+					siteReady: true,
+					initialGeneration: { id: "brief", status: "building" },
+				});
+				harness.activeInitialRequestId = requestId;
+				await harness.onChatResponse({
+					requestId,
+					status: "error",
+					continuation: false,
+					message: { id: `reply-${requestId}`, role: "assistant", parts: [] },
+				});
+				return instance.state.initialGeneration?.status;
+			};
+			// A transient read error mid-stream: recovery restarts the turn in place,
+			// and the chat SDK ends the interrupted request with an error.
+			await harness.onChatRecovery({
+				requestId: "streamed-nothing",
+				recoveryData: { chatTurnStarted: true },
+				partialParts: [],
+				messages: [],
+			});
+			const restarted = await fail("streamed-nothing");
+			const failed = await fail("plain-error");
+			return { restarted, failed };
+		});
+		expect(statuses).toEqual({ restarted: "building", failed: "failed" });
+	});
+
 	it("does not wait on a server tool orphaned by eviction", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000004");
 		await runInDurableObject(agent, async (instance) => {

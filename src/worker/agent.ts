@@ -1542,6 +1542,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private restartingInterruptedTurn = false;
 	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
 	private recoveringTurn = false;
+	/** Requests whose turn onChatRecovery scheduled to run again; that run settles the build. */
+	private restartedRequestIds = new Set<string>();
 
 	private latestUserMessageId(): string | undefined {
 		return [...this.messages].reverse().find((message) => message.role === "user")?.id;
@@ -7777,6 +7779,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			this.recordTurnMetrics(stashedTurnMetrics(ctx.recoveryData), { keepInState: false });
 		}
 		if (plan === "restart" || plan === "retry") {
+			// A stream that fails in place still ends its request with an error.
+			this.restartedRequestIds.add(ctx.requestId);
 			await this.schedule(
 				0,
 				"restartInterruptedTurn",
@@ -7816,11 +7820,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	protected override async onChatResponse(result: ChatResponseResult) {
 		if (result.requestId === this.activeTurnRequestId) this.activeTurnRequestId = undefined;
+		const restarted = this.restartedRequestIds.delete(result.requestId);
 		if (result.requestId === this.activeInitialRequestId) {
 			if (result.status === "aborted") {
 				await this.requestStop(this.state.initialGeneration?.id);
 			} else if (result.status === "error") {
-				this.setInitialGenerationStatus("failed");
+				// An interview that errored leaves setup running; the build it starts
+				// once the site is ready is what the first generation waits on.
+				const interview = this.openTurnMetrics.get(result.requestId)?.kind === "interview";
+				if (!restarted && !interview) this.setInitialGenerationStatus("failed");
 			} else if (!this.state.buildStarted) {
 				this.setInitialGenerationStatus(
 					findPendingQuestionnaire(this.messages) ? "awaiting_answers" : "preparing",

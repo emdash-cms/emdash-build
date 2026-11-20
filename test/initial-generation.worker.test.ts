@@ -4,6 +4,7 @@ import type { ChatResponseResult } from "@cloudflare/ai-chat";
 import type { BuilderAgent } from "../src/worker/agent.js";
 import { BuildConvergence } from "../src/worker/build-convergence.js";
 import { shouldSkipSiteReadyTurn } from "../src/worker/turn-gate.js";
+import { TurnMetrics } from "../src/worker/turn-metrics.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
 
@@ -36,6 +37,48 @@ describe("initial generation stop", () => {
 			});
 		});
 	});
+
+	it.each([
+		{ kind: "interview" as const, status: "preparing" },
+		{ kind: "initial-build" as const, status: "failed" },
+	])(
+		"leaves the first generation $status after a(n) $kind reply errors",
+		async ({ kind, status }) => {
+			const id = kind === "interview" ? "000000000031" : "000000000032";
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const after = await runInDurableObject(agent, async (instance) => {
+				await instance.lifecycle.start();
+				instance.setState({
+					...instance.state,
+					siteReady: kind !== "interview",
+					initialGeneration: {
+						id: "opening-brief",
+						status: kind === "interview" ? "preparing" : "building",
+					},
+				});
+				const harness = instance as unknown as {
+					activeInitialRequestId?: string;
+					openTurnMetrics: Map<string, TurnMetrics>;
+					onChatResponse(result: ChatResponseResult): Promise<void>;
+				};
+				harness.activeInitialRequestId = "reply-1";
+				harness.openTurnMetrics.set(
+					"reply-1",
+					new TurnMetrics({ turnId: "reply-1", kind, resumed: false, model: "test", stepCap: 1 }),
+				);
+				// The model's call failed: the chat SDK ends the reply with an error.
+				await harness.onChatResponse({
+					requestId: "reply-1",
+					status: "error",
+					continuation: false,
+					message: { id: "reply", role: "assistant", parts: [] },
+				} as ChatResponseResult);
+				return instance.state.initialGeneration?.status;
+			});
+			// Setup still finishes an errored interview's site and starts its build.
+			expect(after).toBe(status);
+		},
+	);
 
 	it("waits for provisioning and the active mutation before reporting stopped", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000012");
