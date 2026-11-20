@@ -4,6 +4,7 @@ import type { ChatResponseResult } from "@cloudflare/ai-chat";
 import type { BuilderAgent } from "../src/worker/agent.js";
 import { BuildConvergence } from "../src/worker/build-convergence.js";
 import { shouldSkipSiteReadyTurn } from "../src/worker/turn-gate.js";
+import { TurnMetrics } from "../src/worker/turn-metrics.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
 
@@ -15,6 +16,8 @@ describe("initial generation stop", () => {
 	it("stops only the matching unfinished generation and persists across DO access", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000008");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -35,9 +38,58 @@ describe("initial generation stop", () => {
 		});
 	});
 
+	it.each([
+		{ kind: "interview" as const, status: "preparing" },
+		{ kind: "holding" as const, status: "preparing" },
+		{ kind: "initial-build" as const, status: "failed" },
+	])(
+		"leaves the first generation $status after a(n) $kind reply errors",
+		async ({ kind, status }) => {
+			const id = {
+				interview: "000000000031",
+				holding: "000000000033",
+				"initial-build": "000000000032",
+			}[kind];
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const after = await runInDurableObject(agent, async (instance) => {
+				await instance.lifecycle.start();
+				instance.setState({
+					...instance.state,
+					siteReady: kind === "initial-build",
+					initialGeneration: {
+						id: "opening-brief",
+						status: kind === "initial-build" ? "building" : "preparing",
+					},
+				});
+				const harness = instance as unknown as {
+					activeInitialRequestId?: string;
+					openTurnMetrics: Map<string, TurnMetrics>;
+					onChatResponse(result: ChatResponseResult): Promise<void>;
+				};
+				harness.activeInitialRequestId = "reply-1";
+				harness.openTurnMetrics.set(
+					"reply-1",
+					new TurnMetrics({ turnId: "reply-1", kind, resumed: false, model: "test", stepCap: 1 }),
+				);
+				// The model's call failed: the chat SDK ends the reply with an error.
+				await harness.onChatResponse({
+					requestId: "reply-1",
+					status: "error",
+					continuation: false,
+					message: { id: "reply", role: "assistant", parts: [] },
+				} as ChatResponseResult);
+				return instance.state.initialGeneration?.status;
+			});
+			// Setup still finishes an errored interview's site and starts its build.
+			expect(after).toBe(status);
+		},
+	);
+
 	it("waits for provisioning and the active mutation before reporting stopped", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000012");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -147,6 +199,8 @@ describe("initial generation stop", () => {
 	it("anchors active Stop to its own user message when another tab has sent a newer one", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-00000000000e");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "user-a", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 				{ id: "user-b", role: "user", parts: [{ type: "text", text: "Add a menu" }] },
@@ -214,6 +268,8 @@ describe("initial generation stop", () => {
 				siteReady ? "11111111-1111-4111-8111-00000000000c" : "11111111-1111-4111-8111-00000000000b",
 			);
 			await runInDurableObject(agent, async (instance) => {
+				// Started first, so the transcript it loads does not replace the one set here.
+				await instance.lifecycle.start();
 				const assistant: ChatResponseResult["message"] = {
 					id: "interview",
 					role: "assistant",
