@@ -522,13 +522,20 @@ function builtSnapshotContentType(path: string): string {
 
 /**
  * True if an Artifacts binding error means the repo doesn't exist yet. The
- * structured `.code` ("NOT_FOUND") is stripped when the error crosses the RPC
+ * structured `.code` ("NOT_FOUND") can be lost when the error crosses the RPC
  * boundary into the Worker, so fall back to matching the message.
  */
 function isArtifactsNotFound(err: unknown): boolean {
 	const e = err as { code?: string; message?: string } | undefined;
 	if (e?.code === "NOT_FOUND") return true;
 	return typeof e?.message === "string" && /not found/i.test(e.message);
+}
+
+/** True if the repo is still being created, by its code or, without one, its message. */
+function isArtifactsCreateInProgress(err: unknown): boolean {
+	const e = err as { code?: string; message?: string } | undefined;
+	if (e?.code === "CREATE_IN_PROGRESS") return true;
+	return typeof e?.message === "string" && /being created|create in progress/i.test(e.message);
 }
 
 function isChatRequestMessage(message: WSMessage): boolean {
@@ -1714,8 +1721,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const pinnedShotId = this.state.initialGeneration?.previewShotId ?? "";
 			this.sql`INSERT OR REPLACE INTO builder_preview_thumbnails (shot_id, base64, created_at)
 				VALUES (${shotId}, ${shot.base64}, ${Date.now()})`;
-			this
-				.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
+			this.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
 				SELECT shot_id FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} ORDER BY created_at DESC, rowid DESC LIMIT ${PREVIEW_THUMBNAIL_LIMIT}
 			)`;
 		} catch {
@@ -2116,8 +2122,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}>`SELECT v FROM builder_secrets WHERE k = 'creationDigest'`[0]?.v;
 		if (!recordedCreation) {
 			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('ownerDigest', ${ownerKey})`;
-			this
-				.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
+			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
 			return this.authorizeProject(ownerKey);
 		}
 		if (!equalTokenDigest(recordedCreation, creationDigest)) return false;
@@ -2456,14 +2461,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
-	 * The Artifacts repo handle from `get()` is an RPC stub, so `repo.remote` is
-	 * a promise, not the URL string -- it must be awaited. We also persist it so
-	 * later backups don't depend on the stub at all.
+	 * The repo handle from `get()` carries no metadata properties; its remote comes
+	 * from `info()`, a round trip. We persist it so later backups don't ask again.
 	 */
-	private async resolveArtifactsRemote(repo: { remote: string }): Promise<string> {
+	private async resolveArtifactsRemote(repo: Pick<ArtifactsRepo, "info">): Promise<string> {
 		const stored = this.getStoredArtifactsRemote();
 		if (stored) return stored;
-		const remote = await repo.remote;
+		const { remote } = await repo.info();
 		this.persistArtifactsRemote(remote);
 		return remote;
 	}
@@ -2554,6 +2558,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		} catch (err) {
 			if (isArtifactsNotFound(err)) {
 				return { ok: false, reason: "No snapshot saved yet. Make a change first, then clone." };
+			}
+			// The first checkpoint creates the repo; get() refuses until that finishes.
+			if (isArtifactsCreateInProgress(err)) {
+				return {
+					ok: false,
+					reason: "Your first snapshot is still being saved. Try again in a moment.",
+				};
 			}
 			throw err;
 		}
@@ -7199,8 +7210,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (resuming) markChatTurnStarted(this);
 		if (options?.requestId) {
 			// Chat turns run one at a time: any other chat row belongs to an interrupted turn.
-			this
-				.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
+			this.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
 			this.beginOwnerActivity(`chat:${options.requestId}`, "chat");
 			this.activeTurnRequestId = options.requestId;
 		}
