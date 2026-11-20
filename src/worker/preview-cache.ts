@@ -1,5 +1,11 @@
 import { PREVIEW_PROXY_HEADER } from "./preview-router.js";
 
+/**
+ * Where the site's worker (CANONICAL_WORKER_TS) reports how many items EmDash's
+ * scheduled maintenance has published, for the Sandbox to refresh the preview.
+ */
+export const SCHEDULED_PUBLISHES_PATH = "/_emdash-build/scheduled-publishes";
+
 /** Select only public HTML document routes for last-known-good preview caching. */
 export function previewDocumentKey(request: Request): string | undefined {
 	if (request.method !== "GET" && request.method !== "HEAD") return undefined;

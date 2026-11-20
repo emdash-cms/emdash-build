@@ -3888,6 +3888,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return { busy: busy() };
 	}
 
+	/** The Sandbox saw EmDash publish scheduled content: show it in the open preview. */
+	async refreshPreviewAfterScheduledPublish(): Promise<void> {
+		// A restart an evicted instance left in state is not under way.
+		this.resetProgressLeftByEviction();
+		if (!this.state.previewUrl || this.state.previewRestarting || this.isDeletionPending()) return;
+		this.sendConsole("EmDash published scheduled content. Refreshing the preview.");
+		await this.refreshAndReloadPreview();
+	}
+
 	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
 	async markSandboxStopped(): Promise<void> {
 		this.resetProgressLeftByEviction();
@@ -6864,8 +6873,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 									instructions: [
 										"You write the BODY of a single web content entry, in markdown.",
 										voice,
-										"Rules: 3-6 substantive paragraphs of real, specific writing. Use ## and ### for",
-										"section headings where they help. Do NOT repeat the title as a heading. No",
+										"Rules: 3-6 substantive paragraphs of real, specific writing, separated by blank",
+										"lines. Use ## and ### for section headings where they help. Do NOT repeat the title as a heading. No",
 										"frontmatter, no title line, no preamble such as 'Here is'. Output only the body markdown.",
 									].join("\n"),
 									prompt: `Title: ${entry.title}\n\nWrite about: ${entry.brief}`,

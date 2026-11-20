@@ -11,23 +11,24 @@
 		"validate": "pnpm validate:frontend && pnpm typecheck"
 	},
 	"dependencies": {
-		"@astrojs/cloudflare": "^14.3.1",
-		"@astrojs/react": "^6.0.5",
-		"@emdash-cms/cloudflare": "1.1.0",
-		"@tailwindcss/vite": "^4.3.3",
-		"astro": "^7.3.2",
-		"emdash": "1.1.0",
+		"@astrojs/cloudflare": "^14.4.9",
+		"@astrojs/react": "^7.1.9",
+		"@emdash-cms/cloudflare": "1.5.0",
+		"@tailwindcss/vite": "^4.3.5",
+		"astro": "^7.4.13",
+		"emdash": "1.5.0",
 		"react": "19.2.4",
 		"react-dom": "19.2.4",
-		"tailwindcss": "^4.3.3"
+		"tailwindcss": "^4.3.5"
 	},
 	"devDependencies": {
-		"@astrojs/check": "^0.9.7",
-		"@cloudflare/workers-types": "^5.20260820.1",
-		"wrangler": "4.131.2"
+		"@astrojs/check": "^0.9.12",
+		"@cloudflare/workers-types": "^5.20261118.1",
+		"typescript": "^6.0.3",
+		"wrangler": "4.163.0"
 	},
 	"engines": {
-		"node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+		"node": "^22.23.4 || ^24.15.0 || >=26.0.0"
 	},
 	"packageManager": "pnpm@11.9.0+sha512.bd682d5d03fe525ef7c9fd6780c6884d1e756ac4c9c9fe00c538782824310dcf90e3ddc4f53835f06dfaebd5085e41855e0bcbb3b60de2ac5bbab89e5036f03b",
 	"emdash": {
