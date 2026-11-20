@@ -3910,6 +3910,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		return { busy: busy() };
 	}
 
+	/** The Sandbox saw EmDash publish scheduled content: show it in the open preview. */
+	async refreshPreviewAfterScheduledPublish(): Promise<void> {
+		// A restart an evicted instance left in state is not under way.
+		this.resetProgressLeftByEviction();
+		if (!this.state.previewUrl || this.state.previewRestarting || this.isDeletionPending()) return;
+		this.sendConsole("EmDash published scheduled content. Refreshing the preview.");
+		await this.refreshAndReloadPreview();
+	}
+
 	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
 	async markSandboxStopped(): Promise<void> {
 		this.resetProgressLeftByEviction();
