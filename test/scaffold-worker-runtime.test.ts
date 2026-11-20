@@ -70,14 +70,42 @@ describe("the site worker's count of scheduled publishes", () => {
 		expect(await count(await loadWorker())).toEqual(counted);
 	});
 
-	it("answers neither route on the public preview host", async () => {
+	it.each([
+		"/_emdash/api/setup/dev-bypass?token=1",
+		"/_emdash/api/setup/dev-reset",
+		"/_emdash/api/dev/scheduled-tasks",
+		SCHEDULED_PUBLISHES_PATH,
+	])("keeps %s off the public preview", async (path) => {
 		const worker = await loadWorker();
 		const host = "4321-project-token.build.emdashcms.com";
+		const asked = (url: string, headers: Record<string, string> = {}) =>
+			Promise.all(
+				["GET", "POST"].map(
+					async (method) => (await call(worker, url, { method, headers })).status,
+				),
+			);
 
-		expect((await sweep(worker, host)).status).toBe(404);
-		expect((await call(worker, `https://${host}${SCHEDULED_PUBLISHES_PATH}`)).status).toBe(404);
+		// The Sandbox forwards preview traffic to localhost, naming the public host here.
+		expect(
+			await asked(`http://localhost:4321${path}`, {
+				"X-Forwarded-Host": host,
+				"X-Forwarded-Proto": "https",
+			}),
+		).toEqual([404, 404]);
+		// A quick tunnel reaches the dev server under the public host itself.
+		expect(await asked(`https://${host}${path}`)).toEqual([404, 404]);
 		expect(emdash.runScheduledTasks).not.toHaveBeenCalled();
 		expect(emdash.fetch).not.toHaveBeenCalled();
+	});
+
+	it("still answers the container's own requests, which name no other host", async () => {
+		const worker = await loadWorker();
+		const local = await call(worker, "http://localhost:4321/_emdash/api/setup/dev-bypass?token=1", {
+			headers: { "X-Forwarded-Host": "localhost:4321" },
+		});
+
+		expect(await local.text()).toBe("from EmDash");
+		expect((await sweep(worker)).status).toBe(204);
 	});
 
 	it("leaves the maintenance route's other methods to EmDash", async () => {

@@ -459,6 +459,21 @@ const scheduledPublishes = ((
 const fetchHandler = handler.fetch;
 if (!fetchHandler) throw new Error("The EmDash Worker handler is missing fetch().");
 
+const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+
+/**
+ * Whether a request comes from inside the container. The preview sends public
+ * traffic to localhost too, so the public host shows only in X-Forwarded-Host.
+ */
+function isLoopbackRequest(request: Request, url: URL): boolean {
+	if (!loopbackHosts.has(url.hostname)) return false;
+	const forwarded = request.headers.get("X-Forwarded-Host");
+	if (!forwarded) return true;
+	return forwarded
+		.split(",")
+		.every((host) => loopbackHosts.has(host.trim().replace(/:\\d+$/, "").toLowerCase()));
+}
+
 export default {
 	...handler,
 	async fetch(request, env, ctx) {
@@ -476,11 +491,7 @@ export default {
 			routePath = decoded;
 		}
 		if (routePath.length > 1) routePath = routePath.replace(/\\/+$/, "");
-		if (
-			localOnlyDevRoutes.has(routePath) &&
-			url.hostname !== "localhost" &&
-			url.hostname !== "127.0.0.1"
-		) {
+		if (localOnlyDevRoutes.has(routePath) && !isLoopbackRequest(request, url)) {
 			return new Response("Not found", { status: 404 });
 		}
 		if (routePath === "/_emdash-build/scheduled-publishes") {
