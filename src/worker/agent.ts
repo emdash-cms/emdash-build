@@ -525,6 +525,18 @@ function builtSnapshotContentType(path: string): string {
  * structured `.code` ("NOT_FOUND") can be lost when the error crosses the RPC
  * boundary into the Worker, so fall back to matching the message.
  */
+/**
+ * WebSocket close codes. The agents client stops reconnecting after 1008 or a
+ * code from 4000 to 4999, so those end a connection that cannot come back. The
+ * others make it reconnect, which is how a tab picks up a change of credentials.
+ */
+const CLOSE_NOT_FOUND = 4404;
+const CLOSE_GONE = 4403;
+/** The project moved to another owner; the tab's cookie may now name it. */
+const CLOSE_RECONNECT = 1012;
+/** The tab's credential could not be checked just now. */
+const CLOSE_TRY_AGAIN = 1013;
+
 function isArtifactsNotFound(err: unknown): boolean {
 	const e = err as { code?: string; message?: string } | undefined;
 	if (e?.code === "NOT_FOUND") return true;
@@ -1337,8 +1349,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnConnect = this.onConnect.bind(this);
 		this.onConnect = async (connection: Connection, context: ConnectionContext) => {
 			const auth = readVerifiedAgentAuth(context.request);
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
-				connection.close(4404, "Project not found");
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (live !== "live") {
+				if (live === "unavailable") connection.close(CLOSE_TRY_AGAIN, "Try again");
+				else connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			const previous =
@@ -1350,7 +1364,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnRequest = this.onRequest.bind(this);
 		this.onRequest = async (request: Request) => {
 			const auth = readVerifiedAgentAuth(request);
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (live === "unavailable") {
+				return Response.json({ error: "Try again." }, { status: 503 });
+			}
+			if (live !== "live") {
 				return Response.json({ error: "Project not found." }, { status: 404 });
 			}
 			return frameworkOnRequest(request);
@@ -1359,8 +1377,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnMessage = this.onMessage.bind(this);
 		this.onMessage = async (connection: Connection, message: WSMessage) => {
 			const auth = (connection.state as { emdashAuth?: VerifiedAgentAuth } | null)?.emdashAuth;
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
-				connection.close(4404, "Project not found");
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (!auth || live !== "live") {
+				if (live === "unavailable") connection.close(CLOSE_TRY_AGAIN, "Try again");
+				else connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			if (
@@ -1371,12 +1391,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					auth.sessionHash,
 				))
 			) {
-				connection.close(4404, "Project not found");
+				connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			const currentOwner = this.getOwnerRecord();
 			if (!currentOwner || !equalTokenDigest(currentOwner.ownerKey, auth.ownerKey)) {
-				connection.close(4404, "Project not found");
+				connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			if (isChatResumeRequest(message)) {
@@ -1425,7 +1445,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.isAccountSessionRevoked(auth.sessionHash))
 			) {
 				closed.push(connection.id);
-				connection.close(4404, "Session ended");
+				connection.close(CLOSE_NOT_FOUND, "Session ended");
 			}
 		}
 		return closed;
@@ -2041,15 +2061,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
-	private closeAgentConnections(reason: string) {
-		for (const connection of this.getConnections()) connection.close(4403, reason);
+	private closeAgentConnections(code: number, reason: string) {
+		for (const connection of this.getConnections()) connection.close(code, reason);
 	}
 
+	/** Ask tabs authorized as someone other than `ownerKey` to reconnect with their current cookie. */
 	private closeStaleAgentConnections(ownerKey: string, reason: string) {
 		for (const connection of this.getConnections()) {
 			const auth = (connection.state as { emdashAuth?: VerifiedAgentAuth } | null)?.emdashAuth;
 			if (!auth || !equalTokenDigest(auth.ownerKey, ownerKey)) {
-				connection.close(4403, reason);
+				connection.close(CLOSE_RECONNECT, reason);
 			}
 		}
 	}
@@ -2069,36 +2090,43 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				auth.sessionHash &&
 				equalTokenDigest(auth.sessionHash, sessionHash)
 			) {
-				connection.close(4404, "Session ended");
+				connection.close(CLOSE_NOT_FOUND, "Session ended");
 			}
 		}
 	}
 
-	private async isAgentAuthLive(auth: VerifiedAgentAuth): Promise<boolean> {
+	/**
+	 * Whether a tab's credential still opens this project: "unavailable" when the
+	 * check itself failed, so the tab tries again rather than giving up.
+	 */
+	private async agentAuthStatus(
+		auth: VerifiedAgentAuth,
+	): Promise<"live" | "ended" | "unavailable"> {
 		const owner = this.getOwnerRecord();
 		if (!owner || !equalTokenDigest(owner.ownerKey, auth.ownerKey)) {
-			return false;
+			return "ended";
 		}
 		let credentialLive: boolean;
-		if (auth.kind === "guest") {
-			credentialLive = await this.env.ProjectCatalog.getByName(auth.ownerKey).authorizeActiveGuest(
-				auth.ownerKey,
-			);
-		} else {
-			if (!auth.sessionHash || !auth.expiresAt || auth.expiresAt <= Date.now()) return false;
-			if (this.isAccountSessionRevoked(auth.sessionHash)) return false;
-			try {
+		try {
+			if (auth.kind === "guest") {
+				credentialLive = await this.env.ProjectCatalog.getByName(
+					auth.ownerKey,
+				).authorizeActiveGuest(auth.ownerKey);
+			} else {
+				if (!auth.sessionHash || !auth.expiresAt || auth.expiresAt <= Date.now()) return "ended";
+				if (this.isAccountSessionRevoked(auth.sessionHash)) return "ended";
 				credentialLive = await AccountAuthStore.fromEnv(
 					this.env as Env & IdentityBindings,
 				).isSessionHashLive(auth.sessionHash);
-			} catch {
-				return false;
 			}
+		} catch (error) {
+			console.warn("[BuilderAgent] credential check unavailable:", error);
+			return "unavailable";
 		}
 		const currentOwner = this.getOwnerRecord();
-		return Boolean(
-			credentialLive && currentOwner && equalTokenDigest(currentOwner.ownerKey, auth.ownerKey),
-		);
+		return credentialLive && currentOwner && equalTokenDigest(currentOwner.ownerKey, auth.ownerKey)
+			? "live"
+			: "ended";
 	}
 
 	/** Bind a newly-created project to its server-issued owner key. */
@@ -2221,7 +2249,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			)
 				return "busy";
 			this.sql`INSERT OR REPLACE INTO builder_secrets (k, v) VALUES ('deleting', '1')`;
-			this.closeAgentConnections("Project deleted");
+			this.closeAgentConnections(CLOSE_GONE, "Project deleted");
 		}
 		this.deletionPromise ??= (async () => {
 			await this.backupChain;
@@ -2296,7 +2324,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			v: string;
 		}>`UPDATE builder_secrets SET v = ${accountOwnerKey} WHERE k = 'ownerDigest' AND v = ${expectedGuestKey} RETURNING v`;
 		if (changed.length !== 1) return "conflict";
-		this.closeAgentConnections("Ownership changed");
+		this.closeAgentConnections(CLOSE_RECONNECT, "Ownership changed");
 		return "claimed";
 	}
 
