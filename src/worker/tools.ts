@@ -444,6 +444,8 @@ export { PluginBridge };
 const localOnlyDevRoutes = new Set([
 	"/_emdash/api/setup/dev-bypass",
 	"/_emdash/api/setup/dev-reset",
+	// EmDash 1.3+: the dev server runs scheduled maintenance through this route.
+	"/_emdash/api/dev/scheduled-tasks",
 ]);
 const fetchHandler = handler.fetch;
 if (!fetchHandler) throw new Error("The EmDash Worker handler is missing fetch().");
