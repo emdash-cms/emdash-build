@@ -1,4 +1,4 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
+import { env, evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatRecoveryContext, ChatRecoveryOptions } from "@cloudflare/ai-chat";
 import type { UIMessage } from "ai";
@@ -472,4 +472,269 @@ describe("chat recovery", () => {
 
 		expect(outcome).toEqual({ steps: ["recover the site", "wait for MCP"], reply: "" });
 	});
+});
+
+describe("chat recovery the chat SDK settles itself", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	type SettledHarness = RecoveryHarness & {
+		activeInitialRequestId?: string;
+		onChatResponse(result: Record<string, unknown>): Promise<void>;
+		beginOwnerActivity(id: string, kind: string): void;
+		chatRecovery: { onExhausted?(ctx: Record<string, unknown>): Promise<void> | void };
+		openTurnMetrics: Map<string, TurnMetrics>;
+		startedBuildOnStart: boolean;
+		autoStartPending: boolean;
+		provisionController?: AbortController;
+	};
+	const turnOf = (requestId: string, kind: "interview" | "initial-build" | "follow-up") =>
+		new TurnMetrics({ turnId: requestId, kind, resumed: false, model: "test", stepCap: 1 });
+	const exhausted = (requestId: string) => ({
+		requestId,
+		recoveryRootRequestId: requestId,
+		reason: "no_progress_timeout",
+		terminalMessage: "The response was interrupted.",
+	});
+	const brief: UIMessage = {
+		id: "brief",
+		role: "user",
+		parts: [{ type: "text", text: "A bakery" }],
+	};
+
+	/** A first build under way, as its turn left it. */
+	async function building(instance: BuilderAgent) {
+		await instance.lifecycle.start();
+		instance.setState({
+			...instance.state,
+			siteReady: true,
+			buildStarted: true,
+			initialGeneration: { id: "brief", status: "building" },
+		});
+		return instance as unknown as SettledHarness;
+	}
+	const respond = (harness: SettledHarness, requestId: string, status: string) => {
+		harness.activeInitialRequestId = requestId;
+		return harness.onChatResponse({
+			requestId,
+			status,
+			continuation: false,
+			message: { id: `reply-${requestId}`, role: "assistant", parts: [] },
+		});
+	};
+
+	it("keeps building when recovery continues a stream that failed in place", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000051");
+		const status = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			expect(
+				await harness.onChatRecovery({
+					requestId: "streamed-some",
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [{ type: "text", text: "Adding the menu" }],
+					messages: [brief],
+				}),
+			).toEqual({});
+			// The chat SDK ends the interrupted request as aborted and continues it.
+			await respond(harness, "streamed-some", "aborted");
+			return instance.state.initialGeneration?.status;
+		});
+		expect(status).toBe("building");
+	});
+
+	it("does not fail a reply that finished before its stream failed", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000052");
+		const status = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			expect(
+				await harness.onChatRecovery({
+					requestId: "finished",
+					recoveryData: { chatTurnFinished: true },
+					partialParts: [],
+					messages: [brief],
+				}),
+			).toEqual({ continue: false });
+			await respond(harness, "finished", "error");
+			return instance.state.initialGeneration?.status;
+		});
+		expect(status).toBe("building");
+	});
+
+	it("stops restarting a turn whose stream keeps failing in place", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000053");
+		const statuses = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			const seen: Array<string | undefined> = [];
+			for (const requestId of ["attempt-1", "attempt-2", "attempt-3"]) {
+				harness.openTurnMetrics.set(requestId, turnOf(requestId, "initial-build"));
+				await harness.onChatRecovery({
+					requestId,
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [brief],
+				});
+				await respond(harness, requestId, "error");
+				seen.push(instance.state.initialGeneration?.status);
+			}
+			return seen;
+		});
+		expect(statuses).toEqual(["building", "building", "failed"]);
+	});
+
+	it("continues a follow-up it started after onStart started the first build", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000056");
+		const options = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			harness.startedBuildOnStart = true;
+			harness.openTurnMetrics.set("follow-up", turnOf("follow-up", "follow-up"));
+			return harness.onChatRecovery({
+				requestId: "follow-up",
+				recoveryData: { chatTurnStarted: true },
+				partialParts: [{ type: "text", text: "Adding the events page" }],
+				messages: [brief],
+			});
+		});
+		expect(options).toEqual({});
+	});
+
+	it.each([
+		{ kind: "initial-build" as const, status: "failed" },
+		{ kind: "interview" as const, status: "preparing" },
+	])(
+		"ends the $kind turn recovery gave up on in place as an error, not a Stop",
+		async ({ kind, status }) => {
+			const id = kind === "interview" ? "000000000058" : "000000000057";
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const outcome = await runInDurableObject(agent, async (instance) => {
+				const harness = await building(instance);
+				if (kind === "interview") {
+					instance.setState({
+						...instance.state,
+						siteReady: false,
+						buildStarted: false,
+						initialGeneration: { id: "brief", status: "preparing" },
+					});
+				}
+				const setup = new AbortController();
+				harness.provisionController = setup;
+				harness.beginOwnerActivity("chat:in-place", "chat");
+				harness.openTurnMetrics.set("in-place", turnOf("in-place", kind));
+				await harness.chatRecovery.onExhausted?.(exhausted("in-place"));
+				// The chat SDK then ends the request it gave up on as aborted.
+				await respond(harness, "in-place", "aborted");
+				return {
+					status: instance.state.initialGeneration?.status,
+					setupAborted: setup.signal.aborted,
+				};
+			});
+			expect(outcome).toEqual({ status, setupAborted: false });
+		},
+	);
+
+	it("leaves setup to resume when recovery gives up on a turn before the build", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000059");
+		const status = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			instance.setState({
+				...instance.state,
+				siteReady: false,
+				buildStarted: false,
+				initialGeneration: { id: "brief", status: "preparing" },
+			});
+			instance.sql`INSERT INTO owner_activity (id, kind, started_at)
+				VALUES ('chat:interview', 'chat', ${Date.now()})`;
+			await harness.chatRecovery.onExhausted?.(exhausted("interview"));
+			return instance.state.initialGeneration?.status;
+		});
+		expect(status).toBe("preparing");
+	});
+
+	it.each([
+		{ pending: true, status: "building" },
+		{ pending: false, status: "failed" },
+	])(
+		"leaves the first build onStart started to settle the generation while it runs (running: $pending)",
+		async ({ pending, status }) => {
+			const id = pending ? "00000000005a" : "00000000005b";
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const after = await runInDurableObject(agent, async (instance) => {
+				const harness = await building(instance);
+				harness.startedBuildOnStart = true;
+				harness.autoStartPending = pending;
+				await harness.chatRecovery.onExhausted?.(exhausted("interview"));
+				return instance.state.initialGeneration?.status;
+			});
+			expect(after).toBe(status);
+		},
+	);
+
+	it("fails a first build recovery gave up on before it began to stream", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-00000000005c");
+		const status = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			// The build marks itself started only just before it streams.
+			instance.setState({ ...instance.state, buildStarted: false });
+			await harness.chatRecovery.onExhausted?.(exhausted("restoring"));
+			return instance.state.initialGeneration?.status;
+		});
+		expect(status).toBe("failed");
+	});
+
+	it("counts in-place restarts again after a turn ends without one", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-00000000005d");
+		const statuses = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			const seen: Array<string | undefined> = [];
+			const failInPlace = async (requestId: string) => {
+				harness.openTurnMetrics.set(requestId, turnOf(requestId, "initial-build"));
+				await harness.onChatRecovery({
+					requestId,
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [brief],
+				});
+				await respond(harness, requestId, "error");
+				seen.push(instance.state.initialGeneration?.status);
+			};
+			await failInPlace("attempt-1");
+			await failInPlace("attempt-2");
+			// A turn that ran to its end in between: the next failure is a fresh start.
+			await respond(harness, "answered", "completed");
+			await failInPlace("attempt-3");
+			return seen;
+		});
+		expect(statuses).toEqual(["building", "building", "building"]);
+	});
+
+	it.each([
+		{ live: false, status: "failed", rows: [] },
+		{ live: true, status: "building", rows: ["chat:live"] },
+	])(
+		"settles a turn recovery gave up on unless one is running here (running: $live)",
+		async ({ live, status, rows }) => {
+			const id = live ? "000000000055" : "000000000054";
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const outcome = await runInDurableObject(agent, async (instance) => {
+				const harness = await building(instance);
+				// Left by the instance whose turn recovery kept failing to resume.
+				instance.sql`INSERT INTO owner_activity (id, kind, started_at)
+					VALUES ('chat:gone', 'chat', ${Date.now()})`;
+				if (live) harness.beginOwnerActivity("chat:live", "chat");
+				await harness.chatRecovery.onExhausted?.({
+					requestId: "gone",
+					recoveryRootRequestId: "gone",
+					reason: "interrupted_attempts_exceeded",
+					terminalMessage: "The response was interrupted.",
+				});
+				return {
+					status: instance.state.initialGeneration?.status,
+					rows: instance.sql<{ id: string }>`SELECT id FROM owner_activity WHERE kind = 'chat'`.map(
+						(row) => row.id,
+					),
+				};
+			});
+			expect(outcome).toEqual({ status, rows });
+		},
+	);
 });

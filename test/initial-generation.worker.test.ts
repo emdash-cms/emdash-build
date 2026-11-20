@@ -40,20 +40,25 @@ describe("initial generation stop", () => {
 
 	it.each([
 		{ kind: "interview" as const, status: "preparing" },
+		{ kind: "holding" as const, status: "preparing" },
 		{ kind: "initial-build" as const, status: "failed" },
 	])(
 		"leaves the first generation $status after a(n) $kind reply errors",
 		async ({ kind, status }) => {
-			const id = kind === "interview" ? "000000000031" : "000000000032";
+			const id = {
+				interview: "000000000031",
+				holding: "000000000033",
+				"initial-build": "000000000032",
+			}[kind];
 			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
 			const after = await runInDurableObject(agent, async (instance) => {
 				await instance.lifecycle.start();
 				instance.setState({
 					...instance.state,
-					siteReady: kind !== "interview",
+					siteReady: kind === "initial-build",
 					initialGeneration: {
 						id: "opening-brief",
-						status: kind === "interview" ? "preparing" : "building",
+						status: kind === "initial-build" ? "building" : "preparing",
 					},
 				});
 				const harness = instance as unknown as {
