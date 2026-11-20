@@ -917,7 +917,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(exec).toHaveBeenCalledTimes(2);
 	});
 
-	it("keeps screenshot bytes through both AI SDK model-output conversions", async () => {
+	it("hands the model a screenshot once, then releases its bytes", async () => {
 		const capturePreview = vi.fn(async () => ({
 			ok: true as const,
 			base64: "cHJldmlldw==",
@@ -930,15 +930,16 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const convert = tools.view_preview.toModelOutput as (input: { output: unknown }) => unknown;
 
 		const first = convert({ output });
-		const second = convert({ output });
+		// AI SDK 7 converts a result once and reuses the message for every later step.
+		const later = convert({ output });
 
-		expect(first).toEqual(second);
 		expect(first).toMatchObject({
 			type: "content",
 			value: expect.arrayContaining([
-				expect.objectContaining({ type: "file-data", data: "cHJldmlldw==" }),
+				expect.objectContaining({ type: "file", data: { type: "data", data: "cHJldmlldw==" } }),
 			]),
 		});
+		expect(later).toMatchObject({ type: "error-text" });
 	});
 
 	it("stores a separate thumbnail without adding image bytes to the chat tool result", async () => {
@@ -1175,7 +1176,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const currentOutput = await viewPreview();
 		expect(convert({ output: currentOutput })).toMatchObject({
 			type: "content",
-			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
+			value: expect.arrayContaining([expect.objectContaining({ type: "file" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
 	});
@@ -1195,7 +1196,6 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const convert = tools.view_preview.toModelOutput as (input: { output: unknown }) => unknown;
 
 		const captured = await viewPreview();
-		convert({ output: captured });
 		convert({ output: captured });
 		const cached = await viewPreview();
 		const finishMutation = convergence.beginMutation();
@@ -1233,7 +1233,6 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 
 		const exploratory = await viewPreview();
 		convert({ output: exploratory });
-		convert({ output: exploratory });
 		const finishMutation = convergence.beginMutation();
 		finishMutation();
 
@@ -1246,7 +1245,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(validated).toMatchObject({ success: true, preview: { shotId: expect.any(String) } });
 		expect(convertValidation({ output: validated })).toMatchObject({
 			type: "content",
-			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
+			value: expect.arrayContaining([expect.objectContaining({ type: "file" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
 		expect(convergence.hasCurrentPreviewCapture()).toBe(true);

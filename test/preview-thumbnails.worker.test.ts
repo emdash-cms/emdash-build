@@ -57,7 +57,7 @@ describe("builder preview thumbnails", () => {
 		expect(result.modelOutput).toMatchObject({
 			type: "content",
 			value: expect.arrayContaining([
-				expect.objectContaining({ type: "file-data", data: screenshot }),
+				expect.objectContaining({ type: "file", data: { type: "data", data: screenshot } }),
 			]),
 		});
 		expect(await agent.getPreviewThumbnail((result.output as { shotId: string }).shotId)).toEqual({

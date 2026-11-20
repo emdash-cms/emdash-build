@@ -539,6 +539,17 @@ export const PREVIEW_IMAGE_CAPTION =
 const OMITTED_PREVIEW_TEXT =
 	"A superseded preview image was omitted from the current build context.";
 
+/**
+ * The base64 bytes of a screenshot in a tool result: a `file` part with inline
+ * data, or the `file-data` part AI SDK 6 used.
+ */
+function previewImageData(item: { type: string; data?: unknown }): string | undefined {
+	if (item.type === "file-data") return typeof item.data === "string" ? item.data : undefined;
+	if (item.type !== "file" || typeof item.data !== "object" || item.data === null) return undefined;
+	const data = item.data as { type?: unknown; data?: unknown };
+	return data.type === "data" && typeof data.data === "string" ? data.data : undefined;
+}
+
 export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean): ModelMessage[] {
 	const imageLocations: Array<{ messageIndex: number; partIndex: number }> = [];
 	for (const [messageIndex, message] of messages.entries()) {
@@ -548,7 +559,7 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 				part.type !== "tool-result" ||
 				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content" ||
-				!part.output.value.some((item) => item.type === "file-data")
+				!part.output.value.some((item) => previewImageData(item) !== undefined)
 			) {
 				continue;
 			}
@@ -625,16 +636,17 @@ export function promoteLatestPreviewImage(
 			) {
 				continue;
 			}
-			const file = part.output.value.find((item) => item.type === "file-data");
-			if (!file || typeof file.data !== "string") continue;
+			const file = part.output.value.find((item) => previewImageData(item) !== undefined);
+			const data = file && previewImageData(file);
+			if (!file || data === undefined || !("mediaType" in file)) continue;
 			latest = {
 				text:
 					part.output.value
 						.filter((item): item is { type: "text"; text: string } => item.type === "text")
 						.map((item) => item.text)
 						.join("\n") || PREVIEW_USER_TEXT,
-				data: file.data,
-				mediaType: file.mediaType,
+				data,
+				mediaType: file.mediaType as string,
 			};
 		}
 	}
