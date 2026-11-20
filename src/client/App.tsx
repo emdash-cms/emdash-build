@@ -76,6 +76,12 @@ import {
 } from "../shared/client-recovery.js";
 import { fetchWithTransientRetries } from "./retry.js";
 
+/**
+ * For calls that wait on the sandbox or a save: restoring a site, a checkpoint
+ * retry and Stop can each outlast the agents client's 30-second default.
+ */
+const WAIT_FOR_RESULT = { timeout: 0 } as const;
+
 const LandingAurora = lazy(() => import("./components/LandingAurora.js"));
 const CLAIM_WINDOW_MS = 60 * 60 * 1000;
 const PENDING_PROJECT_CREATION_KEY = "emdash-build:pending-project-creation";
@@ -919,7 +925,7 @@ function AppInner({
 			if (saveRetryInFlight.current) return;
 			saveRetryInFlight.current = true;
 			void agent
-				.call<boolean>("retrySessionSave")
+				.call<boolean>("retrySessionSave", [], WAIT_FOR_RESULT)
 				.then((saved) => {
 					if (saved) toasts.close(persistenceToastId);
 				})
@@ -1127,7 +1133,11 @@ function AppInner({
 		setResumingPreview(true);
 		setProvisionError(undefined);
 		agent
-			.call<{ ready: boolean; error?: string }>("resumePreview", [window.location.host])
+			.call<{ ready: boolean; error?: string }>(
+				"resumePreview",
+				[window.location.host],
+				WAIT_FOR_RESULT,
+			)
 			.then((result) => {
 				resumeInFlight.current = false;
 				setPreviewRestarting(false);
@@ -1274,7 +1284,9 @@ function AppInner({
 		[agent],
 	);
 	const refreshPreviewRoute = useCallback(
-		(path: string) => agent.call<{ refreshed: boolean }>("refreshPreviewRoute", [path]),
+		(path: string) =>
+			// The agent bounds a route render at 60 seconds; wait slightly longer for its answer.
+			agent.call<{ refreshed: boolean }>("refreshPreviewRoute", [path], { timeout: 65_000 }),
 		[agent],
 	);
 	const checkPreviewRoute = useCallback(
@@ -1599,7 +1611,7 @@ function AppInner({
 			initialGeneration && isInitialGenerationActive(initialGeneration.status)
 				? initialGeneration.id
 				: undefined;
-		const stopped = await agent.call<boolean>("stopGeneration", [generationId]);
+		const stopped = await agent.call<boolean>("stopGeneration", [generationId], WAIT_FOR_RESULT);
 		if (!stopped) throw new Error("Could not confirm the build stopped. Check its activity.");
 	}, [agent, initialGeneration?.id, initialGeneration?.status]);
 	const setupAnswer = setupAnswerForDetails(replyMessages, detailsMessage?.id ?? detailsId);
