@@ -672,6 +672,26 @@ const ABANDONED_REPAIR_NOTE =
 const BYPASSED_REPAIR_NOTE =
 	"A later call of the same tool succeeded, but not as these failed calls; one may have been retried under another name or slug. Check each is covered (for example with content_list) before creating it again; otherwise say in your final summary what is still missing:";
 
+const FORCED_REPAIR_NOTE = "Repair this failure now with ";
+
+/**
+ * Drop the notes an earlier step added. AI SDK 7 hands a step's prepared
+ * messages on to the next step, so each step would otherwise keep every note
+ * before it, including a forced repair already done.
+ */
+function withoutBuilderNotes(messages: ModelMessage[]): ModelMessage[] {
+	return messages.filter((message) => {
+		if (message.role !== "user" || !Array.isArray(message.content)) return true;
+		const [part, ...rest] = message.content;
+		if (rest.length > 0 || part?.type !== "text") return true;
+		return !(
+			part.text.startsWith(FORCED_REPAIR_NOTE) ||
+			part.text.startsWith(ABANDONED_REPAIR_NOTE) ||
+			part.text.startsWith(BYPASSED_REPAIR_NOTE)
+		);
+	});
+}
+
 /**
  * Say which failure a forced step is for: two calls of one tool can fail the
  * same way, and a retry of the other would look like the repair.
@@ -683,7 +703,7 @@ function withForcedRepairNote(
 	// Keys end with what failed: a collection, locale and entry, or an image.
 	const subject = failure.key.split("\0").slice(1).filter(Boolean).join(" / ");
 	// "Repair", not "retry": a content_update of a missing entry is repaired with content_create.
-	const text = `Repair this failure now with ${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
+	const text = `${FORCED_REPAIR_NOTE}${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
 	return [...messages, { role: "user", content: [{ type: "text", text }] }];
 }
 
@@ -729,7 +749,7 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 	toolNames: readonly TOOL_NAME[],
 ): PreparedBuildStep<TOOL_NAME> {
 	const preparedPreview = promoteLatestPreviewImage(
-		messages,
+		withoutBuilderNotes(messages),
 		convergence.hasCurrentPreviewCapture(),
 	);
 	if (preparedPreview.promoted) {
