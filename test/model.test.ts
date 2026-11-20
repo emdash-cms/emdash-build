@@ -69,7 +69,12 @@ describe("builder model configuration", () => {
 		});
 		// Nobody reads a sub-call's reasoning, so it asks for no summary.
 		expect(builderProviderOptions("low", { reasoningSummary: false })).toEqual({
-			openai: { forceReasoning: true, reasoningEffort: "low", store: false },
+			openai: {
+				forceReasoning: true,
+				reasoningEffort: "low",
+				reasoningSummary: null,
+				store: false,
+			},
 		});
 	});
 
@@ -294,6 +299,28 @@ describe("build step requests", () => {
 			},
 		]);
 	}
+
+	it("asks for a reasoning summary only where one is read", async () => {
+		const bodies: Array<Record<string, unknown>> = [];
+		const model = createBuilderModel(env, {
+			fetch: async (_input, init) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return textTurn();
+			},
+		});
+		for (const reasoningSummary of [true, false]) {
+			await streamText({
+				model,
+				prompt: "Write",
+				providerOptions: builderProviderOptions("low", { reasoningSummary }),
+			}).consumeStream();
+		}
+		// @ai-sdk/openai 4 asks for a detailed summary unless told none is wanted.
+		expect(bodies.map((body) => body.reasoning)).toEqual([
+			{ effort: "low", summary: "auto" },
+			{ effort: "low" },
+		]);
+	});
 
 	it("sends the same tools every step and restricts calls through tool_choice", async () => {
 		const bodies: Array<Record<string, unknown>> = [];

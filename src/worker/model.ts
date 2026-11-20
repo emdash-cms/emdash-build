@@ -41,7 +41,8 @@ export function builderProviderOptions(
 		openai: {
 			forceReasoning: true,
 			reasoningEffort: effort,
-			...(reasoningSummary ? { reasoningSummary: "auto" } : {}),
+			// @ai-sdk/openai 4 asks for a detailed summary when this is left out.
+			reasoningSummary: reasoningSummary ? "auto" : null,
 			...(promptCacheKey ? { promptCacheKey } : {}),
 			store: false,
 		} satisfies OpenAIResponsesProviderOptions,
