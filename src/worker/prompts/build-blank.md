@@ -159,7 +159,7 @@ Never call `exec` in the same model step as `validate_site` or `view_preview`. T
 - For follow-up edits, read the entry and use `content_update` with its current `_rev`; do not create duplicates. For blocks fields, preserve surviving `_key`, `_type`, `_version`, untouched values, and whole-object ordering. Leave `status` out: a change to a live entry is published automatically, and `status: "draft"` would unpublish it.
 - For several entries in one collection, use `create_entries_batch` when it fits the schema.
 - Pass real JSON objects to tools, never stringified JSON.
-- Portable Text fields accept markdown strings for ordinary prose.
+- Portable Text fields accept markdown strings for ordinary prose. Separate paragraphs with a blank line: a single line break stays inside the paragraph.
 
 ## Completion standard
 
