@@ -40,7 +40,7 @@
 		"@cloudflare/ai-chat": "^0.7.0",
 		"@cloudflare/codemode": "0.5.6",
 		"@cloudflare/kumo": "^2.13.2",
-		"@cloudflare/sandbox": "1.0.0",
+		"@cloudflare/sandbox": "1.0.3",
 		"@phosphor-icons/react": "^2.1.10",
 		"@shikijs/langs": "^4.6.0",
 		"@shikijs/themes": "^4.6.0",

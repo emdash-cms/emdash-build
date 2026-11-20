@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "emdash-build",
 	"account_id": "1f74638c495bc9f0330ce5c8e64c1b6b",
-	"compatibility_date": "2026-03-24",
+	"compatibility_date": "2026-11-17",
 	"compatibility_flags": ["nodejs_compat", "enable_abortsignal_rpc"],
 	"main": "./src/worker/index.ts",
 	"observability": {

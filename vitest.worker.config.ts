@@ -8,8 +8,8 @@ export default defineConfig({
 		cloudflareTest({
 			main: "./src/worker/index.ts",
 			miniflare: {
-				compatibilityDate: "2026-03-24",
-				compatibilityFlags: ["nodejs_compat"],
+				compatibilityDate: "2026-11-17",
+				compatibilityFlags: ["nodejs_compat", "enable_abortsignal_rpc"],
 				d1Databases: ["AUTH_DB"],
 				r2Buckets: ["SITE_MEDIA", "WFP_RELEASES"],
 				durableObjects: {

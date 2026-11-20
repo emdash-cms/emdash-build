@@ -67,8 +67,9 @@ beforeAll(() => {
 	);
 	tool(
 		"cloudflared",
-		// It names its own API host first, as its error lines do.
-		'#!/bin/sh\necho "failed to request quick Tunnel: Post https://api.trycloudflare.com/tunnel"\necho "|  https://quick-brown-fox.trycloudflare.com  |"\nexec sleep 30\n',
+		// It names its own API host first, as its error lines do. It refuses to start
+		// unless asked for IPv4, as 2026.3.0 did before --edge-ip-version became auto.
+		'#!/bin/sh\ncase " $* " in *" --edge-ip-version 4 "*) ;; *) echo "expected --edge-ip-version 4: $*" >&2; exit 2;; esac\necho "failed to request quick Tunnel: Post https://api.trycloudflare.com/tunnel"\necho "|  https://quick-brown-fox.trycloudflare.com  |"\nexec sleep 30\n',
 	);
 	path = `${bin}:/usr/bin:/bin`;
 });
