@@ -15,6 +15,8 @@ describe("initial generation stop", () => {
 	it("stops only the matching unfinished generation and persists across DO access", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000008");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -38,6 +40,8 @@ describe("initial generation stop", () => {
 	it("waits for provisioning and the active mutation before reporting stopped", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000012");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -147,6 +151,8 @@ describe("initial generation stop", () => {
 	it("anchors active Stop to its own user message when another tab has sent a newer one", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-00000000000e");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "user-a", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 				{ id: "user-b", role: "user", parts: [{ type: "text", text: "Add a menu" }] },
@@ -214,6 +220,8 @@ describe("initial generation stop", () => {
 				siteReady ? "11111111-1111-4111-8111-00000000000c" : "11111111-1111-4111-8111-00000000000b",
 			);
 			await runInDurableObject(agent, async (instance) => {
+				// Started first, so the transcript it loads does not replace the one set here.
+				await instance.lifecycle.start();
 				const assistant: ChatResponseResult["message"] = {
 					id: "interview",
 					role: "assistant",

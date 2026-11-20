@@ -36,7 +36,10 @@ function install(instance: BuilderAgent, stub: unknown) {
 	Reflect.set(Reflect.get(instance, "env") as object, "Sandbox", { getByName: () => stub });
 	const harness = instance as unknown as Harness;
 	const broadcasts: string[] = [];
-	harness.broadcast = (message) => broadcasts.push(message);
+	// The SDK broadcasts its MCP state on its own; these tests watch the builder's messages.
+	harness.broadcast = (message) => {
+		if (JSON.parse(message).type !== "cf_agent_mcp_servers") broadcasts.push(message);
+	};
 	return { harness, broadcasts };
 }
 
@@ -94,7 +97,7 @@ describe("preview refresh after a mutation", () => {
 			const { stub, renders } = deferredSandbox();
 			const { harness } = install(instance, stub);
 			const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
-			Reflect.set(instance, "mcp", { callTool });
+			Reflect.set(instance.mcp, "callTool", callTool);
 
 			await harness.refreshAndReloadPreview();
 			await settle();
@@ -163,7 +166,7 @@ describe("preview refresh loop robustness", () => {
 			const { stub } = deferredSandbox();
 			const { harness } = install(instance, stub);
 			const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
-			Reflect.set(instance, "mcp", { callTool });
+			Reflect.set(instance.mcp, "callTool", callTool);
 			Reflect.set(instance, "previewRenderWaitMs", 50);
 
 			// The render never finishes.
@@ -205,7 +208,7 @@ describe("preview refresh loop robustness", () => {
 			const { stub } = deferredSandbox();
 			const { harness } = install(instance, stub);
 			const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "{}" }] }));
-			Reflect.set(instance, "mcp", { callTool });
+			Reflect.set(instance.mcp, "callTool", callTool);
 			Reflect.set(instance, "previewRenderWaitMs", 300);
 			const timedCall = async () => {
 				const started = Date.now();

@@ -294,6 +294,8 @@ describe("chat recovery", () => {
 	it("resumes a restarted turn only while the conversation is where it stopped", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000008");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set below.
+			await instance.lifecycle.start();
 			const harness = instance as unknown as RecoveryHarness;
 			const user: UIMessage = { id: "user-1", role: "user", parts: [{ type: "text", text: "Hi" }] };
 			const later: UIMessage = {
@@ -379,6 +381,8 @@ describe("chat recovery", () => {
 				harness.createTurnModel = () => replyModel((tools) => steps.push(["build with", tools]));
 
 				await recover(harness);
+				// Recovery hands its continuation to a turn of its own; wait for it to finish.
+				await harness.waitUntilStable({ timeout: 10_000 });
 				return steps;
 			});
 
