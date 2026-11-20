@@ -743,7 +743,11 @@ describe("preview context pruning", () => {
 							type: "content",
 							value: [
 								{ type: "text", text: "current" },
-								{ type: "file-data", data: "current-image", mediaType: "image/png" },
+								{
+									type: "file",
+									mediaType: "image/png",
+									data: { type: "data", data: "current-image" },
+								},
 							],
 						},
 					},
