@@ -4,7 +4,7 @@ import type { ChatRecoveryContext, ChatRecoveryOptions } from "@cloudflare/ai-ch
 import type { UIMessage } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import type { BuilderAgent } from "../src/worker/agent.js";
-import { markChatTurnFinished } from "../src/worker/turn-gate.js";
+import { markChatTurnFinished, planChatRecovery } from "../src/worker/turn-gate.js";
 import { TurnMetrics } from "../src/worker/turn-metrics.js";
 
 const testEnv = env as typeof env & {
@@ -16,6 +16,7 @@ interface RecoveryHarness {
 	restartInterruptedTurn(payload: {
 		afterMessageId: string | null;
 		pastGate?: boolean;
+		giveUp?: boolean;
 	}): Promise<void>;
 	restartingInterruptedTurn: boolean;
 	saveMessages(update: (messages: UIMessage[]) => UIMessage[]): Promise<unknown>;
@@ -679,6 +680,241 @@ describe("chat recovery the chat SDK settles itself", () => {
 			return instance.state.initialGeneration?.status;
 		});
 		expect(status).toBe("failed");
+	});
+
+	it.each([
+		{ site: "a first build", id: "00000000005e", status: "building", settled: "failed" },
+		{ site: "a follow-up on a ready site", id: "00000000005f", status: "ready", settled: "ready" },
+	])(
+		"ends $site that evictions keep interrupting before it streams with an error",
+		async ({ id, status, settled }) => {
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const last = await runInDurableObject(agent, async (instance) => {
+				if (status === "building") {
+					await building(instance);
+					await instance.persistMessages([brief]);
+				} else {
+					await instance.lifecycle.start();
+					await leaveEditUnderWay(instance);
+				}
+				return instance.messages.at(-1)!.id;
+			});
+			const recoverAfterEviction = async (requestId: string) => {
+				// Each restart is a new request, recovered by a new instance.
+				await evictDurableObject(agent);
+				return runInDurableObject(agent, async (instance) => {
+					const harness = instance as unknown as SettledHarness;
+					await instance.lifecycle.start();
+					// The instance that ran the attempt is gone; only its row is left.
+					instance.sql`INSERT OR IGNORE INTO owner_activity (id, kind, started_at)
+						VALUES (${`chat:${requestId}`}, 'chat', ${Date.now()})`;
+					const options = await harness.onChatRecovery({
+						requestId,
+						recoveryData: { chatTurnStarted: true },
+						partialParts: [],
+						messages: [...instance.messages],
+					});
+					const scheduled = instance
+						.getSchedules()
+						.filter(({ callback }) => callback === "restartInterruptedTurn");
+					return {
+						options,
+						scheduled: scheduled.map(({ payload }) => payload),
+						status: instance.state.initialGeneration?.status,
+					};
+				});
+			};
+			const cancelSchedules = () =>
+				runInDurableObject(agent, async (instance) => {
+					for (const { id } of instance.getSchedules()) await instance.cancelSchedule(id);
+				});
+
+			const restarted = {
+				options: { continue: false },
+				scheduled: [{ afterMessageId: last, pastGate: true }],
+				status,
+			};
+			for (let attempt = 1; attempt <= 4; attempt++) {
+				expect(await recoverAfterEviction(`attempt-${attempt}`)).toEqual(restarted);
+				await cancelSchedules();
+			}
+			// Recovered again after the instance went mid-recovery: the same attempt.
+			expect(await recoverAfterEviction("attempt-4")).toEqual(restarted);
+			await cancelSchedules();
+			// Five attempts in all, as the chat SDK allows a turn it recovers itself.
+			const givenUp = {
+				options: { continue: false },
+				scheduled: [{ afterMessageId: last, giveUp: true }],
+				status,
+			};
+			expect(await recoverAfterEviction("attempt-5")).toEqual(givenUp);
+			expect(await recoverAfterEviction("attempt-5")).toEqual(givenUp);
+			await cancelSchedules();
+
+			// The turn the give-up enqueues ends it with the error, and calls no model.
+			const outcome = await runInDurableObject(agent, async (instance) => {
+				const harness = instance as unknown as RecoveredBuildHarness & SettledHarness;
+				harness.createTurnModel = () => {
+					throw new Error("A given-up turn must not call the model.");
+				};
+				const ended: unknown[] = [];
+				const respond = harness.onChatResponse.bind(instance);
+				harness.onChatResponse = async (result) => {
+					ended.push(result.status);
+					return respond(result);
+				};
+				const sent: string[] = [];
+				const broadcast = instance.broadcast.bind(instance);
+				instance.broadcast = (message, without) => {
+					sent.push(String(message));
+					return broadcast(message, without);
+				};
+				await harness.restartInterruptedTurn({ afterMessageId: last, giveUp: true });
+				await harness.waitUntilStable({ timeout: 10_000 });
+				return {
+					ended,
+					error: sent.some((message) => message.includes("interrupted too many times")),
+					status: instance.state.initialGeneration?.status,
+					rows: instance.sql<{ id: string }>`SELECT id FROM owner_activity WHERE kind = 'chat'`.map(
+						(row) => row.id,
+					),
+					counts: instance.sql<{ n: number }>`SELECT COUNT(*) AS n FROM builder_turn_restarts`[0]
+						?.n,
+				};
+			});
+			// The owner's retry of the same message then gets a full budget of its own.
+			expect(outcome).toEqual({
+				ended: ["error"],
+				error: true,
+				status: settled,
+				rows: [],
+				counts: 0,
+			});
+		},
+	);
+
+	it.each([
+		{ why: "the owner stopped the build", id: "000000000061", stopped: true },
+		{ why: "the build onStart started answers it", id: "000000000062", stopped: false },
+	])("ends a given-up turn with nothing when $why", async ({ id, stopped }) => {
+		const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			await instance.persistMessages([brief]);
+			if (stopped) {
+				instance.setState({
+					...instance.state,
+					initialGeneration: { id: "brief", status: "stopped", terminalMessageId: "brief" },
+				});
+			} else {
+				harness.autoStartPending = true;
+			}
+			const ended: unknown[] = [];
+			const respond = harness.onChatResponse.bind(instance);
+			harness.onChatResponse = async (result) => {
+				ended.push(result.status);
+				return respond(result);
+			};
+			const sent: string[] = [];
+			const broadcast = instance.broadcast.bind(instance);
+			instance.broadcast = (message, without) => {
+				sent.push(String(message));
+				return broadcast(message, without);
+			};
+			await harness.restartInterruptedTurn({ afterMessageId: "brief", giveUp: true });
+			await harness.waitUntilStable({ timeout: 10_000 });
+			return {
+				ended,
+				error: sent.some((message) => message.includes("interrupted too many times")),
+				status: instance.state.initialGeneration?.status,
+			};
+		});
+		// No reply at all, as for a Stop before a turn starts.
+		expect(outcome).toEqual({
+			ended: [],
+			error: false,
+			status: stopped ? "stopped" : "building",
+		});
+	});
+
+	it("ends a given-up turn again when the instance goes before its error is out", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000063");
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			await instance.persistMessages([brief]);
+			// Five attempts evicted before they streamed: the fifth was given up on.
+			for (let attempt = 1; attempt <= 5; attempt++) {
+				await harness.onChatRecovery({
+					requestId: `attempt-${attempt}`,
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [brief],
+				});
+			}
+			for (const { id } of instance.getSchedules()) await instance.cancelSchedule(id);
+
+			// The turn that ends it starts, and the instance goes before its error is read.
+			Reflect.set(instance, "givingUpInterruptedTurn", "error");
+			const fiber = "__cf_internal_chat_turn:give-up";
+			let stashed: unknown;
+			await instance.runFiber(fiber, async () => {
+				await instance.onChatMessage(async () => {}, { requestId: "give-up" });
+				const snapshot = instance.sql<{ snapshot: string | null }>`
+					SELECT snapshot FROM cf_agents_runs WHERE name = ${fiber}
+				`[0]?.snapshot;
+				stashed = snapshot ? JSON.parse(snapshot) : null;
+			});
+			const plan = planChatRecovery({ recoveryData: stashed, partialParts: [] });
+			await harness.onChatRecovery({
+				requestId: "give-up",
+				recoveryData: stashed,
+				partialParts: [],
+				messages: [brief],
+			});
+			return {
+				plan,
+				scheduled: instance
+					.getSchedules()
+					.filter(({ callback }) => callback === "restartInterruptedTurn")
+					.map(({ payload }) => payload),
+			};
+		});
+		// Recovery does not take it for a finished reply: it ends the turn again.
+		expect(outcome).toEqual({
+			plan: "retry",
+			scheduled: [{ afterMessageId: "brief", giveUp: true }],
+		});
+	});
+
+	it("keeps in-place restarts apart from restarts after an eviction", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000060");
+		const statuses = await runInDurableObject(agent, async (instance) => {
+			const harness = await building(instance);
+			// Three attempts evicted before they streamed, within their own limit.
+			for (const requestId of ["evicted-1", "evicted-2", "evicted-3"]) {
+				await harness.onChatRecovery({
+					requestId,
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [brief],
+				});
+			}
+			const seen: Array<string | undefined> = [];
+			for (const requestId of ["attempt-1", "attempt-2", "attempt-3"]) {
+				harness.openTurnMetrics.set(requestId, turnOf(requestId, "initial-build"));
+				await harness.onChatRecovery({
+					requestId,
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [brief],
+				});
+				await respond(harness, requestId, "error");
+				seen.push(instance.state.initialGeneration?.status);
+			}
+			return seen;
+		});
+		// The in-place limit still allows its two restarts.
+		expect(statuses).toEqual(["building", "building", "failed"]);
 	});
 
 	it("counts in-place restarts again after a turn ends without one", async () => {
