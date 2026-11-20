@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderStudioWrangler, validateProviderConfig } from "../scripts/provider-config.mjs";
 
@@ -21,7 +22,24 @@ const config = {
 	identityDatabaseId: "11111111-1111-4111-8111-111111111111",
 };
 
+/** The deployed Worker's compatibility settings, as `wrangler.jsonc` declares them. */
+function workerCompatibility() {
+	const source = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+	const date = /"compatibility_date":\s*"([^"]+)"/.exec(source)?.[1];
+	const flags = /"compatibility_flags":\s*(\[[^\]]*\])/.exec(source)?.[1];
+	return { date, flags: flags ? JSON.parse(flags) : undefined };
+}
+
 describe("provider configuration", () => {
+	it("runs provider deployments on the Worker's compatibility date and flags", () => {
+		const wrangler = renderStudioWrangler(validateProviderConfig(config));
+		const worker = workerCompatibility();
+		// The same code: without enable_abortsignal_rpc, a Stop's signal cannot reach the Sandbox.
+		expect(worker.date).toBeDefined();
+		expect(wrangler.compatibility_date).toBe(worker.date);
+		expect(wrangler.compatibility_flags).toEqual(worker.flags);
+	});
+
 	it("renders provider-owned names, routes, and capacity", () => {
 		const wrangler = renderStudioWrangler(validateProviderConfig(config));
 		expect(wrangler).toMatchObject({
