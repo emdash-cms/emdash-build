@@ -9,7 +9,9 @@
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import type {
+	ChatRecoveryConfig,
 	ChatRecoveryContext,
+	ChatRecoveryExhaustedContext,
 	ChatRecoveryOptions,
 	ChatResponseResult,
 	OnChatMessageOptions,
@@ -101,6 +103,7 @@ import {
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
 	stashedTurnMetrics,
+	type ChatRecoveryPlan,
 } from "./turn-gate.js";
 import { AccountAuthStore, type IdentityBindings } from "./account-auth.js";
 import { readVerifiedAgentAuth, type VerifiedAgentAuth } from "./agent-authorization.js";
@@ -353,6 +356,8 @@ const MAX_TRACKED_PREVIEW_CLIENTS = 4;
  * second time when this resolves, so a slow render still reaches the user.
  */
 const PREVIEW_ROUTE_REFRESH_TIMEOUT_MS = 60_000;
+/** Restarts of one turn whose stream failed in place before it ends with the error. */
+const MAX_IN_PLACE_RESTARTS = 2;
 const PREVIEW_THUMBNAIL_LIMIT = 6;
 
 /**
@@ -1341,6 +1346,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	// Block the turn on MCP (re)connection so CMS tools are available on the
 	// first turn and after hibernation, instead of racing tool enumeration.
 	override waitForMcpConnections = { timeout: 20_000 };
+	// A class field: the SDK reads it on wake, before onStart runs.
+	override chatRecovery: ChatRecoveryConfig = {
+		onExhausted: (ctx) => this.settleExhaustedRecovery(ctx),
+	};
 	override initialState: BuilderState = { siteReady: false };
 
 	constructor(ctx: AgentContext, env: Env) {
@@ -1542,8 +1551,20 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private restartingInterruptedTurn = false;
 	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
 	private recoveringTurn = false;
-	/** Requests whose turn onChatRecovery scheduled to run again; that run settles the build. */
-	private restartedRequestIds = new Set<string>();
+	/**
+	 * Requests chat recovery took over in this instance, by plan. The chat SDK
+	 * still ends such a request, as aborted or as an error, but the turn that
+	 * settles it is the recovered one.
+	 */
+	private recoveredRequestPlans = new Map<string, ChatRecoveryPlan>();
+	/** In-place restarts of the turn that answers each message, since a turn last ended unrestarted. */
+	private inPlaceRestarts = new Map<string | null, number>();
+	/** onStart started the first build itself, so a recovered pre-build turn has been overtaken. */
+	private startedBuildOnStart = false;
+	/** The build onStart started has not ended yet. */
+	private autoStartPending = false;
+	/** Requests chat recovery gave up on in place; the SDK ends each as aborted. */
+	private exhaustedRequestIds = new Set<string>();
 
 	private latestUserMessageId(): string | undefined {
 		return [...this.messages].reverse().find((message) => message.role === "user")?.id;
@@ -7753,13 +7774,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		// Ready before the restart, but the build it starts was not under way yet.
 		// A turn recovered from a fiber has said so by now and starts it instead.
-		// A turn recovered as a Task is only seen after onStart: it starts this
-		// build too, and whichever of the two runs second finds the conversation
-		// answered and ends without building.
+		// A turn recovered as a Task is only seen after onStart, so this build
+		// starts first and onChatRecovery treats that turn as overtaken.
 		if (status !== "preparing" || this.state.buildStarted || this.recoveringTurn) return;
-		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
-			console.error("[BuilderAgent] auto-start build failed:", error),
-		);
+		this.startedBuildOnStart = true;
+		this.autoStartPending = true;
+		void this.saveMessages((messages) => [...messages])
+			.catch((error: unknown) => console.error("[BuilderAgent] auto-start build failed:", error))
+			.finally(() => {
+				this.autoStartPending = false;
+			});
 	}
 
 	/**
@@ -7772,24 +7796,69 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	protected override async onChatRecovery(ctx: ChatRecoveryContext): Promise<ChatRecoveryOptions> {
-		const plan = planChatRecovery(ctx);
+		let plan = planChatRecovery(ctx);
+		const afterMessageId = () => ctx.messages.at(-1)?.id ?? null;
+		// The first build onStart started answers the conversation an interrupted
+		// pre-build turn left; running that turn too would only queue behind it.
+		// Turns this instance ran itself are its own and recover as usual.
+		if (plan !== "skip" && this.startedBuildOnStart && !this.openTurnMetrics.has(ctx.requestId)) {
+			plan = "skip";
+		}
+		// A stream that fails in place again and again would restart for good: each
+		// restart is a new request, so the SDK's own budget never grows for it.
+		// Past the limit the SDK ends the request with its error.
+		if ((plan === "restart" || plan === "retry") && this.openTurnMetrics.has(ctx.requestId)) {
+			const restarts = (this.inPlaceRestarts.get(afterMessageId()) ?? 0) + 1;
+			this.inPlaceRestarts.set(afterMessageId(), restarts);
+			if (restarts > MAX_IN_PLACE_RESTARTS) return { continue: false };
+		}
+		this.recoveredRequestPlans.set(ctx.requestId, plan);
 		if (plan === "skip") {
 			this.finishOwnerActivity(`chat:${ctx.requestId}`);
 			// Evicted during the end-of-turn backup: record the turn as it stood before it.
-			this.recordTurnMetrics(stashedTurnMetrics(ctx.recoveryData), { keepInState: false });
+			// A turn that ran here is recorded when the SDK ends its request.
+			if (!this.openTurnMetrics.has(ctx.requestId)) {
+				this.recordTurnMetrics(stashedTurnMetrics(ctx.recoveryData), { keepInState: false });
+			}
 		}
 		if (plan === "restart" || plan === "retry") {
-			// A stream that fails in place still ends its request with an error.
-			this.restartedRequestIds.add(ctx.requestId);
 			await this.schedule(
 				0,
 				"restartInterruptedTurn",
-				{ afterMessageId: ctx.messages.at(-1)?.id ?? null, pastGate: plan === "restart" },
+				{ afterMessageId: afterMessageId(), pastGate: plan === "restart" },
 				{ idempotent: true },
 			);
 		}
 		if (plan !== "skip") this.recoveringTurn = true;
 		return plan === "continue" ? {} : { continue: false };
+	}
+
+	/** Chat recovery gave up on a turn: past its attempts, or without progress for too long. */
+	private settleExhaustedRecovery(ctx: ChatRecoveryExhaustedContext): void {
+		this.settleAbandonedTurn(ctx.requestId, ctx.reason);
+	}
+
+	/**
+	 * A turn recovery will not run again. No hook of the turn's runs after
+	 * this, so clear what it left. A turn running here, or the build onStart
+	 * started, owns the first generation and settles it itself.
+	 */
+	private settleAbandonedTurn(requestId: string, reason: string): void {
+		// Given up on in place: the SDK still ends the request, as aborted or as an error.
+		this.exhaustedRequestIds.add(requestId);
+		const live =
+			this.autoStartPending || [...this.liveOwnerWork].some((id) => id.startsWith("chat:"));
+		this.ensureOwnerActivityTable();
+		for (const row of this.sql<{ id: string }>`SELECT id FROM owner_activity WHERE kind = 'chat'`) {
+			if (!this.liveOwnerWork.has(row.id)) this.finishOwnerActivity(row.id);
+		}
+		console.warn("[BuilderAgent] chat recovery gave up:", reason, requestId);
+		// Before the build, setup carries on and starts it once the site is ready.
+		const status = this.state.initialGeneration?.status;
+		if (!live && (status === "building" || status === "checking")) {
+			this.setInitialGenerationStatus("failed");
+			this.sendStatus("");
+		}
 	}
 
 	/**
@@ -7820,15 +7889,24 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 	protected override async onChatResponse(result: ChatResponseResult) {
 		if (result.requestId === this.activeTurnRequestId) this.activeTurnRequestId = undefined;
-		const restarted = this.restartedRequestIds.delete(result.requestId);
+		const recovered = this.recoveredRequestPlans.get(result.requestId);
+		this.recoveredRequestPlans.delete(result.requestId);
+		const exhausted = this.exhaustedRequestIds.delete(result.requestId);
+		// A finished reply that recovery skipped completed, and one recovery gave up
+		// on failed, whatever ended its request.
+		const status = recovered === "skip" ? "completed" : exhausted ? "error" : result.status;
+		// A turn that ended without a restart starts the count again.
+		if (recovered !== "restart" && recovered !== "retry") this.inPlaceRestarts.clear();
 		if (result.requestId === this.activeInitialRequestId) {
-			if (result.status === "aborted") {
+			if (recovered && recovered !== "skip" && !exhausted) {
+				// The recovered turn settles the first generation.
+			} else if (status === "aborted") {
 				await this.requestStop(this.state.initialGeneration?.id);
-			} else if (result.status === "error") {
-				// An interview that errored leaves setup running; the build it starts
-				// once the site is ready is what the first generation waits on.
-				const interview = this.openTurnMetrics.get(result.requestId)?.kind === "interview";
-				if (!restarted && !interview) this.setInitialGenerationStatus("failed");
+			} else if (status === "error") {
+				// A reply before the site is ready leaves setup running; the build it
+				// starts once the site is ready is what the first generation waits on.
+				const kind = this.openTurnMetrics.get(result.requestId)?.kind;
+				if (kind !== "interview" && kind !== "holding") this.setInitialGenerationStatus("failed");
 			} else if (!this.state.buildStarted) {
 				this.setInitialGenerationStatus(
 					findPendingQuestionnaire(this.messages) ? "awaiting_answers" : "preparing",
@@ -7851,7 +7929,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			// Records user Stops (ai-chat settles before onAbort fires) and stream
 			// failures that reach no streamText callback; onFinish/onAbort record
 			// the rest first, and a second finish is a no-op.
-			this.recordTurnMetrics(metrics.finishFromResponse(result));
+			this.recordTurnMetrics(metrics.finishFromResponse({ ...result, status }));
 		}
 	}
 }
