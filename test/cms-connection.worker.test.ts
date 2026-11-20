@@ -166,6 +166,7 @@ describe("CMS connection", () => {
 			return { result, methods };
 		});
 
-		expect(outcome).toEqual({ result: "stopped", methods: ["initialize"] });
+		// MCP client 2.x probes with server/discover, then falls back to initialize once.
+		expect(outcome).toEqual({ result: "stopped", methods: ["server/discover", "initialize"] });
 	});
 });

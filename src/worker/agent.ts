@@ -1337,8 +1337,6 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	// Block the turn on MCP (re)connection so CMS tools are available on the
 	// first turn and after hibernation, instead of racing tool enumeration.
 	override waitForMcpConnections = { timeout: 20_000 };
-	// Wrap chat turns in a fiber so a turn interrupted by DO eviction resumes.
-	override chatRecovery = true;
 	override initialState: BuilderState = { siteReady: false };
 
 	constructor(ctx: AgentContext, env: Env) {
@@ -2286,8 +2284,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return "already-claimed";
 		}
 		if (!equalTokenDigest(owner.ownerKey, expectedGuestKey)) return "conflict";
-		// Claims arrive by plain DO RPC, which skips onStart, so progress left
-		// by an evicted instance may still be in state; only this instance's counts.
+		// Progress an evicted instance left in state is not work: the call woke this
+		// instance through onStart, which resets it; only this instance's counts.
 		if (
 			this.hasOwnerActivity() ||
 			(this.stateWrittenHere && this.hasProgressInState()) ||
@@ -2308,6 +2306,26 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (changed.length !== 1) return "conflict";
 		this.closeAgentConnections("Ownership changed");
 		return "claimed";
+	}
+
+	/**
+	 * When a message was first saved, in ms. The chat SDK records this for each
+	 * message, carrying it over when it migrates older transcripts, but exposes
+	 * it through no API, so this reads the SDK's own table. A change to that
+	 * table loses the time rather than failing the caller.
+	 */
+	private briefSavedAt(messageId: string): number | undefined {
+		try {
+			return (
+				this.sql<{ created_at: number | null }>`
+					SELECT created_at FROM cf_agents_session_messages WHERE id = ${messageId}
+					ORDER BY created_at LIMIT 1
+				`[0]?.created_at ?? undefined
+			);
+		} catch (error) {
+			console.warn("[BuilderAgent] brief save time unavailable:", error);
+			return undefined;
+		}
 	}
 
 	async getClaimableProjectSummary(
@@ -2333,10 +2351,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					: "building";
 		// When the brief was first saved, so a catalogue that learns of the site
 		// late (sign-in reconciliation) lists it in place, not as brand new.
-		const savedAt = this.sql<{ ms: number | null }>`
-			SELECT CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS ms
-			FROM cf_ai_chat_agent_messages WHERE id = ${firstUser.id}
-		`[0]?.ms;
+		const savedAt = this.briefSavedAt(firstUser.id);
 		const createdAt =
 			typeof savedAt === "number" && Number.isSafeInteger(savedAt) && savedAt >= 0
 				? savedAt
@@ -3800,7 +3815,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * container after an hour: an idle container must not run forever.
 	 */
 	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
-		// The Sandbox calls by plain RPC, which skips onStart, and may write state first.
+		// Progress an evicted instance left in state is not work under way. The call
+		// woke this instance through onStart, which resets it; this keeps the check
+		// honest should an earlier write have happened first.
 		this.resetProgressLeftByEviction();
 		// One check at a time: an alarm that stopped waiting asks again while the save runs.
 		this.stopCheck ??= this.checkSandboxStop(idleForMs).finally(() => {
@@ -7726,7 +7743,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return;
 		}
 		// Ready before the restart, but the build it starts was not under way yet.
-		// An interrupted turn that chat recovery runs again starts it instead.
+		// A turn recovered from a fiber has said so by now and starts it instead.
+		// A turn recovered as a Task is only seen after onStart: it starts this
+		// build too, and whichever of the two runs second finds the conversation
+		// answered and ends without building.
 		if (status !== "preparing" || this.state.buildStarted || this.recoveringTurn) return;
 		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
 			console.error("[BuilderAgent] auto-start build failed:", error),

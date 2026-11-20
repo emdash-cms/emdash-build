@@ -472,6 +472,8 @@ describe("guest project claiming", () => {
 		const agent = testEnv.BuilderAgent.getByName("55555555-5555-4555-8555-555555555555");
 		const closed = new Map<string, number | undefined>();
 		await runInDurableObject(agent, async (instance) => {
+			// Started first: the start broadcasts, which closes expired connections before the check below.
+			await instance.lifecycle.start();
 			const now = Date.now();
 			let active: Array<{
 				id: string;

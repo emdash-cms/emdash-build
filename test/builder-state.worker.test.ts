@@ -104,9 +104,11 @@ describe("builder state", () => {
 	it("reports durable transcript and turn state for ambiguous client actions", async () => {
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000021");
 		const recovered = await runInDurableObject(agent, async (instance) => {
-			instance.messages = [
+			// Calls start the agent first, which loads the saved transcript.
+			await instance.lifecycle.start();
+			await instance.persistMessages([
 				{ id: "message-1", role: "user", parts: [{ type: "text", text: "Keep this" }] },
-			];
+			]);
 			instance.setState({
 				...instance.state,
 				initialGeneration: { id: "message-1", status: "stopping" },
@@ -256,7 +258,8 @@ describe("builder state", () => {
 			// A flag left by an evicted instance describes a turn that no longer runs.
 			instance.setState({ ...instance.state, turnActive: true });
 			internals.stateWrittenHere = false;
-			await instance.onStart();
+			// The instance already started; run onStart as a new instance would.
+			await Object.getPrototypeOf(instance).onStart.call(instance);
 			seen.push(instance.state.turnActive);
 			return seen;
 		});
@@ -287,7 +290,7 @@ describe("builder state", () => {
 			// A new instance: recovery skips the finished turn before onStart runs.
 			internals.stateWrittenHere = false;
 			internals.finishOwnerActivity("chat:evicted");
-			await instance.onStart();
+			await instance.lifecycle.start();
 			return instance.state;
 		});
 
@@ -340,17 +343,37 @@ describe("builder state", () => {
 		const guestKey = "created-at-guest";
 		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000012");
 		await agent.initializeOwnership(guestKey);
+		const before = Date.now();
 		const summary = await runInDurableObject(agent, async (instance) => {
-			const brief = {
-				id: "brief",
-				role: "user" as const,
-				parts: [{ type: "text" as const, text: "A journal" }],
-			};
-			instance.sql`INSERT INTO cf_ai_chat_agent_messages (id, message, created_at)
-				VALUES ('brief', ${JSON.stringify(brief)}, '2026-01-02 03:04:05')`;
-			instance.messages = [brief];
+			await instance.persistMessages([
+				{ id: "brief", role: "user", parts: [{ type: "text", text: "A journal" }] },
+			]);
 			return instance.getClaimableProjectSummary(guestKey);
 		});
+		expect(summary?.createdAt).toBeGreaterThanOrEqual(before);
+		expect(summary?.createdAt).toBeLessThanOrEqual(Date.now());
+	});
+
+	it("keeps the save time of a brief from a transcript the chat SDK migrated", async () => {
+		const guestKey = "migrated-guest";
+		const agent = testEnv.BuilderAgent.getByName("22222222-2222-4222-8222-000000000016");
+		await agent.initializeOwnership(guestKey);
+		await runInDurableObject(agent, async (instance) => {
+			// The table @cloudflare/ai-chat 0.7 kept messages in, as projects saved before 0.12 hold it.
+			instance.sql`CREATE TABLE cf_ai_chat_agent_messages (
+				id text primary key, message text not null, created_at datetime default current_timestamp
+			)`;
+			const brief = { id: "brief", role: "user", parts: [{ type: "text", text: "A journal" }] };
+			instance.sql`INSERT INTO cf_ai_chat_agent_messages (id, message, created_at)
+				VALUES ('brief', ${JSON.stringify(brief)}, '2026-01-02 03:04:05')`;
+		});
+		await evictDurableObject(agent);
+		// The first call after the restart wakes the agent, which migrates the transcript.
+		const summary = await agent.getClaimableProjectSummary(guestKey);
+		const messages = await runInDurableObject(agent, async (instance) =>
+			instance.messages.map((message) => message.id),
+		);
+		expect(messages).toEqual(["brief"]);
 		expect(summary?.createdAt).toBe(Date.UTC(2026, 0, 2, 3, 4, 5));
 	});
 
@@ -399,12 +422,21 @@ describe("builder state", () => {
 		await step((internals) => internals.finishOwnerActivity("chat:turn"));
 		expect(await building()).toBe(false);
 
-		// Evicted mid-turn: the renewal it left finds no live work, clears the
-		// flag at once, and cancels itself.
+		// Evicted mid-turn in the build of a ready site: the renewal it left finds
+		// no live work, clears the flag at once, and cancels itself.
+		await runInDurableObject(agent, (instance) => {
+			instance.setState({
+				...instance.state,
+				siteReady: true,
+				initialGeneration: { id: "brief", status: "building" },
+			});
+		});
 		await step((internals) => internals.beginOwnerActivity("chat:evicted", "chat"));
 		expect(await building()).toBe(true);
 		await evictDurableObject(agent);
 		const renewals = await runInDurableObject(agent, async (instance) => {
+			// The renewal's alarm starts the new instance before it runs.
+			await instance.lifecycle.start();
 			await instance.renewBuildActivity();
 			return (await instance.listSchedules()).filter(
 				(schedule) => schedule.callback === "renewBuildActivity",
