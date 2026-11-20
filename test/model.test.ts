@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { isStepCount, streamText, tool } from "ai";
+import {
+	convertToModelMessages,
+	generateText,
+	isStepCount,
+	readUIMessageStream,
+	streamText,
+	toUIMessageStream,
+	tool,
+	type UIMessage,
+} from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { vi } from "vitest";
 import { z } from "zod";
@@ -11,6 +20,8 @@ import {
 	buildStepReasoningEffort,
 	builderProviderOptions,
 	createBuilderModel,
+	EMPTY_SUMMARY_REPLY,
+	noToolCallsWhenNoneMiddleware,
 	prepareBuildTurnStep,
 } from "../src/worker/model.js";
 
@@ -299,6 +310,524 @@ describe("build step requests", () => {
 			},
 		]);
 	}
+
+	/** A summary written, then a tool called anyway. */
+	function textThenToolCallTurn(name: string) {
+		return responseStream([
+			{ type: "response.created", response: { id: "resp_3", created_at: 1, model: "m" } },
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "message", id: "msg_1", role: "assistant", content: [] },
+			},
+			{ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "Built it." },
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "message",
+					id: "msg_1",
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text: "Built it.", annotations: [] }],
+				},
+			},
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "function_call", id: "fc_1", call_id: "call_1", name, arguments: "" },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 1,
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name,
+					arguments: "{}",
+					status: "completed",
+				},
+			},
+			{
+				type: "response.completed",
+				response: {
+					id: "resp_3",
+					status: "completed",
+					usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+				},
+			},
+		]);
+	}
+
+	/** The same reply as toolCallTurn, not streamed, after reasoning if asked. */
+	function toolCallResponse(name: string, reasoning = false, preamble = false) {
+		return Response.json({
+			id: "resp_4",
+			created_at: 1,
+			model: "m",
+			status: "completed",
+			output: [
+				...(reasoning
+					? [{ type: "reasoning", id: "rs_1", encrypted_content: "enc_1", summary: [] }]
+					: []),
+				...(preamble
+					? [
+							{
+								type: "message",
+								id: "msg_1",
+								role: "assistant",
+								status: "completed",
+								phase: "commentary",
+								content: [
+									{ type: "output_text", text: "Let me check the preview.", annotations: [] },
+								],
+							},
+						]
+					: []),
+				{
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name,
+					arguments: "{}",
+					status: "completed",
+				},
+			],
+			usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+		});
+	}
+
+	/** The build's closing summary step: it writes the summary and must not change the site. */
+	function summaryStep(reply: () => Response) {
+		const write = vi.fn(async () => ({ success: true }));
+		const errors: unknown[] = [];
+		const result = streamText({
+			model: createBuilderModel(env, { fetch: async () => reply() }),
+			prompt: "Summarise the build",
+			tools: { write_file: tool({ inputSchema: z.object({}), execute: write }) },
+			toolChoice: "none",
+			providerOptions: builderProviderOptions("low"),
+			onError: ({ error }) => {
+				errors.push(error);
+			},
+		});
+		return { result, write, errors };
+	}
+
+	it("ends a summary step that calls a tool anyway as a stop, keeping its text", async () => {
+		const { result, write, errors } = summaryStep(() => textThenToolCallTurn("write_file"));
+		await result.consumeStream();
+
+		// AI SDK 7 fails a step whose reply breaks toolChoice; the call is dropped instead.
+		expect(errors).toEqual([]);
+		expect(await result.finishReason).toBe("stop");
+		expect(await result.text).toBe("Built it.");
+		expect(await result.toolCalls).toEqual([]);
+		expect(write).not.toHaveBeenCalled();
+		// Nor does the call reach the saved conversation.
+		const parts = (await result.response).messages.flatMap((message): Array<{ type: string }> =>
+			Array.isArray(message.content) ? message.content : [],
+		);
+		expect(parts.map((part) => part.type)).toEqual(["text"]);
+	});
+
+	/** A reply of reasoning, text and function-call items, in order. */
+	function itemsTurn(items: Array<"reasoning" | "text" | "preamble" | "call">) {
+		const events: Array<Record<string, unknown>> = [
+			{ type: "response.created", response: { id: "resp_5", created_at: 1, model: "m" } },
+		];
+		items.forEach((kind, index) => {
+			const words = kind === "preamble" ? "Let me check the preview once more." : "Built it.";
+			const item =
+				kind === "reasoning"
+					? { type: "reasoning", id: `rs_${index}`, encrypted_content: `enc_${index}`, summary: [] }
+					: kind === "text" || kind === "preamble"
+						? {
+								type: "message",
+								id: `msg_${index}`,
+								role: "assistant",
+								status: "completed",
+								phase: kind === "preamble" ? "commentary" : "final_answer",
+								content: [{ type: "output_text", text: words, annotations: [] }],
+							}
+						: {
+								type: "function_call",
+								id: `fc_${index}`,
+								call_id: `call_${index}`,
+								name: "write_file",
+								arguments: "{}",
+								status: "completed",
+							};
+			const added =
+				kind === "text" || kind === "preamble"
+					? { ...item, content: [] }
+					: kind === "call"
+						? { ...item, arguments: "" }
+						: item;
+			events.push({ type: "response.output_item.added", output_index: index, item: added });
+			if (kind === "text" || kind === "preamble") {
+				events.push({
+					type: "response.output_text.delta",
+					item_id: `msg_${index}`,
+					output_index: index,
+					delta: words,
+				});
+			}
+			events.push({ type: "response.output_item.done", output_index: index, item });
+		});
+		events.push({
+			type: "response.completed",
+			response: {
+				id: "resp_5",
+				status: "completed",
+				usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+			},
+		});
+		return responseStream(events);
+	}
+
+	/**
+	 * The reply as the builder saves it (its UI message), and what the next
+	 * request sends back of it: OpenAI input items by type or role.
+	 */
+	async function savedAndSentBack(result: ReturnType<typeof summaryStep>["result"]) {
+		let saved: UIMessage | undefined;
+		for await (const message of readUIMessageStream({
+			stream: toUIMessageStream({ stream: result.stream }),
+		})) {
+			saved = message;
+		}
+		const bodies: Array<{ input: Array<Record<string, unknown>> }> = [];
+		const next = streamText({
+			model: createBuilderModel(env, {
+				fetch: async (_input, init) => {
+					bodies.push(JSON.parse(String(init?.body)));
+					return textTurn();
+				},
+			}),
+			messages: await convertToModelMessages([
+				{ id: "ask", role: "user", parts: [{ type: "text", text: "Summarise the build" }] },
+				saved!,
+				{ id: "next", role: "user", parts: [{ type: "text", text: "Next" }] },
+			]),
+			// As every build step asks: nothing stored, so reasoning goes back by value.
+			providerOptions: builderProviderOptions("low"),
+		});
+		await next.consumeStream();
+		return {
+			shown: saved!.parts
+				.filter((part) => part.type === "reasoning" || part.type === "text")
+				.map((part) => part.type),
+			sentBack: bodies[0]!.input.map((item) =>
+				item.type === "reasoning" ? "reasoning" : String(item.role ?? item.type),
+			),
+		};
+	}
+
+	it.each<{
+		reply: Array<"reasoning" | "text" | "preamble" | "call">;
+		text: string;
+		shown: string[];
+		sentBack: string[];
+	}>([
+		// Reasoning that led to a dropped call, or to no text, still shows but is not sent
+		// back: without the item it was produced with, OpenAI may refuse the request.
+		{
+			reply: ["reasoning", "call"],
+			text: EMPTY_SUMMARY_REPLY,
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning", "text", "call"],
+			text: "Built it.",
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "reasoning", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning", "text", "reasoning", "call"],
+			text: "Built it.",
+			shown: ["reasoning", "text", "reasoning"],
+			sentBack: ["user", "reasoning", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning", "call", "text"],
+			text: "Built it.",
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning"],
+			text: EMPTY_SUMMARY_REPLY,
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "assistant", "user"],
+		},
+		// A preamble announces the call, which never happens: it goes with the call.
+		{
+			reply: ["reasoning", "preamble", "call"],
+			text: EMPTY_SUMMARY_REPLY,
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning", "text", "preamble", "call"],
+			text: "Built it.",
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "reasoning", "assistant", "user"],
+		},
+		// Reasoning after a preamble keeps its place, and only what text follows goes back.
+		{
+			reply: ["reasoning", "preamble", "reasoning", "text"],
+			text: "Let me check the preview once more.Built it.",
+			shown: ["reasoning", "text", "reasoning", "text"],
+			sentBack: ["user", "reasoning", "assistant", "reasoning", "assistant", "user"],
+		},
+		{
+			reply: ["reasoning", "preamble", "reasoning"],
+			text: "Let me check the preview once more.",
+			shown: ["reasoning", "text", "reasoning"],
+			sentBack: ["user", "reasoning", "assistant", "user"],
+		},
+		// The model's last words, with no call after them, are its reply.
+		{
+			reply: ["reasoning", "preamble"],
+			text: "Let me check the preview once more.",
+			shown: ["reasoning", "text"],
+			sentBack: ["user", "reasoning", "assistant", "user"],
+		},
+	])(
+		"sends back only the reasoning a summary step's own text follows: $reply",
+		async ({ reply, text, shown, sentBack }) => {
+			const { result, errors } = summaryStep(() => itemsTurn(reply));
+			const outcome = await savedAndSentBack(result);
+
+			expect(errors).toEqual([]);
+			expect(await result.text).toBe(text);
+			expect(outcome).toEqual({ shown, sentBack });
+		},
+	);
+
+	it.each([
+		{ ending: "an error", error: true, finish: "error" },
+		{ ending: "a content filter", error: false, finish: "content-filter" },
+	] as const)(
+		"adds no closing reply to a summary step that ends in $ending",
+		async ({ error, finish }) => {
+			const parts = [
+				{ type: "stream-start", warnings: [] },
+				{ type: "reasoning-start", id: "rs_1:0" },
+				{ type: "reasoning-end", id: "rs_1:0" },
+				...(error ? [{ type: "error", error: new Error("The model failed.") }] : []),
+				{
+					type: "finish",
+					finishReason: { unified: finish, raw: finish },
+					usage: {
+						inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+						outputTokens: { total: 1, text: 1, reasoning: 0 },
+					},
+				},
+			];
+			const wrapped = await noToolCallsWhenNoneMiddleware.wrapStream!({
+				doStream: async () => ({
+					stream: new ReadableStream({
+						start(controller) {
+							for (const part of parts) controller.enqueue(part);
+							controller.close();
+						},
+					}),
+				}),
+				doGenerate: async () => {
+					throw new Error("not called");
+				},
+				params: { prompt: [], toolChoice: { type: "none" } },
+				model: {} as never,
+			} as never);
+			const out: Array<{ type: string }> = [];
+			const reader = wrapped.stream.getReader();
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				out.push(value as { type: string });
+			}
+
+			expect(out.map((part) => part.type)).not.toContain("text-delta");
+			expect(out.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: finish } });
+		},
+	);
+
+	it("still lets out what waited when a summary's stream ends without a finish", async () => {
+		const parts = [
+			{ type: "stream-start", warnings: [] },
+			{ type: "reasoning-start", id: "rs_1:0" },
+			{ type: "reasoning-end", id: "rs_1:0", providerMetadata: { openai: { itemId: "rs_1" } } },
+			{ type: "text-start", id: "msg_1" },
+			{ type: "text-delta", id: "msg_1", delta: " " },
+		];
+		const wrapped = await noToolCallsWhenNoneMiddleware.wrapStream!({
+			doStream: async () => ({
+				stream: new ReadableStream({
+					start(controller) {
+						for (const part of parts) controller.enqueue(part);
+						controller.close();
+					},
+				}),
+			}),
+			doGenerate: async () => {
+				throw new Error("not called");
+			},
+			params: { prompt: [], toolChoice: { type: "none" } },
+			model: {} as never,
+		} as never);
+		const out: Array<{ type: string; providerMetadata?: unknown }> = [];
+		const reader = wrapped.stream.getReader();
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			out.push(value as { type: string });
+		}
+
+		// The reasoning ends, without the item no text followed; the blank text stays out.
+		expect(out.map((part) => part.type)).toEqual([
+			"stream-start",
+			"reasoning-start",
+			"reasoning-end",
+		]);
+		expect(out.at(-1)).toMatchObject({ providerMetadata: {} });
+	});
+
+	it("lets a summary's text out as it streams, with the reasoning before it", async () => {
+		let source!: ReadableStreamDefaultController<unknown>;
+		const wrapped = await noToolCallsWhenNoneMiddleware.wrapStream!({
+			doStream: async () => ({
+				stream: new ReadableStream({
+					start(controller) {
+						source = controller;
+					},
+				}),
+			}),
+			doGenerate: async () => {
+				throw new Error("not called");
+			},
+			params: { prompt: [], toolChoice: { type: "none" } },
+			model: {} as never,
+		} as never);
+		const reader = wrapped.stream.getReader();
+		const next = async () => ((await reader.read()).value as { type: string }).type;
+
+		source.enqueue({ type: "reasoning-start", id: "rs_1:0" });
+		// Reasoning shows while the model thinks.
+		expect(await next()).toBe("reasoning-start");
+		// The first summary part ends as the next begins, which shows too.
+		source.enqueue({ type: "reasoning-end", id: "rs_1:0" });
+		source.enqueue({ type: "reasoning-start", id: "rs_1:1" });
+		source.enqueue({ type: "reasoning-delta", id: "rs_1:1", delta: "Checking the menu." });
+		expect([await next(), await next()]).toEqual(["reasoning-start", "reasoning-delta"]);
+		source.enqueue({ type: "reasoning-end", id: "rs_1:1" });
+		source.enqueue({ type: "text-start", id: "msg_1" });
+		source.enqueue({ type: "text-delta", id: "msg_1", delta: "Built it." });
+		// The first words of the reply let out what waited, before the step ends.
+		expect([await next(), await next(), await next(), await next()]).toEqual([
+			"reasoning-end",
+			"reasoning-end",
+			"text-start",
+			"text-delta",
+		]);
+		source.enqueue({ type: "text-delta", id: "msg_1", delta: " Have a look." });
+		expect(await next()).toBe("text-delta");
+		source.close();
+		await reader.cancel();
+	});
+
+	it("answers a summary step of nothing but whitespace with the closing reply", async () => {
+		const { result } = summaryStep(() =>
+			responseStream([
+				{ type: "response.created", response: { id: "resp_7", created_at: 1, model: "m" } },
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "message", id: "msg_1", role: "assistant", content: [] },
+				},
+				{ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "\n" },
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "message",
+						id: "msg_1",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "\n", annotations: [] }],
+					},
+				},
+				{
+					type: "response.completed",
+					response: {
+						id: "resp_7",
+						status: "completed",
+						usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+					},
+				},
+			]),
+		);
+
+		expect(await result.text).toBe(EMPTY_SUMMARY_REPLY);
+	});
+
+	it("gives a summary step that only calls a tool a closing reply", async () => {
+		const { result, write, errors } = summaryStep(() => toolCallTurn("write_file"));
+		await result.consumeStream();
+
+		expect(errors).toEqual([]);
+		expect(await result.finishReason).toBe("stop");
+		expect(await result.text).toBe(EMPTY_SUMMARY_REPLY);
+		expect(write).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ reasoning: false, preamble: false },
+		{ reasoning: true, preamble: false },
+		{ reasoning: true, preamble: true },
+	])(
+		"drops the tool call from a summary step that is not streamed (reasoning: $reasoning, preamble: $preamble)",
+		async ({ reasoning, preamble }) => {
+			const write = vi.fn(async () => ({ success: true }));
+			const result = await generateText({
+				model: createBuilderModel(env, {
+					fetch: async () => toolCallResponse("write_file", reasoning, preamble),
+				}),
+				prompt: "Summarise the build",
+				tools: { write_file: tool({ inputSchema: z.object({}), execute: write }) },
+				toolChoice: "none",
+			});
+
+			expect(result.finishReason).toBe("stop");
+			// A preamble announced the call, so it goes with it.
+			expect(result.text).toBe(EMPTY_SUMMARY_REPLY);
+			expect(result.toolCalls).toEqual([]);
+			expect(result.content.map((part) => part.type)).toEqual(
+				reasoning ? ["reasoning", "text"] : ["text"],
+			);
+			// It led to the dropped call: it shows, but is not sent back to OpenAI.
+			const reasoningPart = result.content.find((part) => part.type === "reasoning");
+			if (reasoning) expect(reasoningPart?.providerMetadata).toEqual({});
+			expect(write).not.toHaveBeenCalled();
+		},
+	);
+
+	it("leaves a step that may call tools as the model replied", async () => {
+		const write = vi.fn(async () => ({ success: true }));
+		const result = streamText({
+			model: createBuilderModel(env, { fetch: async () => toolCallTurn("write_file") }),
+			prompt: "Build the site",
+			tools: { write_file: tool({ inputSchema: z.object({}), execute: write }) },
+		});
+		await result.consumeStream();
+
+		expect(await result.finishReason).toBe("tool-calls");
+		expect(await result.text).toBe("");
+		expect(write).toHaveBeenCalledOnce();
+	});
 
 	it("asks for a reasoning summary only where one is read", async () => {
 		const bodies: Array<Record<string, unknown>> = [];
