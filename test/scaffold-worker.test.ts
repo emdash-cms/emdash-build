@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { SCHEDULED_PUBLISHES_PATH } from "../src/worker/preview-cache.js";
+import { SCHEDULED_PUBLISHES_PATH } from "../src/worker/site-dev-routes.js";
 import { CANONICAL_WORKER_TS } from "../src/worker/tools.js";
 
 const scaffoldWorker = readFileSync(

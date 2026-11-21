@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SCHEDULED_PUBLISHES_PATH } from "../src/worker/preview-cache.js";
+import { SCHEDULED_PUBLISHES_PATH, SITE_DEV_ONLY_ROUTES } from "../src/worker/site-dev-routes.js";
 import { CANONICAL_WORKER_TS } from "../src/worker/tools.js";
 
 const emdash = {
@@ -70,12 +70,15 @@ describe("the site worker's count of scheduled publishes", () => {
 		expect(await count(await loadWorker())).toEqual(counted);
 	});
 
-	const devRoutes = [
-		"/_emdash/api/setup/dev-bypass",
-		"/_emdash/api/setup/dev-reset",
-		"/_emdash/api/dev/scheduled-tasks",
-		SCHEDULED_PUBLISHES_PATH,
-	];
+	it("keeps the same dev-only routes as the preview router", () => {
+		const list = /const localOnlyDevRoutes = new Set\(\[([^\]]*)\]\);/.exec(
+			CANONICAL_WORKER_TS,
+		)?.[1];
+		const routes = [...(list ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+		expect(new Set(routes)).toEqual(SITE_DEV_ONLY_ROUTES);
+	});
+
+	const devRoutes = [...SITE_DEV_ONLY_ROUTES];
 	/** Ways to write a route that Astro still routes there: it decodes until the path stops changing, reads `\` as `/`, resolves dot segments and collapses repeated slashes. */
 	const spellings = (route: string) => {
 		const cut = route.lastIndexOf("/");
