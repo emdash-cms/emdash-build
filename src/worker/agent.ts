@@ -363,6 +363,8 @@ const MAX_IN_PLACE_RESTARTS = 2;
  * five attempts in all, as the chat SDK allows a turn it recovers itself.
  */
 const MAX_WAKE_RESTARTS = 4;
+/** What restartInterruptedTurn tells the turn it enqueues. */
+type InterruptedTurnRestart = { pastGate: boolean } | { giveUp: "error" | "superseded" };
 /** The error a turn ends with once evictions have interrupted it too often. */
 const INTERRUPTED_TOO_OFTEN =
 	"This reply was interrupted too many times, so it stopped. Send your message again to retry.";
@@ -1563,14 +1565,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private activeTurnRequestId?: string;
 	private activeBuildConvergences = new Map<string, BuildConvergence>();
 	private stopPromise: Promise<void> | null = null;
-	/** Set by restartInterruptedTurn for the one turn it enqueues. */
-	private restartingInterruptedTurn = false;
 	/**
-	 * Set by restartInterruptedTurn when the turn it enqueues only ends a turn
-	 * evictions interrupted too often: with its error, or, superseded meanwhile,
-	 * with nothing.
+	 * Set by restartInterruptedTurn for the one turn it enqueues, which takes it:
+	 * whether that turn runs past the site-ready gate, or only ends a turn
+	 * evictions interrupted too often (with its error, or, superseded meanwhile,
+	 * with nothing).
 	 */
-	private givingUpInterruptedTurn?: "error" | "superseded";
+	private interruptedTurnRestart?: InterruptedTurnRestart;
 	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
 	private recoveringTurn = false;
 	/**
@@ -7292,10 +7293,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		options?: OnChatMessageOptions,
 	) {
 		if (this.stopPromise) await this.stopPromise;
-		const givingUp = this.givingUpInterruptedTurn;
-		if (givingUp) {
-			this.givingUpInterruptedTurn = undefined;
-			this.restartingInterruptedTurn = false;
+		const restart = this.interruptedTurnRestart;
+		this.interruptedTurnRestart = undefined;
+		if (restart && "giveUp" in restart) {
+			const givingUp = restart.giveUp;
 			const generationStatus = this.state.initialGeneration?.status;
 			// Nothing to end: the conversation moved on, the owner stopped the build,
 			// or the build onStart started answers it.
@@ -7316,9 +7317,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return this.errorTurn(INTERRUPTED_TOO_OFTEN);
 		}
 		const turnStartedAt = Date.now();
-		const resuming = options?.continuation === true || this.restartingInterruptedTurn;
+		const resuming =
+			options?.continuation === true ||
+			(restart !== undefined && "pastGate" in restart && restart.pastGate);
 		const turnUserMessageId = this.latestUserMessageId();
-		this.restartingInterruptedTurn = false;
 		const exclusive = this.hasOwnerActivityKind("publish")
 			? "Publishing is in progress."
 			: this.hasOwnerActivityKind("deploy")
@@ -7986,21 +7988,32 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const target = payload?.afterMessageId ?? null;
 		// Already superseded: the newer turn answers the conversation as it is now.
 		if ((this.messages.at(-1)?.id ?? null) !== target) return;
-		try {
-			await this.saveMessages((messages) => {
+		// This scheduled job ends once the turn starts, not when it ends. A job stays
+		// queued until its callback returns, and one an eviction cut short runs again
+		// on the next wake, ahead of the recovery of the turn it had started: that turn
+		// would run again uncounted, and its own recovery would then answer the reply.
+		let started!: () => void;
+		const turnStarted = new Promise<void>((resolve) => (started = resolve));
+		let restart: InterruptedTurnRestart | undefined;
+		const turn = this.keepAliveWhile(() =>
+			this.saveMessages((messages) => {
 				// Runs inside the turn lock, immediately before this turn's onChatMessage.
 				const current = (messages.at(-1)?.id ?? null) === target;
-				if (payload?.giveUp) {
-					this.givingUpInterruptedTurn = current ? "error" : "superseded";
-				} else {
-					this.restartingInterruptedTurn = payload?.pastGate === true && current;
-				}
+				restart = payload?.giveUp
+					? { giveUp: current ? "error" : "superseded" }
+					: { pastGate: payload?.pastGate === true && current };
+				this.interruptedTurnRestart = restart;
+				started();
 				return [...messages];
-			});
-		} finally {
-			this.restartingInterruptedTurn = false;
-			this.givingUpInterruptedTurn = undefined;
-		}
+			}),
+		).finally(() => {
+			// Still set only if the turn never ran; a later restart's is its own.
+			if (restart && this.interruptedTurnRestart === restart) {
+				this.interruptedTurnRestart = undefined;
+			}
+		});
+		turn.catch((error: unknown) => console.error("[BuilderAgent] restarted turn failed:", error));
+		await Promise.race([turnStarted, turn]);
 	}
 
 	protected override async onChatResponse(result: ChatResponseResult) {

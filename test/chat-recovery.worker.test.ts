@@ -1,4 +1,10 @@
-import { env, evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
+import {
+	env,
+	evictDurableObject,
+	reset,
+	runDurableObjectAlarm,
+	runInDurableObject,
+} from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatRecoveryContext, ChatRecoveryOptions } from "@cloudflare/ai-chat";
 import type { UIMessage } from "ai";
@@ -18,7 +24,7 @@ interface RecoveryHarness {
 		pastGate?: boolean;
 		giveUp?: boolean;
 	}): Promise<void>;
-	restartingInterruptedTurn: boolean;
+	interruptedTurnRestart?: { pastGate: boolean } | { giveUp: "error" | "superseded" };
 	saveMessages(update: (messages: UIMessage[]) => UIMessage[]): Promise<unknown>;
 	registerProjectForCurrentOwner(): Promise<void>;
 	waitUntilStable(options: { timeout: number }): Promise<boolean>;
@@ -196,43 +202,74 @@ describe("chat recovery", () => {
 		});
 	});
 
-	it("leaves the first build to the restart it scheduled when its stream fails in place", async () => {
-		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000010");
-		const statuses = await runInDurableObject(agent, async (instance) => {
-			await instance.lifecycle.start();
-			const harness = instance as unknown as RecoveryHarness & {
-				activeInitialRequestId?: string;
-				onChatResponse(result: Record<string, unknown>): Promise<void>;
-			};
-			const fail = async (requestId: string) => {
-				instance.setState({
-					...instance.state,
-					siteReady: true,
-					initialGeneration: { id: "brief", status: "building" },
+	it.each([
+		{ how: "fails in place", id: "11111111-1111-4111-8111-000000000010", inPlace: true },
+		{
+			how: "is cut off by an eviction",
+			id: "11111111-1111-4111-8111-0000000000f2",
+			inPlace: false,
+		},
+	])(
+		"leaves the first build to the restart it scheduled when its stream $how",
+		async ({ id, inPlace }) => {
+			const agent = testEnv.BuilderAgent.getByName(id);
+			const statuses = await runInDurableObject(agent, async (instance) => {
+				await instance.lifecycle.start();
+				const harness = instance as unknown as RecoveryHarness & {
+					activeInitialRequestId?: string;
+					openTurnMetrics: Map<string, TurnMetrics>;
+					onChatResponse(result: Record<string, unknown>): Promise<void>;
+				};
+				// A turn this instance runs is in place; one an eviction cut off ran on another.
+				if (inPlace) {
+					harness.openTurnMetrics.set(
+						"streamed-nothing",
+						new TurnMetrics({
+							turnId: "streamed-nothing",
+							kind: "initial-build",
+							resumed: false,
+							model: "test",
+							stepCap: 1,
+						}),
+					);
+				}
+				const fail = async (requestId: string) => {
+					instance.setState({
+						...instance.state,
+						siteReady: true,
+						initialGeneration: { id: "brief", status: "building" },
+					});
+					harness.activeInitialRequestId = requestId;
+					await harness.onChatResponse({
+						requestId,
+						status: "error",
+						continuation: false,
+						message: { id: `reply-${requestId}`, role: "assistant", parts: [] },
+					});
+					return instance.state.initialGeneration?.status;
+				};
+				// A transient read error mid-stream: recovery restarts the turn in place,
+				// and the chat SDK ends the interrupted request with an error.
+				await harness.onChatRecovery({
+					requestId: "streamed-nothing",
+					recoveryData: { chatTurnStarted: true },
+					partialParts: [],
+					messages: [],
 				});
-				harness.activeInitialRequestId = requestId;
-				await harness.onChatResponse({
-					requestId,
-					status: "error",
-					continuation: false,
-					message: { id: `reply-${requestId}`, role: "assistant", parts: [] },
-				});
-				return instance.state.initialGeneration?.status;
-			};
-			// A transient read error mid-stream: recovery restarts the turn in place,
-			// and the chat SDK ends the interrupted request with an error.
-			await harness.onChatRecovery({
-				requestId: "streamed-nothing",
-				recoveryData: { chatTurnStarted: true },
-				partialParts: [],
-				messages: [],
+				const counted = instance.sql<{ in_place: number; wake: number }>`
+					SELECT in_place, wake FROM builder_turn_restarts
+				`;
+				const restarted = await fail("streamed-nothing");
+				const failed = await fail("plain-error");
+				return { counted, restarted, failed };
 			});
-			const restarted = await fail("streamed-nothing");
-			const failed = await fail("plain-error");
-			return { restarted, failed };
-		});
-		expect(statuses).toEqual({ restarted: "building", failed: "failed" });
-	});
+			expect(statuses).toEqual({
+				counted: [inPlace ? { in_place: 1, wake: 0 } : { in_place: 0, wake: 1 }],
+				restarted: "building",
+				failed: "failed",
+			});
+		},
+	);
 
 	it("does not wait on a server tool orphaned by eviction", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000004");
@@ -299,14 +336,14 @@ describe("chat recovery", () => {
 				{ afterMessageId: "assistant-build", pastGate: false },
 			]);
 
-			let restarting: boolean | undefined;
+			let restarting: unknown;
 			instance.messages = [reply];
 			harness.saveMessages = async (update) => {
 				update([reply]);
-				restarting = harness.restartingInterruptedTurn;
+				restarting = harness.interruptedTurnRestart;
 			};
 			await harness.restartInterruptedTurn({ afterMessageId: "assistant-build", pastGate: false });
-			expect(restarting).toBe(false);
+			expect(restarting).toEqual({ pastGate: false });
 		});
 	});
 
@@ -318,7 +355,7 @@ describe("chat recovery", () => {
 			harness.registerProjectForCurrentOwner = async () => {
 				throw new Error("evicted mid-call");
 			};
-			harness.restartingInterruptedTurn = true;
+			harness.interruptedTurnRestart = { pastGate: true };
 			const fiber = "__cf_internal_chat_turn:req-resume";
 			await instance.runFiber(fiber, async () => {
 				await instance.onChatMessage(async () => {}, { requestId: "req-resume" });
@@ -327,6 +364,69 @@ describe("chat recovery", () => {
 				`[0]!.snapshot;
 				expect(JSON.parse(snapshot!)).toEqual({ chatTurnStarted: true });
 			});
+		});
+	});
+
+	it("ends a restart's scheduled job once its turn starts, so an eviction mid-turn cannot run it again", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000f1");
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		await runInDurableObject(agent, async (instance) => {
+			await instance.lifecycle.start();
+			const harness = instance as unknown as RecoveryHarness;
+			instance.messages = [{ id: "user-1", role: "user", parts: [{ type: "text", text: "Hi" }] }];
+			harness.saveMessages = async (update) => {
+				update(instance.messages);
+				await held;
+			};
+			await instance.schedule(0, "restartInterruptedTurn", {
+				afterMessageId: "user-1",
+				pastGate: true,
+			});
+		});
+
+		// The job's callback returns while the turn it started still runs, so its row is gone.
+		const alarm = await Promise.race([
+			runDurableObjectAlarm(agent),
+			new Promise((resolve) => setTimeout(() => resolve("still in the job"), 2_000)),
+		]);
+		try {
+			expect(alarm).toBe(true);
+			await runInDurableObject(agent, (instance) => {
+				const restarts = instance
+					.getSchedules()
+					.filter(({ callback }) => callback === "restartInterruptedTurn");
+				expect(restarts).toEqual([]);
+				expect((instance as unknown as RecoveryHarness).interruptedTurnRestart).toEqual({
+					pastGate: true,
+				});
+			});
+		} finally {
+			release();
+		}
+	});
+
+	it("leaves a later restart's word for its turn when an earlier restart's turn ends", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-0000000000f3");
+		await runInDurableObject(agent, async (instance) => {
+			await instance.lifecycle.start();
+			const harness = instance as unknown as RecoveryHarness;
+			const user: UIMessage = { id: "user-1", role: "user", parts: [{ type: "text", text: "Hi" }] };
+			instance.messages = [user];
+			const releases: (() => void)[] = [];
+			// Each mock turn starts, then holds until released, never taking what its restart set.
+			harness.saveMessages = async (update) => {
+				update([user]);
+				await new Promise<void>((resolve) => releases.push(resolve));
+			};
+			await harness.restartInterruptedTurn({ afterMessageId: "user-1", pastGate: true });
+			await harness.restartInterruptedTurn({ afterMessageId: "user-1", giveUp: true });
+
+			releases[0]!();
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(harness.interruptedTurnRestart).toEqual({ giveUp: "error" });
+			releases[1]!();
+			await vi.waitFor(() => expect(harness.interruptedTurnRestart).toBeUndefined());
 		});
 	});
 
@@ -342,12 +442,12 @@ describe("chat recovery", () => {
 				role: "assistant",
 				parts: [{ type: "text", text: "Answered a newer message" }],
 			};
-			const observed: boolean[] = [];
+			const observed: unknown[] = [];
 			const restartWith = async (current: UIMessage[], atTurnStart: UIMessage[]) => {
 				instance.messages = current;
 				harness.saveMessages = async (update) => {
 					update(atTurnStart);
-					observed.push(harness.restartingInterruptedTurn);
+					observed.push(harness.interruptedTurnRestart);
 				};
 				await harness.restartInterruptedTurn({ afterMessageId: "user-1", pastGate: true });
 			};
@@ -358,8 +458,9 @@ describe("chat recovery", () => {
 			// Already superseded: nothing is enqueued.
 			await restartWith([user, later], [user, later]);
 
-			expect(observed).toEqual([true, false]);
-			expect(harness.restartingInterruptedTurn).toBe(false);
+			expect(observed).toEqual([{ pastGate: true }, { pastGate: false }]);
+			// Neither mock turn took what its restart set; each restart cleared its own.
+			await vi.waitFor(() => expect(harness.interruptedTurnRestart).toBeUndefined());
 		});
 	});
 
@@ -854,7 +955,7 @@ describe("chat recovery the chat SDK settles itself", () => {
 			for (const { id } of instance.getSchedules()) await instance.cancelSchedule(id);
 
 			// The turn that ends it starts, and the instance goes before its error is read.
-			Reflect.set(instance, "givingUpInterruptedTurn", "error");
+			Reflect.set(instance, "interruptedTurnRestart", { giveUp: "error" });
 			const fiber = "__cf_internal_chat_turn:give-up";
 			let stashed: unknown;
 			await instance.runFiber(fiber, async () => {

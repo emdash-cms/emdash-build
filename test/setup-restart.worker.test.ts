@@ -343,6 +343,10 @@ describe("setup interrupted by a restart", () => {
 				.getSchedules()
 				.find(({ callback }) => callback === "restartInterruptedTurn");
 			await harness.restartInterruptedTurn(recovery?.payload);
+			// The job ends once the turn starts; the turn itself runs on.
+			await (
+				instance as unknown as { waitUntilStable(o: object): Promise<boolean> }
+			).waitUntilStable({ timeout: 5_000 });
 			const builds = model.doStreamCalls.map(({ tools }) =>
 				tools?.some((tool) => tool.name === "write_file"),
 			);
