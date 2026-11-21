@@ -14,11 +14,13 @@ function repoHandle(info: () => Promise<{ remote: string }>) {
 			expiresAt: "2026-11-19T12:00:00.000Z",
 		}),
 		info: vi.fn(info),
+		[Symbol.dispose]: vi.fn(),
 	};
 }
 
 type Harness = {
 	env: { ARTIFACTS: unknown };
+	ensureArtifactsRepo: () => Promise<{ remote: string; token: string }>;
 	getArtifactsRepoForRead: () => Promise<{ remote: string; token: string } | null>;
 	getCloneInfo: () => Promise<{ ok: boolean; reason?: string; repoUrl?: string }>;
 	persistArtifactsRemote: (remote: string) => void;
@@ -80,6 +82,29 @@ describe("Artifacts repo remote", () => {
 				token: "token-read",
 			});
 			expect(repo.info).not.toHaveBeenCalled();
+		});
+	});
+
+	it("releases each repo handle once it has the token and remote", async () => {
+		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000106");
+		await runInDurableObject(agent, async (instance) => {
+			const harness = instance as unknown as Harness;
+			instance.setState({ ...instance.state, siteReady: true });
+			const handles: ReturnType<typeof repoHandle>[] = [];
+			useArtifacts(harness, {
+				get: async () => {
+					const repo = repoHandle(async () => ({ remote: REMOTE }));
+					handles.push(repo);
+					return repo;
+				},
+			});
+
+			await harness.ensureArtifactsRepo();
+			await harness.getArtifactsRepoForRead();
+			expect(await harness.getCloneInfo()).toMatchObject({ ok: true, repoUrl: REMOTE });
+
+			expect(handles).toHaveLength(3);
+			for (const repo of handles) expect(repo[Symbol.dispose]).toHaveBeenCalledTimes(1);
 		});
 	});
 

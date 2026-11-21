@@ -538,6 +538,14 @@ function isArtifactsCreateInProgress(err: unknown): boolean {
 	return typeof e?.message === "string" && /being created|create in progress/i.test(e.message);
 }
 
+/**
+ * Release a repo handle from `ARTIFACTS.get()` once its token and remote are read.
+ * It is an RPC stub; unreleased, it stays open until the Durable Object's current event ends.
+ */
+function releaseArtifactsRepo(repo: Disposable): void {
+	repo[Symbol.dispose]?.();
+}
+
 function isChatRequestMessage(message: WSMessage): boolean {
 	if (typeof message !== "string") return false;
 	try {
@@ -2502,12 +2510,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
-			return {
-				remote: await this.resolveArtifactsRemote(repo),
-				token: tok.plaintext,
-				ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
-			};
+			try {
+				const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
+				return {
+					remote: await this.resolveArtifactsRemote(repo),
+					token: tok.plaintext,
+					ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
+				};
+			} finally {
+				releaseArtifactsRepo(repo);
+			}
 		} catch (err) {
 			if (!isArtifactsNotFound(err)) throw err;
 			// First save for this session: create the repo. `create` returns a
@@ -2528,8 +2540,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async getArtifactsRepoForRead(): Promise<{ remote: string; token: string } | null> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("read", 900);
-			return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			try {
+				const tok = await repo.createToken("read", 900);
+				return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			} finally {
+				releaseArtifactsRepo(repo);
+			}
 		} catch (err) {
 			if (isArtifactsNotFound(err)) return null;
 			throw err;
@@ -2568,11 +2584,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			}
 			throw err;
 		}
-		const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
-		const remote = await this.resolveArtifactsRemote(repo);
-		const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
-		const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
-		return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		try {
+			// The remote first, so a failing info() wastes no token.
+			const remote = await this.resolveArtifactsRemote(repo);
+			const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
+			const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
+			const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
+			return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		} finally {
+			releaseArtifactsRepo(repo);
+		}
 	}
 
 	/**
