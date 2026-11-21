@@ -40,6 +40,19 @@ describe("provider configuration", () => {
 		expect(wrangler.compatibility_flags).toEqual(worker.flags);
 	});
 
+	it("leaves out nodejs_compat, which the compatibility date turns on", () => {
+		// On by default from 2026-08-04: workerd reports it as redundant, and Wrangler's setup leaves it out.
+		expect(workerCompatibility().date >= "2026-08-04").toBe(true);
+		expect(workerCompatibility().flags).not.toContain("nodejs_compat");
+	});
+
+	it("runs the worker tests on the Worker's compatibility date and flags", () => {
+		const source = readFileSync(new URL("../vitest.worker.config.ts", import.meta.url), "utf8");
+		const date = /compatibilityDate:\s*"([^"]+)"/.exec(source)?.[1];
+		const flags = /compatibilityFlags:\s*(\[[^\]]*\])/.exec(source)?.[1];
+		expect({ date, flags: flags ? JSON.parse(flags) : undefined }).toEqual(workerCompatibility());
+	});
+
 	it("renders provider-owned names, routes, and capacity", () => {
 		const wrangler = renderStudioWrangler(validateProviderConfig(config));
 		expect(wrangler).toMatchObject({

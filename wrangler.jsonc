@@ -3,7 +3,8 @@
 	"name": "emdash-build",
 	"account_id": "1f74638c495bc9f0330ce5c8e64c1b6b",
 	"compatibility_date": "2026-11-17",
-	"compatibility_flags": ["nodejs_compat", "enable_abortsignal_rpc"],
+	// nodejs_compat is on by default from 2026-08-04; naming it again is redundant.
+	"compatibility_flags": ["enable_abortsignal_rpc"],
 	"main": "./src/worker/index.ts",
 	"observability": {
 		"enabled": true,
