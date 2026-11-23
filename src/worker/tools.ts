@@ -473,10 +473,9 @@ function isLoopbackRequest(request: Request, url: URL): boolean {
 }
 
 /**
- * The path Astro routes on, decoded until it stops changing. As in Astro, the URL
- * parser turns \`\\\` into \`/\` and resolves dot segments, and repeated slashes
- * collapse, so \`//x\`, \`/a%5Cx\` and \`/a/%2e/x\` all name the route they reach.
- * Null when the path will not decode.
+ * The path Astro routes on, decoded until it stops changing, with \`\\\` read as
+ * \`/\`, dot segments resolved and repeated slashes collapsed, so \`//x\` and
+ * \`/a/%2e/x\` name the route they reach. Null when the path will not decode.
  */
 function routePathOf(url: URL): string | null {
 	const parsed = new URL("http://localhost/");
@@ -496,14 +495,23 @@ function routePathOf(url: URL): string | null {
 	return null;
 }
 
+/**
+ * Whether a path reaches a local-only route. Astro's dev server also routes
+ * \`<route>.html\` and \`<route>/index.html\` to a route, so any path that begins
+ * with one counts, in any letter case.
+ */
+function isLocalOnlyDevRoute(routePath: string): boolean {
+	const path = routePath.toLowerCase();
+	return [...localOnlyDevRoutes].some((route) => path.startsWith(route));
+}
+
 export default {
 	...handler,
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const routePath = routePathOf(url);
 		if (routePath === null) return new Response("Bad request", { status: 400 });
-		// In any letter case, though Astro's own matching minds it.
-		if (localOnlyDevRoutes.has(routePath.toLowerCase()) && !isLoopbackRequest(request, url)) {
+		if (isLocalOnlyDevRoute(routePath) && !isLoopbackRequest(request, url)) {
 			return new Response("Not found", { status: 404 });
 		}
 		if (routePath === "/_emdash-build/scheduled-publishes") {

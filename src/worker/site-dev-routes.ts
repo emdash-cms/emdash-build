@@ -18,9 +18,9 @@ export const SITE_DEV_ONLY_ROUTES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The path Astro routes on, decoded until it stops changing, as the site's
- * worker reads it: the URL parser turns `\` into `/` and resolves dot
- * segments, and repeated slashes collapse. Null when the path will not decode.
+ * The path Astro routes on, as the site's worker reads it: decoded until it
+ * stops changing, with `\` read as `/`, dot segments resolved and repeated
+ * slashes collapsed. Null when the path will not decode.
  */
 export function siteRoutePath(url: URL): string | null {
 	const parsed = new URL("http://localhost/");
@@ -38,4 +38,14 @@ export function siteRoutePath(url: URL): string | null {
 		path = next;
 	}
 	return null;
+}
+
+/**
+ * Whether a path from siteRoutePath reaches a dev-only route. Astro's dev server
+ * also routes `<route>.html` and `<route>/index.html` to a route, so any path
+ * that begins with one counts, in any letter case.
+ */
+export function isSiteDevOnlyRoute(routePath: string): boolean {
+	const path = routePath.toLowerCase();
+	return [...SITE_DEV_ONLY_ROUTES].some((route) => path.startsWith(route));
 }

@@ -1,4 +1,4 @@
-import { SITE_DEV_ONLY_ROUTES, siteRoutePath } from "./site-dev-routes.js";
+import { isSiteDevOnlyRoute, siteRoutePath } from "./site-dev-routes.js";
 
 /**
  * Routes public preview hosts (`<port>-<project uuid>-<token>.<preview hostname>`)
@@ -62,7 +62,7 @@ export async function routePreviewRequest(
 	// The site's dev-only routes are the container's alone, however the path is spelled.
 	const routePath = siteRoutePath(url);
 	if (routePath === null) return new Response("Bad request", { status: 400 });
-	if (SITE_DEV_ONLY_ROUTES.has(routePath.toLowerCase())) {
+	if (isSiteDevOnlyRoute(routePath)) {
 		return new Response("Not found", { status: 404 });
 	}
 	const headers = new Headers(request.headers);

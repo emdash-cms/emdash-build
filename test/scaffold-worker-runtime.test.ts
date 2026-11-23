@@ -79,7 +79,11 @@ describe("the site worker's count of scheduled publishes", () => {
 	});
 
 	const devRoutes = [...SITE_DEV_ONLY_ROUTES];
-	/** Ways to write a route that Astro still routes there: it decodes until the path stops changing, reads `\` as `/`, resolves dot segments and collapses repeated slashes. */
+	/**
+	 * Ways to write a route that must not get through. Astro's dev server routes a
+	 * leading `//`, dot segments and an `.html` or `/index.html` suffix, encoded or
+	 * not, to the route; the others are refused as well.
+	 */
 	const spellings = (route: string) => {
 		const cut = route.lastIndexOf("/");
 		const [head, tail] = [route.slice(0, cut), route.slice(cut + 1)];
@@ -94,6 +98,11 @@ describe("the site worker's count of scheduled publishes", () => {
 			`${head}/%2e/${tail}`,
 			`${head}/x/%252e%252e/${tail}`,
 			route.toUpperCase(),
+			`${route}.html`,
+			`${route}/index.html`,
+			`${route}.html.html`,
+			`${route}.htm%6c`,
+			`${route}%2ehtml`,
 		].map((path) => `${path}?token=1`);
 	};
 

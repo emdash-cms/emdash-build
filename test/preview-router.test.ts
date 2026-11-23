@@ -111,6 +111,9 @@ describe("preview routing", () => {
 				`${head}%5C${tail}`,
 				`${head}/%252e/${tail}/`,
 				route.toUpperCase(),
+				`${route}.html`,
+				`${route}/index.html`,
+				`${route}.htm%6c`,
 			];
 		}),
 	)("refuses %s without waking the Sandbox", async (path) => {
