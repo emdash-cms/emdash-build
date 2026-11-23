@@ -7758,14 +7758,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					errors.noteToolCall(call);
 					this.noteToolCallReported(call);
 				},
-				// A Stop after a finished step also reaches onEnd, which logs the benchmark.
-				onAbort: () => {
-					if (convergence.currentRevision() > 0) this.dropSuggestions();
+				// An aborted run ends here and never reaches onEnd, even after finished
+				// steps, so the build is settled, logged and saved from here too.
+				onAbort: async ({ steps }) => {
 					this.recordTurnMetrics(
 						metrics.finish("stopped", {
 							error: runawayController.signal.aborted ? runawayController.signal.reason : undefined,
 						}),
 					);
+					// Saved once the stopped tools have settled, as Stop waits for them too.
+					await convergence.waitForIdle();
+					await onBuildFinish({ steps });
 				},
 				maxRetries: 5,
 				maxOutputTokens: 32768,
