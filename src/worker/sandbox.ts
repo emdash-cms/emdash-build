@@ -708,7 +708,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		// A stopped container serves the last good snapshot instead of waiting for a render.
 		if (!container?.running) return Promise.resolve(paused("The preview is paused."));
 		// The signal goes in fetch's own options: workerd ignores a Request's signal there.
-		return container.getTcpPort(4321).fetch(new URL(cachePath, "http://localhost:4321"), {
+		return container.getTcpPort(4321).fetch(new URL(`http://localhost:4321${cachePath}`), {
 			headers: { Accept: "text/html" },
 			redirect: "manual",
 			signal,

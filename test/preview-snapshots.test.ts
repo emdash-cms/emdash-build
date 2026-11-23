@@ -96,6 +96,52 @@ describe("preview snapshots of partial HTML", () => {
 });
 
 describe("preview renders", () => {
+	it("renders a path with repeated slashes inside it under the key a visit stores", async () => {
+		const rendered: string[] = [];
+		const previews = new PreviewSnapshots({
+			sql: sql(),
+			waitUntil: () => {},
+			forwardLive: async () => html("<!doctype html><html><body>live</body></html>"),
+			renderCanonical: async (cachePath) => {
+				rendered.push(cachePath);
+				return html("<!doctype html><html><body>rendered</body></html>");
+			},
+			validatePortToken: async () => true,
+		});
+
+		await previews.refreshPreview("/docs//intro?tab=1");
+
+		expect(rendered).toEqual(["/docs//intro?tab=1"]);
+	});
+
+	it.each([
+		"//localhost:4321/_emdash/api/setup/dev-bypass?token=1",
+		"/_emdash/api/setup/dev-bypass?token=1",
+		"/_emdash/api/setup/dev-reset.html",
+		"/x/%2e%2e/_emdash-build/scheduled-publishes",
+	])(
+		"never renders %s, which would run a dev-only route from inside the container",
+		async (path) => {
+			const rendered: string[] = [];
+			const previews = new PreviewSnapshots({
+				sql: sql(),
+				waitUntil: () => {},
+				forwardLive: async () => html("<!doctype html><html><body>live</body></html>"),
+				renderCanonical: async (cachePath) => {
+					rendered.push(cachePath);
+					return html("<!doctype html><html><body>rendered</body></html>");
+				},
+				validatePortToken: async () => true,
+			});
+
+			await previews.refreshPreview(path);
+
+			expect(rendered.filter((cachePath) => cachePath.includes("_emdash"))).toEqual(
+				path.startsWith("//") ? ["/localhost:4321/_emdash/api/setup/dev-bypass?token=1"] : [],
+			);
+		},
+	);
+
 	it("gives up on a render that never answers, so the route can render again", async () => {
 		const page = "<!doctype html><html><body><h1>Home</h1></body></html>";
 		const signals: AbortSignal[] = [];
