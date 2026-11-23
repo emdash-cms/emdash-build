@@ -66,7 +66,7 @@ flowchart LR
 
 ### Prerequisites
 
-- Node.js 24 or later
+- Node.js 24.15 or later
 - pnpm 11.9
 - A Docker-compatible daemon
 - Wrangler authenticated to a Cloudflare account
