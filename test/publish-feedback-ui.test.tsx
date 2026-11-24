@@ -94,6 +94,25 @@ describe("clone feedback", () => {
 		expect(await screen.findByText("git clone NEW")).toBeTruthy();
 	});
 
+	it("offers Retry when the clone link is not ready yet", async () => {
+		const user = userEvent.setup();
+		const fetchCloneInfo = vi
+			.fn()
+			.mockResolvedValueOnce({
+				ok: false,
+				reason: "Your first snapshot is still being saved. Try again in a moment.",
+			})
+			.mockResolvedValueOnce({ ok: true, command: "git clone example" });
+		render(<CloneCard fetchCloneInfo={fetchCloneInfo} onDismiss={vi.fn()} />);
+		expect(
+			await screen.findByText("Your first snapshot is still being saved. Try again in a moment."),
+		).toBeTruthy();
+
+		await user.click(screen.getByRole("button", { name: "Retry" }));
+		expect(await screen.findByText("git clone example")).toBeTruthy();
+		expect(fetchCloneInfo).toHaveBeenCalledTimes(2);
+	});
+
 	it("keeps the newest clone link when a prior request finishes late", async () => {
 		const first = deferred<CloneInfo>();
 		const second = deferred<CloneInfo>();

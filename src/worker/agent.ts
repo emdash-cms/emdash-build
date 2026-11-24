@@ -9,7 +9,9 @@
 
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import type {
+	ChatRecoveryConfig,
 	ChatRecoveryContext,
+	ChatRecoveryExhaustedContext,
 	ChatRecoveryOptions,
 	ChatResponseResult,
 	OnChatMessageOptions,
@@ -36,9 +38,10 @@ import {
 	createUIMessageStream,
 	createUIMessageStreamResponse,
 	hasToolCall,
-	stepCountIs,
+	isStepCount,
 	jsonSchema,
 	tool,
+	toUIMessageStream,
 	type ToolSet,
 } from "ai";
 import { z } from "zod";
@@ -101,6 +104,8 @@ import {
 	shouldAutoStartInitialBuild,
 	shouldSkipSiteReadyTurn,
 	stashedTurnMetrics,
+	toolCallOutcome,
+	type ChatRecoveryPlan,
 } from "./turn-gate.js";
 import { AccountAuthStore, type IdentityBindings } from "./account-auth.js";
 import { readVerifiedAgentAuth, type VerifiedAgentAuth } from "./agent-authorization.js";
@@ -353,6 +358,18 @@ const MAX_TRACKED_PREVIEW_CLIENTS = 4;
  * second time when this resolves, so a slow render still reaches the user.
  */
 const PREVIEW_ROUTE_REFRESH_TIMEOUT_MS = 60_000;
+/** Restarts of one turn whose stream failed in place before it ends with the error. */
+const MAX_IN_PLACE_RESTARTS = 2;
+/**
+ * Restarts of one turn that evictions keep interrupting before it streams:
+ * five attempts in all, as the chat SDK allows a turn it recovers itself.
+ */
+const MAX_WAKE_RESTARTS = 4;
+/** What restartInterruptedTurn tells the turn it enqueues. */
+type InterruptedTurnRestart = { pastGate: boolean } | { giveUp: "error" | "superseded" };
+/** The error a turn ends with once evictions have interrupted it too often. */
+const INTERRUPTED_TOO_OFTEN =
+	"This reply was interrupted too many times, so it stopped. Send your message again to retry.";
 const PREVIEW_THUMBNAIL_LIMIT = 6;
 
 /**
@@ -522,13 +539,40 @@ function builtSnapshotContentType(path: string): string {
 
 /**
  * True if an Artifacts binding error means the repo doesn't exist yet. The
- * structured `.code` ("NOT_FOUND") is stripped when the error crosses the RPC
+ * structured `.code` ("NOT_FOUND") can be lost when the error crosses the RPC
  * boundary into the Worker, so fall back to matching the message.
  */
+/**
+ * WebSocket close codes. The agents client stops reconnecting after 1008 or a
+ * code from 4000 to 4999, so those end a connection that cannot come back. The
+ * others make it reconnect, which is how a tab picks up a change of credentials.
+ */
+const CLOSE_NOT_FOUND = 4404;
+const CLOSE_GONE = 4403;
+/** The project moved to another owner; the tab's cookie may now name it. */
+const CLOSE_RECONNECT = 1012;
+/** The tab's credential could not be checked just now. */
+const CLOSE_TRY_AGAIN = 1013;
+
 function isArtifactsNotFound(err: unknown): boolean {
 	const e = err as { code?: string; message?: string } | undefined;
 	if (e?.code === "NOT_FOUND") return true;
 	return typeof e?.message === "string" && /not found/i.test(e.message);
+}
+
+/** True if the repo is still being created, by its code or, without one, its message. */
+function isArtifactsCreateInProgress(err: unknown): boolean {
+	const e = err as { code?: string; message?: string } | undefined;
+	if (typeof e?.code === "string") return e.code === "CREATE_IN_PROGRESS";
+	return typeof e?.message === "string" && /being created|create in progress/i.test(e.message);
+}
+
+/**
+ * Release a repo handle from `ARTIFACTS.get()` once its token and remote are read.
+ * It is an RPC stub; unreleased, it stays open until the Durable Object's current event ends.
+ */
+function releaseArtifactsRepo(repo: Disposable): void {
+	repo[Symbol.dispose]?.();
 }
 
 function isChatRequestMessage(message: WSMessage): boolean {
@@ -1322,8 +1366,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	// Block the turn on MCP (re)connection so CMS tools are available on the
 	// first turn and after hibernation, instead of racing tool enumeration.
 	override waitForMcpConnections = { timeout: 20_000 };
-	// Wrap chat turns in a fiber so a turn interrupted by DO eviction resumes.
-	override chatRecovery = true;
+	// A class field: the SDK reads it on wake, before onStart runs.
+	override chatRecovery: ChatRecoveryConfig = {
+		onExhausted: (ctx) => this.settleExhaustedRecovery(ctx),
+	};
 	override initialState: BuilderState = { siteReady: false };
 
 	constructor(ctx: AgentContext, env: Env) {
@@ -1332,8 +1378,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnConnect = this.onConnect.bind(this);
 		this.onConnect = async (connection: Connection, context: ConnectionContext) => {
 			const auth = readVerifiedAgentAuth(context.request);
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
-				connection.close(4404, "Project not found");
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (live !== "live") {
+				if (live === "unavailable") connection.close(CLOSE_TRY_AGAIN, "Try again");
+				else connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			const previous =
@@ -1345,7 +1393,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnRequest = this.onRequest.bind(this);
 		this.onRequest = async (request: Request) => {
 			const auth = readVerifiedAgentAuth(request);
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (live === "unavailable") {
+				return Response.json({ error: "Try again." }, { status: 503 });
+			}
+			if (live !== "live") {
 				return Response.json({ error: "Project not found." }, { status: 404 });
 			}
 			return frameworkOnRequest(request);
@@ -1354,8 +1406,10 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		const frameworkOnMessage = this.onMessage.bind(this);
 		this.onMessage = async (connection: Connection, message: WSMessage) => {
 			const auth = (connection.state as { emdashAuth?: VerifiedAgentAuth } | null)?.emdashAuth;
-			if (!auth || !(await this.isAgentAuthLive(auth))) {
-				connection.close(4404, "Project not found");
+			const live = auth ? await this.agentAuthStatus(auth) : "ended";
+			if (!auth || live !== "live") {
+				if (live === "unavailable") connection.close(CLOSE_TRY_AGAIN, "Try again");
+				else connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			if (
@@ -1366,12 +1420,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					auth.sessionHash,
 				))
 			) {
-				connection.close(4404, "Project not found");
+				connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			const currentOwner = this.getOwnerRecord();
 			if (!currentOwner || !equalTokenDigest(currentOwner.ownerKey, auth.ownerKey)) {
-				connection.close(4404, "Project not found");
+				connection.close(CLOSE_NOT_FOUND, "Project not found");
 				return;
 			}
 			if (isChatResumeRequest(message)) {
@@ -1420,7 +1474,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.isAccountSessionRevoked(auth.sessionHash))
 			) {
 				closed.push(connection.id);
-				connection.close(4404, "Session ended");
+				connection.close(CLOSE_NOT_FOUND, "Session ended");
 			}
 		}
 		return closed;
@@ -1513,10 +1567,27 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private activeTurnRequestId?: string;
 	private activeBuildConvergences = new Map<string, BuildConvergence>();
 	private stopPromise: Promise<void> | null = null;
-	/** Set by restartInterruptedTurn for the one turn it enqueues. */
-	private restartingInterruptedTurn = false;
+	/**
+	 * Set by restartInterruptedTurn for the one turn it enqueues, which takes it:
+	 * whether that turn runs past the site-ready gate, or only ends a turn
+	 * evictions interrupted too often (with its error, or, superseded meanwhile,
+	 * with nothing).
+	 */
+	private interruptedTurnRestart?: InterruptedTurnRestart;
 	/** Chat recovery runs an interrupted turn again; set before onStart, which reads it. */
 	private recoveringTurn = false;
+	/**
+	 * Requests chat recovery took over in this instance, by plan. The chat SDK
+	 * still ends such a request, as aborted or as an error, but the turn that
+	 * settles it is the recovered one.
+	 */
+	private recoveredRequestPlans = new Map<string, ChatRecoveryPlan>();
+	/** onStart started the first build itself, so a recovered pre-build turn has been overtaken. */
+	private startedBuildOnStart = false;
+	/** The build onStart started has not ended yet. */
+	private autoStartPending = false;
+	/** Requests chat recovery gave up on in place; the SDK ends each as aborted. */
+	private exhaustedRequestIds = new Set<string>();
 
 	private latestUserMessageId(): string | undefined {
 		return [...this.messages].reverse().find((message) => message.role === "user")?.id;
@@ -1714,8 +1785,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const pinnedShotId = this.state.initialGeneration?.previewShotId ?? "";
 			this.sql`INSERT OR REPLACE INTO builder_preview_thumbnails (shot_id, base64, created_at)
 				VALUES (${shotId}, ${shot.base64}, ${Date.now()})`;
-			this
-				.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
+			this.sql`DELETE FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} AND shot_id NOT IN (
 				SELECT shot_id FROM builder_preview_thumbnails WHERE shot_id != ${pinnedShotId} ORDER BY created_at DESC, rowid DESC LIMIT ${PREVIEW_THUMBNAIL_LIMIT}
 			)`;
 		} catch {
@@ -2037,15 +2107,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 	}
 
-	private closeAgentConnections(reason: string) {
-		for (const connection of this.getConnections()) connection.close(4403, reason);
+	private closeAgentConnections(code: number, reason: string) {
+		for (const connection of this.getConnections()) connection.close(code, reason);
 	}
 
+	/** Ask tabs authorized as someone other than `ownerKey` to reconnect with their current cookie. */
 	private closeStaleAgentConnections(ownerKey: string, reason: string) {
 		for (const connection of this.getConnections()) {
 			const auth = (connection.state as { emdashAuth?: VerifiedAgentAuth } | null)?.emdashAuth;
 			if (!auth || !equalTokenDigest(auth.ownerKey, ownerKey)) {
-				connection.close(4403, reason);
+				connection.close(CLOSE_RECONNECT, reason);
 			}
 		}
 	}
@@ -2065,36 +2136,43 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 				auth.sessionHash &&
 				equalTokenDigest(auth.sessionHash, sessionHash)
 			) {
-				connection.close(4404, "Session ended");
+				connection.close(CLOSE_NOT_FOUND, "Session ended");
 			}
 		}
 	}
 
-	private async isAgentAuthLive(auth: VerifiedAgentAuth): Promise<boolean> {
+	/**
+	 * Whether a tab's credential still opens this project: "unavailable" when the
+	 * check itself failed, so the tab tries again rather than giving up.
+	 */
+	private async agentAuthStatus(
+		auth: VerifiedAgentAuth,
+	): Promise<"live" | "ended" | "unavailable"> {
 		const owner = this.getOwnerRecord();
 		if (!owner || !equalTokenDigest(owner.ownerKey, auth.ownerKey)) {
-			return false;
+			return "ended";
 		}
 		let credentialLive: boolean;
-		if (auth.kind === "guest") {
-			credentialLive = await this.env.ProjectCatalog.getByName(auth.ownerKey).authorizeActiveGuest(
-				auth.ownerKey,
-			);
-		} else {
-			if (!auth.sessionHash || !auth.expiresAt || auth.expiresAt <= Date.now()) return false;
-			if (this.isAccountSessionRevoked(auth.sessionHash)) return false;
-			try {
+		try {
+			if (auth.kind === "guest") {
+				credentialLive = await this.env.ProjectCatalog.getByName(
+					auth.ownerKey,
+				).authorizeActiveGuest(auth.ownerKey);
+			} else {
+				if (!auth.sessionHash || !auth.expiresAt || auth.expiresAt <= Date.now()) return "ended";
+				if (this.isAccountSessionRevoked(auth.sessionHash)) return "ended";
 				credentialLive = await AccountAuthStore.fromEnv(
 					this.env as Env & IdentityBindings,
 				).isSessionHashLive(auth.sessionHash);
-			} catch {
-				return false;
 			}
+		} catch (error) {
+			console.warn("[BuilderAgent] credential check unavailable:", error);
+			return "unavailable";
 		}
 		const currentOwner = this.getOwnerRecord();
-		return Boolean(
-			credentialLive && currentOwner && equalTokenDigest(currentOwner.ownerKey, auth.ownerKey),
-		);
+		return credentialLive && currentOwner && equalTokenDigest(currentOwner.ownerKey, auth.ownerKey)
+			? "live"
+			: "ended";
 	}
 
 	/** Bind a newly-created project to its server-issued owner key. */
@@ -2116,8 +2194,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}>`SELECT v FROM builder_secrets WHERE k = 'creationDigest'`[0]?.v;
 		if (!recordedCreation) {
 			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('ownerDigest', ${ownerKey})`;
-			this
-				.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
+			this.sql`INSERT OR IGNORE INTO builder_secrets (k, v) VALUES ('creationDigest', ${creationDigest})`;
 			return this.authorizeProject(ownerKey);
 		}
 		if (!equalTokenDigest(recordedCreation, creationDigest)) return false;
@@ -2218,7 +2295,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			)
 				return "busy";
 			this.sql`INSERT OR REPLACE INTO builder_secrets (k, v) VALUES ('deleting', '1')`;
-			this.closeAgentConnections("Project deleted");
+			this.closeAgentConnections(CLOSE_GONE, "Project deleted");
 		}
 		this.deletionPromise ??= (async () => {
 			await this.backupChain;
@@ -2273,8 +2350,8 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return "already-claimed";
 		}
 		if (!equalTokenDigest(owner.ownerKey, expectedGuestKey)) return "conflict";
-		// Claims arrive by plain DO RPC, which skips onStart, so progress left
-		// by an evicted instance may still be in state; only this instance's counts.
+		// Progress an evicted instance left in state is not work: the call woke this
+		// instance through onStart, which resets it; only this instance's counts.
 		if (
 			this.hasOwnerActivity() ||
 			(this.stateWrittenHere && this.hasProgressInState()) ||
@@ -2293,8 +2370,28 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			v: string;
 		}>`UPDATE builder_secrets SET v = ${accountOwnerKey} WHERE k = 'ownerDigest' AND v = ${expectedGuestKey} RETURNING v`;
 		if (changed.length !== 1) return "conflict";
-		this.closeAgentConnections("Ownership changed");
+		this.closeAgentConnections(CLOSE_RECONNECT, "Ownership changed");
 		return "claimed";
+	}
+
+	/**
+	 * When a message was first saved, in ms. The chat SDK records this for each
+	 * message, carrying it over when it migrates older transcripts, but exposes
+	 * it through no API, so this reads the SDK's own table. A change to that
+	 * table loses the time rather than failing the caller.
+	 */
+	private briefSavedAt(messageId: string): number | undefined {
+		try {
+			return (
+				this.sql<{ created_at: number | null }>`
+					SELECT created_at FROM cf_agents_session_messages WHERE id = ${messageId}
+					ORDER BY created_at LIMIT 1
+				`[0]?.created_at ?? undefined
+			);
+		} catch (error) {
+			console.warn("[BuilderAgent] brief save time unavailable:", error);
+			return undefined;
+		}
 	}
 
 	async getClaimableProjectSummary(
@@ -2320,10 +2417,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					: "building";
 		// When the brief was first saved, so a catalogue that learns of the site
 		// late (sign-in reconciliation) lists it in place, not as brand new.
-		const savedAt = this.sql<{ ms: number | null }>`
-			SELECT CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS ms
-			FROM cf_ai_chat_agent_messages WHERE id = ${firstUser.id}
-		`[0]?.ms;
+		const savedAt = this.briefSavedAt(firstUser.id);
 		const createdAt =
 			typeof savedAt === "number" && Number.isSafeInteger(savedAt) && savedAt >= 0
 				? savedAt
@@ -2456,14 +2550,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	/**
-	 * The Artifacts repo handle from `get()` is an RPC stub, so `repo.remote` is
-	 * a promise, not the URL string -- it must be awaited. We also persist it so
-	 * later backups don't depend on the stub at all.
+	 * The repo handle from `get()` carries no metadata properties; its remote comes
+	 * from `info()`, a round trip. We persist it so later backups don't ask again.
 	 */
-	private async resolveArtifactsRemote(repo: { remote: string }): Promise<string> {
+	private async resolveArtifactsRemote(repo: Pick<ArtifactsRepo, "info">): Promise<string> {
 		const stored = this.getStoredArtifactsRemote();
 		if (stored) return stored;
-		const remote = await repo.remote;
+		const { remote } = await repo.info();
 		this.persistArtifactsRemote(remote);
 		return remote;
 	}
@@ -2498,12 +2591,16 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
-			return {
-				remote: await this.resolveArtifactsRemote(repo),
-				token: tok.plaintext,
-				ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
-			};
+			try {
+				const tok = await repo.createToken("write", ARTIFACTS_WRITE_TOKEN_TTL_SECONDS);
+				return {
+					remote: await this.resolveArtifactsRemote(repo),
+					token: tok.plaintext,
+					ttlSeconds: ARTIFACTS_WRITE_TOKEN_TTL_SECONDS,
+				};
+			} finally {
+				releaseArtifactsRepo(repo);
+			}
 		} catch (err) {
 			if (!isArtifactsNotFound(err)) throw err;
 			// First save for this session: create the repo. `create` returns a
@@ -2524,8 +2621,12 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	private async getArtifactsRepoForRead(): Promise<{ remote: string; token: string } | null> {
 		try {
 			const repo = await this.env.ARTIFACTS.get(this.name);
-			const tok = await repo.createToken("read", 900);
-			return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			try {
+				const tok = await repo.createToken("read", 900);
+				return { remote: await this.resolveArtifactsRemote(repo), token: tok.plaintext };
+			} finally {
+				releaseArtifactsRepo(repo);
+			}
 		} catch (err) {
 			if (isArtifactsNotFound(err)) return null;
 			throw err;
@@ -2552,16 +2653,28 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		try {
 			repo = await this.env.ARTIFACTS.get(this.name);
 		} catch (err) {
+			// The first checkpoint creates the repo; get() refuses until that finishes.
+			if (isArtifactsCreateInProgress(err)) {
+				return {
+					ok: false,
+					reason: "Your first snapshot is still being saved. Try again in a moment.",
+				};
+			}
 			if (isArtifactsNotFound(err)) {
 				return { ok: false, reason: "No snapshot saved yet. Make a change first, then clone." };
 			}
 			throw err;
 		}
-		const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
-		const remote = await this.resolveArtifactsRemote(repo);
-		const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
-		const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
-		return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		try {
+			// The remote first, so a failing info() wastes no token.
+			const remote = await this.resolveArtifactsRemote(repo);
+			const tok = await repo.createToken("read", CLONE_TOKEN_TTL_SECONDS);
+			const clone = artifactsCloneCommand(remote, tok.plaintext, "my-site");
+			const command = `${clone}\ncd my-site\npnpm install\npnpm dev`;
+			return { ok: true, repoUrl: remote, command, expiresAt: tok.expiresAt };
+		} finally {
+			releaseArtifactsRepo(repo);
+		}
 	}
 
 	/**
@@ -3768,7 +3881,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	 * container after an hour: an idle container must not run forever.
 	 */
 	async prepareSandboxStop(idleForMs = 0): Promise<{ busy: boolean }> {
-		// The Sandbox calls by plain RPC, which skips onStart, and may write state first.
+		// Progress an evicted instance left in state is not work under way. The call
+		// woke this instance through onStart, which resets it; this keeps the check
+		// honest should an earlier write have happened first.
 		this.resetProgressLeftByEviction();
 		// One check at a time: an alarm that stopped waiting asks again while the save runs.
 		this.stopCheck ??= this.checkSandboxStop(idleForMs).finally(() => {
@@ -3793,6 +3908,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		}
 		// The owner may have come back during the save.
 		return { busy: busy() };
+	}
+
+	/** The Sandbox saw EmDash publish scheduled content: show it in the open preview. */
+	async refreshPreviewAfterScheduledPublish(): Promise<void> {
+		// A restart an evicted instance left in state is not under way.
+		this.resetProgressLeftByEviction();
+		if (!this.state.previewUrl || this.state.previewRestarting || this.isDeletionPending()) return;
+		this.sendConsole("EmDash published scheduled content. Refreshing the preview.");
+		await this.refreshAndReloadPreview();
 	}
 
 	/** The Sandbox stopped the container; the preview shows itself paused until it resumes. */
@@ -6768,11 +6892,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 								const { text, usage, finishReason } = await generateText({
 									model: genModel,
 									abortSignal,
-									system: [
+									instructions: [
 										"You write the BODY of a single web content entry, in markdown.",
 										voice,
-										"Rules: 3-6 substantive paragraphs of real, specific writing. Use ## and ### for",
-										"section headings where they help. Do NOT repeat the title as a heading. No",
+										"Rules: 3-6 substantive paragraphs of real, specific writing, separated by blank",
+										"lines. Use ## and ### for section headings where they help. Do NOT repeat the title as a heading. No",
 										"frontmatter, no title line, no preamble such as 'Here is'. Output only the body markdown.",
 									].join("\n"),
 									prompt: `Title: ${entry.title}\n\nWrite about: ${entry.brief}`,
@@ -7180,10 +7304,34 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		options?: OnChatMessageOptions,
 	) {
 		if (this.stopPromise) await this.stopPromise;
+		const restart = this.interruptedTurnRestart;
+		this.interruptedTurnRestart = undefined;
+		if (restart && "giveUp" in restart) {
+			const givingUp = restart.giveUp;
+			const generationStatus = this.state.initialGeneration?.status;
+			// Nothing to end: the conversation moved on, the owner stopped the build,
+			// or the build onStart started answers it.
+			if (
+				givingUp === "superseded" ||
+				generationStatus === "stopping" ||
+				generationStatus === "stopped" ||
+				this.autoStartPending ||
+				this.startedBuildOnStart
+			) {
+				// An eviction now must not start the turn again.
+				markChatTurnFinished(this);
+				return this.finishNoopChat(options?.requestId);
+			}
+			// Not marked finished: evicted before its error is out, it is recovered as
+			// another attempt past the limit, and ends the turn again.
+			this.settleAbandonedTurn(options?.requestId ?? "", "interrupted_restarts_exceeded");
+			return this.errorTurn(INTERRUPTED_TOO_OFTEN);
+		}
 		const turnStartedAt = Date.now();
-		const resuming = options?.continuation === true || this.restartingInterruptedTurn;
+		const resuming =
+			options?.continuation === true ||
+			(restart !== undefined && "pastGate" in restart && restart.pastGate);
 		const turnUserMessageId = this.latestUserMessageId();
-		this.restartingInterruptedTurn = false;
 		const exclusive = this.hasOwnerActivityKind("publish")
 			? "Publishing is in progress."
 			: this.hasOwnerActivityKind("deploy")
@@ -7199,8 +7347,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (resuming) markChatTurnStarted(this);
 		if (options?.requestId) {
 			// Chat turns run one at a time: any other chat row belongs to an interrupted turn.
-			this
-				.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
+			this.sql`DELETE FROM owner_activity WHERE kind = 'chat' AND id != ${`chat:${options.requestId}`}`;
 			this.beginOwnerActivity(`chat:${options.requestId}`, "chat");
 			this.activeTurnRequestId = options.requestId;
 		}
@@ -7332,13 +7479,13 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
-				system: interviewSystem,
+				instructions: interviewSystem,
 				messages: interviewMessages,
 				tools: interviewTools,
 				toolChoice: alreadyInterviewed ? undefined : FIRST_INTERVIEW_TOOL_CHOICE,
 				stopWhen: alreadyInterviewed
-					? stepCountIs(2)
-					: [hasToolCall("ask_questions"), stepCountIs(2)],
+					? isStepCount(2)
+					: [hasToolCall("ask_questions"), isStepCount(2)],
 				maxRetries: 5,
 				maxOutputTokens: 8192,
 				providerOptions: builderProviderOptions(
@@ -7348,24 +7495,25 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					{ promptCacheKey: this.name },
 				),
 				abortSignal,
-				experimental_onStepStart: (event) =>
+				onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
 				onChunk: ({ chunk }) => metrics.observeChunk(chunk.type),
-				onStepFinish: (step) => {
+				onStepEnd: (step) => {
 					this.touchBuildActivity();
 					metrics.onStep(step);
 				},
-				experimental_onToolCallFinish: (event) => {
+				onToolExecutionEnd: (event) => {
 					this.touchBuildActivity();
-					metrics.onToolCallFinish(event);
-					errors.noteToolCall(event);
+					const call = toolCallOutcome(event);
+					metrics.onToolCallFinish(call);
+					errors.noteToolCall(call);
 				},
 				onAbort: () => this.recordTurnMetrics(metrics.finish("stopped")),
 				onError: ({ error }) => {
 					console.error("[BuilderAgent] interview stream error:", error);
 					metrics.noteError(error);
 				},
-				onFinish: (async (...args: unknown[]) => {
+				onEnd: (async (...args: unknown[]) => {
 					await finish(...args);
 					metrics.modelFinished((args[0] as { finishReason?: string } | undefined)?.finishReason);
 					// The reply is complete; eviction during the backup must not replay the turn.
@@ -7375,13 +7523,15 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			});
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(
-						replyStreamOptions(
+					toUIMessageStream({
+						stream: result.stream,
+						tools: interviewTools,
+						...replyStreamOptions(
 							errors.errorText,
 							initialGenerationId,
 							alreadyInterviewed ? "holding" : undefined,
 						),
-					),
+					}),
 				),
 			});
 		}
@@ -7585,21 +7735,21 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			const errors = replyErrors(friendlyTurnError);
 			const result = streamText({
 				model: this.createTurnModel(metrics),
-				system,
+				instructions: system,
 				messages: modelMessages,
 				tools,
 				// A full build is many tool calls; cap high so it finishes in one
 				// turn. Keep text and tool history intact; prepareStep only drops
 				// superseded screenshot bytes. Interview turns are capped at 2.
-				stopWhen: stepCountIs(BUILD_STEP_CAP),
+				stopWhen: isStepCount(BUILD_STEP_CAP),
 				prepareStep: ({ messages, stepNumber }) =>
 					prepareBuildTurnStep(convergence, messages, buildToolNames, {
 						initialBuild: tracksInitialBuild,
 						stepNumber,
 					}),
-				experimental_onStepStart: (event) =>
+				onStepStart: (event) =>
 					metrics.stepStarted({ effort: requestedReasoningEffort(event.providerOptions) }),
-				onStepFinish: (step) => {
+				onStepEnd: (step) => {
 					convergence.finishStep(step);
 					if (tracksInitialBuild) {
 						this.setInitialGenerationStatus(
@@ -7610,20 +7760,24 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.touchBuildActivity();
 					metrics.onStep(step);
 				},
-				experimental_onToolCallFinish: (event) => {
+				onToolExecutionEnd: (event) => {
 					this.touchBuildActivity();
-					metrics.onToolCallFinish(event);
-					errors.noteToolCall(event);
-					this.noteToolCallReported(event);
+					const call = toolCallOutcome(event);
+					metrics.onToolCallFinish(call);
+					errors.noteToolCall(call);
+					this.noteToolCallReported(call);
 				},
-				// A Stop after a finished step also reaches onFinish, which logs the benchmark.
-				onAbort: () => {
-					if (convergence.currentRevision() > 0) this.dropSuggestions();
+				// An aborted run ends here and never reaches onEnd, even after finished
+				// steps, so the build is settled, logged and saved from here too.
+				onAbort: async ({ steps }) => {
 					this.recordTurnMetrics(
 						metrics.finish("stopped", {
 							error: runawayController.signal.aborted ? runawayController.signal.reason : undefined,
 						}),
 					);
+					// Saved once the stopped tools have settled, as Stop waits for them too.
+					await convergence.waitForIdle();
+					await onBuildFinish({ steps });
 				},
 				maxRetries: 5,
 				maxOutputTokens: 32768,
@@ -7642,7 +7796,7 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 					this.sendConsole(`ERROR: ${error.message}`);
 					runawayController.abort(error);
 				},
-				onFinish: onBuildFinish as any,
+				onEnd: onBuildFinish as any,
 				onError: ({ error }) => {
 					console.error("[BuilderAgent] build stream error:", error);
 					this.sendConsole(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
@@ -7652,7 +7806,11 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 
 			return createUIMessageStreamResponse({
 				stream: withReasoningDurations(
-					result.toUIMessageStream(replyStreamOptions(errors.errorText, initialGenerationId)),
+					toUIMessageStream({
+						stream: result.stream,
+						tools,
+						...replyStreamOptions(errors.errorText, initialGenerationId),
+					}),
 				),
 			});
 		} catch (err) {
@@ -7695,11 +7853,17 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 			return;
 		}
 		// Ready before the restart, but the build it starts was not under way yet.
-		// An interrupted turn that chat recovery runs again starts it instead.
+		// A turn recovered from a fiber has said so by now and starts it instead.
+		// A turn recovered as a Task is only seen after onStart, so this build
+		// starts first and onChatRecovery treats that turn as overtaken.
 		if (status !== "preparing" || this.state.buildStarted || this.recoveringTurn) return;
-		void this.saveMessages((messages) => [...messages]).catch((error: unknown) =>
-			console.error("[BuilderAgent] auto-start build failed:", error),
-		);
+		this.startedBuildOnStart = true;
+		this.autoStartPending = true;
+		void this.saveMessages((messages) => [...messages])
+			.catch((error: unknown) => console.error("[BuilderAgent] auto-start build failed:", error))
+			.finally(() => {
+				this.autoStartPending = false;
+			});
 	}
 
 	/**
@@ -7712,22 +7876,122 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	}
 
 	protected override async onChatRecovery(ctx: ChatRecoveryContext): Promise<ChatRecoveryOptions> {
-		const plan = planChatRecovery(ctx);
+		let plan = planChatRecovery(ctx);
+		const afterMessageId = () => ctx.messages.at(-1)?.id ?? null;
+		// The first build onStart started answers the conversation an interrupted
+		// pre-build turn left; running that turn too would only queue behind it.
+		// Turns this instance ran itself are its own and recover as usual.
+		if (plan !== "skip" && this.startedBuildOnStart && !this.openTurnMetrics.has(ctx.requestId)) {
+			plan = "skip";
+		}
+		// A turn that fails again and again would restart for good: each restart is
+		// a new request, so the SDK's own budget never grows for it.
+		if (plan === "restart" || plan === "retry") {
+			const inPlace = this.openTurnMetrics.has(ctx.requestId);
+			const restarts = this.countTurnRestart(afterMessageId(), ctx.requestId, inPlace);
+			// In place, the SDK ends the request with its error and onChatResponse settles it.
+			if (inPlace && restarts > MAX_IN_PLACE_RESTARTS) return { continue: false };
+			if (!inPlace && restarts > MAX_WAKE_RESTARTS) {
+				// After an eviction nothing of the turn runs again: a turn of its own
+				// ends it with the error, as any failed turn ends.
+				await this.schedule(
+					0,
+					"restartInterruptedTurn",
+					{ afterMessageId: afterMessageId(), giveUp: true },
+					{ idempotent: true },
+				);
+				return { continue: false };
+			}
+		}
+		this.recoveredRequestPlans.set(ctx.requestId, plan);
 		if (plan === "skip") {
 			this.finishOwnerActivity(`chat:${ctx.requestId}`);
 			// Evicted during the end-of-turn backup: record the turn as it stood before it.
-			this.recordTurnMetrics(stashedTurnMetrics(ctx.recoveryData), { keepInState: false });
+			// A turn that ran here is recorded when the SDK ends its request.
+			if (!this.openTurnMetrics.has(ctx.requestId)) {
+				this.recordTurnMetrics(stashedTurnMetrics(ctx.recoveryData), { keepInState: false });
+			}
 		}
 		if (plan === "restart" || plan === "retry") {
 			await this.schedule(
 				0,
 				"restartInterruptedTurn",
-				{ afterMessageId: ctx.messages.at(-1)?.id ?? null, pastGate: plan === "restart" },
+				{ afterMessageId: afterMessageId(), pastGate: plan === "restart" },
 				{ idempotent: true },
 			);
 		}
 		if (plan !== "skip") this.recoveringTurn = true;
 		return plan === "continue" ? {} : { continue: false };
+	}
+
+	/**
+	 * Restarts of the turn that answers a message since a turn last ended
+	 * unrestarted, this one included: those in place, or those after an
+	 * eviction, each against its own limit. Durable, since a restart after an
+	 * eviction runs on a new instance. A request recovered again, after the
+	 * instance went while recovering it, is one attempt, not two.
+	 */
+	private countTurnRestart(
+		afterMessageId: string | null,
+		requestId: string,
+		inPlace: boolean,
+	): number {
+		this.ensureTurnRestartsTable();
+		const inPlaceStep = inPlace ? 1 : 0;
+		const wakeStep = inPlace ? 0 : 1;
+		const [row] = this.sql<{ in_place: number; wake: number }>`
+			INSERT INTO builder_turn_restarts (after_message_id, request_id, in_place, wake)
+			VALUES (${afterMessageId ?? ""}, ${requestId ?? ""}, ${inPlaceStep}, ${wakeStep})
+			ON CONFLICT(after_message_id) DO UPDATE SET
+				in_place = in_place + CASE WHEN request_id = excluded.request_id THEN 0 ELSE excluded.in_place END,
+				wake = wake + CASE WHEN request_id = excluded.request_id THEN 0 ELSE excluded.wake END,
+				request_id = excluded.request_id
+			RETURNING in_place, wake
+		`;
+		return (inPlace ? row?.in_place : row?.wake) ?? 1;
+	}
+
+	/** A turn ended without a restart: every count starts again. */
+	private clearTurnRestarts(): void {
+		this.ensureTurnRestartsTable();
+		this.sql`DELETE FROM builder_turn_restarts`;
+	}
+
+	private ensureTurnRestartsTable() {
+		this.sql`CREATE TABLE IF NOT EXISTS builder_turn_restarts (
+			after_message_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			in_place INTEGER NOT NULL,
+			wake INTEGER NOT NULL
+		)`;
+	}
+
+	/** Chat recovery gave up on a turn: past its attempts, or without progress for too long. */
+	private settleExhaustedRecovery(ctx: ChatRecoveryExhaustedContext): void {
+		this.settleAbandonedTurn(ctx.requestId, ctx.reason);
+	}
+
+	/**
+	 * A turn recovery will not run again. No hook of the turn's runs after
+	 * this, so clear what it left. A turn running here, or the build onStart
+	 * started, owns the first generation and settles it itself.
+	 */
+	private settleAbandonedTurn(requestId: string, reason: string): void {
+		// Given up on in place: the SDK still ends the request, as aborted or as an error.
+		this.exhaustedRequestIds.add(requestId);
+		const live =
+			this.autoStartPending || [...this.liveOwnerWork].some((id) => id.startsWith("chat:"));
+		this.ensureOwnerActivityTable();
+		for (const row of this.sql<{ id: string }>`SELECT id FROM owner_activity WHERE kind = 'chat'`) {
+			if (!this.liveOwnerWork.has(row.id)) this.finishOwnerActivity(row.id);
+		}
+		console.warn("[BuilderAgent] chat recovery gave up:", reason, requestId);
+		// Before the build, setup carries on and starts it once the site is ready.
+		const status = this.state.initialGeneration?.status;
+		if (!live && (status === "building" || status === "checking")) {
+			this.setInitialGenerationStatus("failed");
+			this.sendStatus("");
+		}
 	}
 
 	/**
@@ -7740,29 +8004,60 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 	async restartInterruptedTurn(payload?: {
 		afterMessageId?: string | null;
 		pastGate?: boolean;
+		/** End the turn with its error instead: evictions interrupted it too often. */
+		giveUp?: boolean;
 	}): Promise<void> {
 		const target = payload?.afterMessageId ?? null;
 		// Already superseded: the newer turn answers the conversation as it is now.
 		if ((this.messages.at(-1)?.id ?? null) !== target) return;
-		try {
-			await this.saveMessages((messages) => {
+		// This scheduled job ends once the turn starts, not when it ends. A job stays
+		// queued until its callback returns, and one an eviction cut short runs again
+		// on the next wake, ahead of the recovery of the turn it had started: that turn
+		// would run again uncounted, and its own recovery would then answer the reply.
+		let started!: () => void;
+		const turnStarted = new Promise<void>((resolve) => (started = resolve));
+		let restart: InterruptedTurnRestart | undefined;
+		const turn = this.keepAliveWhile(() =>
+			this.saveMessages((messages) => {
 				// Runs inside the turn lock, immediately before this turn's onChatMessage.
-				this.restartingInterruptedTurn =
-					payload?.pastGate === true && (messages.at(-1)?.id ?? null) === target;
+				const current = (messages.at(-1)?.id ?? null) === target;
+				restart = payload?.giveUp
+					? { giveUp: current ? "error" : "superseded" }
+					: { pastGate: payload?.pastGate === true && current };
+				this.interruptedTurnRestart = restart;
+				started();
 				return [...messages];
-			});
-		} finally {
-			this.restartingInterruptedTurn = false;
-		}
+			}),
+		).finally(() => {
+			// Still set only if the turn never ran; a later restart's is its own.
+			if (restart && this.interruptedTurnRestart === restart) {
+				this.interruptedTurnRestart = undefined;
+			}
+		});
+		turn.catch((error: unknown) => console.error("[BuilderAgent] restarted turn failed:", error));
+		await Promise.race([turnStarted, turn]);
 	}
 
 	protected override async onChatResponse(result: ChatResponseResult) {
 		if (result.requestId === this.activeTurnRequestId) this.activeTurnRequestId = undefined;
+		const recovered = this.recoveredRequestPlans.get(result.requestId);
+		this.recoveredRequestPlans.delete(result.requestId);
+		const exhausted = this.exhaustedRequestIds.delete(result.requestId);
+		// A finished reply that recovery skipped completed, and one recovery gave up
+		// on failed, whatever ended its request.
+		const status = recovered === "skip" ? "completed" : exhausted ? "error" : result.status;
+		// A turn that ended without a restart starts the count again.
+		if (recovered !== "restart" && recovered !== "retry") this.clearTurnRestarts();
 		if (result.requestId === this.activeInitialRequestId) {
-			if (result.status === "aborted") {
+			if (recovered && recovered !== "skip" && !exhausted) {
+				// The recovered turn settles the first generation.
+			} else if (status === "aborted") {
 				await this.requestStop(this.state.initialGeneration?.id);
-			} else if (result.status === "error") {
-				this.setInitialGenerationStatus("failed");
+			} else if (status === "error") {
+				// A reply before the site is ready leaves setup running; the build it
+				// starts once the site is ready is what the first generation waits on.
+				const kind = this.openTurnMetrics.get(result.requestId)?.kind;
+				if (kind !== "interview" && kind !== "holding") this.setInitialGenerationStatus("failed");
 			} else if (!this.state.buildStarted) {
 				this.setInitialGenerationStatus(
 					findPendingQuestionnaire(this.messages) ? "awaiting_answers" : "preparing",
@@ -7783,9 +8078,9 @@ export class BuilderAgent extends AIChatAgent<Env, BuilderState> {
 		if (metrics) {
 			this.openTurnMetrics.delete(result.requestId);
 			// Records user Stops (ai-chat settles before onAbort fires) and stream
-			// failures that reach no streamText callback; onFinish/onAbort record
+			// failures that reach no streamText callback; onEnd/onAbort record
 			// the rest first, and a second finish is a no-op.
-			this.recordTurnMetrics(metrics.finishFromResponse(result));
+			this.recordTurnMetrics(metrics.finishFromResponse({ ...result, status }));
 		}
 	}
 }

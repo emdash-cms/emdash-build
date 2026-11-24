@@ -823,7 +823,7 @@ export class SandboxRuntime implements ContainerOps {
 		}
 		await this.startProcess(
 			id,
-			`cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:${port}`,
+			`cloudflared tunnel --no-autoupdate --protocol http2 --edge-ip-version 4 --url http://127.0.0.1:${port}`,
 		);
 		const url = await this.waitForTunnelUrl(id);
 		if (url) return { url };

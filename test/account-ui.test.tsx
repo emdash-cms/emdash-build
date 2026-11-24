@@ -474,7 +474,8 @@ describe("application boot", () => {
 		expect(JSON.stringify(toast)).not.toContain("sqlite-wal");
 		toast.actions?.[0]?.onClick?.();
 		toast.actions?.[0]?.onClick?.();
-		expect(site.agentCall).toHaveBeenCalledWith("retrySessionSave");
+		// A save can outlast the SDK's 30-second default, so the call waits for it.
+		expect(site.agentCall).toHaveBeenCalledWith("retrySessionSave", [], { timeout: 0 });
 		expect(
 			site.agentCall.mock.calls.filter(([method]) => method === "retrySessionSave"),
 		).toHaveLength(1);
@@ -668,7 +669,8 @@ describe("application boot", () => {
 
 		render(<App />);
 		expect(await screen.findByText("Opening your site")).toBeTruthy();
-		expect(call).toHaveBeenCalledWith("resumePreview", [window.location.host]);
+		// Restoring a saved site takes minutes, so the call waits for it.
+		expect(call).toHaveBeenCalledWith("resumePreview", [window.location.host], { timeout: 0 });
 		await act(async () => finishRecovery({ ready: false, error: "Snapshot unavailable" }));
 		const failure = await screen.findByText("Couldn't restore this saved site");
 		const user = userEvent.setup();

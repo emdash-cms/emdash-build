@@ -150,7 +150,7 @@ const CONTENT_LIST_NOTE =
 /** Saves the separate content_publish step EmDash's own description points to. */
 const CREATE_PUBLISHED_NOTE =
 	'In this builder, pass status: "published" to create and publish the entry in one call, unless the user asked for a draft. ' +
-	"Publishing needs a slug, which is derived only from a title or name field, so pass an explicit slug for any other entry.";
+	"Publishing needs a slug, which EmDash derives only from the collection's title field or a title or name field, so pass an explicit slug for any other entry.";
 
 /** EmDash's description, plus what the builder does differently. */
 export function mcpToolDescription(toolName: string, description: string): string {
@@ -220,7 +220,8 @@ export function reserveBatchSlugs(entries: readonly { slug?: string }[]): {
  * `content_create` arguments for one `create_entries_batch` entry. Fields not
  * in the schema are dropped, and `title` is sent only when the collection has
  * it (EmDash rejects unknown fields; `validFields` null means unknown, so it is
- * sent). EmDash derives a missing slug only from `title` or `name`, and can't
+ * sent). EmDash derives a missing slug only from the entry's title field
+ * (`title` or `name`; from 1.4, first the collection's titleField), and can't
  * publish a routable entry without one, so otherwise the slug comes from the
  * entry title. EmDash doesn't de-duplicate explicit slugs, so `usedSlugs`
  * numbers repeats within one batch.

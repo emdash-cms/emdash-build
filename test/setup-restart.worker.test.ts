@@ -1,4 +1,5 @@
 import {
+	abortAllDurableObjects,
 	env,
 	evictDurableObject,
 	reset,
@@ -119,7 +120,7 @@ async function leaveProject(
 function restart(agent: DurableObjectStub<BuilderAgent>) {
 	return runInDurableObject(agent, async (instance) => {
 		const resumed = recordResumes(instance);
-		await instance.onStart();
+		await instance.lifecycle.start();
 		return resumed;
 	});
 }
@@ -335,13 +336,17 @@ describe("setup interrupted by a restart", () => {
 				return saveMessages(...args);
 			};
 
-			await instance.onStart();
+			await instance.lifecycle.start();
 			const autoStarts = turns;
 			// Chat recovery scheduled the interrupted turn to run again; run it as the alarm would.
 			const recovery = instance
 				.getSchedules()
 				.find(({ callback }) => callback === "restartInterruptedTurn");
 			await harness.restartInterruptedTurn(recovery?.payload);
+			// The job ends once the turn starts; the turn itself runs on.
+			await (
+				instance as unknown as { waitUntilStable(o: object): Promise<boolean> }
+			).waitUntilStable({ timeout: 5_000 });
 			const builds = model.doStreamCalls.map(({ tools }) =>
 				tools?.some((tool) => tool.name === "write_file"),
 			);
@@ -349,5 +354,96 @@ describe("setup interrupted by a restart", () => {
 		});
 		// One build, the recovered turn's, with the build's tools.
 		expect(outcome).toEqual({ autoStarts: 0, builds: [true] });
+	});
+});
+
+/** A model that starts its reply and never finishes it, so the turn is under way when the instance goes. */
+function hangingModel(onCall: () => void) {
+	return new MockLanguageModelV3({
+		doStream: async () => {
+			onCall();
+			return {
+				stream: new ReadableStream({
+					start(controller) {
+						controller.enqueue({ type: "stream-start", warnings: [] });
+						controller.enqueue({ type: "text-start", id: "reply" });
+						controller.enqueue({ type: "text-delta", id: "reply", delta: "Building" });
+					},
+				}),
+			};
+		},
+	});
+}
+
+/** Stub what a turn reads from the sandbox; setup is already done. */
+function stubSandbox(instance: BuilderAgent, model: unknown) {
+	Object.assign(instance, {
+		createTurnModel: () => model,
+		provisionSite: async () => ({ ready: true }),
+		startProvisioning: () => {},
+		loadInitialScaffoldContext: async () => undefined,
+		loadTemplateGuidance: async () => undefined,
+		backupSite: async () => undefined,
+	});
+}
+
+describe("a turn chat recovery runs again as a Task", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	it.each<{ turn: string; id: string; siteReadyAtStart: boolean }>([
+		{ turn: "the first build", id: "33333333-3333-4333-8333-0000000000f1", siteReadyAtStart: true },
+		{
+			turn: "an interview that setup finished during",
+			id: "33333333-3333-4333-8333-0000000000f2",
+			siteReadyAtStart: false,
+		},
+	])("builds once after $turn is interrupted", async ({ id, siteReadyAtStart }) => {
+		const agent = await newProject(id);
+		await runInDurableObject(agent, async (instance) => {
+			await instance.persistMessages([brief]);
+			instance.setState({
+				...instance.state,
+				siteReady: siteReadyAtStart,
+				appHost: "localhost:5173",
+				initialGeneration: { id: "brief", status: "preparing" },
+			});
+			let called!: () => void;
+			const streaming = new Promise<void>((resolve) => (called = resolve));
+			stubSandbox(instance, hangingModel(called));
+			void instance.saveMessages((messages) => [...messages]).catch(() => {});
+			await streaming;
+			instance.setState({ ...instance.state, siteReady: true });
+		});
+		// A deploy ends the instance mid-turn.
+		await abortAllDurableObjects();
+
+		const restarted = testEnv.BuilderAgent.getByName(id);
+		const model = replyModel();
+		await runInDurableObject(restarted, async (instance) => {
+			stubSandbox(instance, model);
+			await instance.lifecycle.start();
+		});
+		// Chat recovery runs the interrupted turn from the agent's alarm.
+		while (await runDurableObjectAlarm(restarted)) {
+			await runInDurableObject(restarted, (instance) =>
+				(
+					instance as unknown as SetupHarness & { waitUntilStable(o: object): Promise<boolean> }
+				).waitUntilStable({ timeout: 5_000 }),
+			);
+		}
+		const transcript = await runInDurableObject(restarted, async (instance) => {
+			await (
+				instance as unknown as { waitUntilStable(o: object): Promise<boolean> }
+			).waitUntilStable({ timeout: 5_000 });
+			return instance.messages.map((message) => message.role);
+		});
+
+		const builds = model.doStreamCalls.map(({ tools }) =>
+			tools?.some((tool) => tool.name === "write_file"),
+		);
+		expect(builds).toEqual([true]);
+		expect(transcript).toEqual(["user", "assistant"]);
 	});
 });

@@ -293,6 +293,10 @@ body {
 .recent-site-popover[data-ending-style] {
 	opacity: 0;
 	transform: translateY(-4px) scale(0.97);
+	/* Kumo 2.15+ also scales its menu popup, through Tailwind's scale variables; this pop is the one. */
+	--tw-scale-x: 100%;
+	--tw-scale-y: 100%;
+	--tw-scale-z: 100%;
 }
 
 .preview-popover[data-ending-style],

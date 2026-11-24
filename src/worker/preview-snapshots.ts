@@ -15,6 +15,7 @@ import {
 	PREVIEW_TOKEN_HEADER,
 } from "./preview-router.js";
 import { isCompletePublicHtml } from "./public-site-audit.js";
+import { isSiteDevOnlyRoute, siteRoutePath } from "./site-dev-routes.js";
 
 const MAX_CACHED_HTML_BYTES = 1024 * 1024;
 const MAX_CACHED_ROUTES = 50;
@@ -104,10 +105,20 @@ async function readBodyUpTo(
 	return body.buffer;
 }
 
+/**
+ * The path a snapshot is kept and rendered under, or undefined for one that is
+ * never rendered. Joined to the dev server's origin rather than resolved against
+ * it, with its leading slashes collapsed to one, so `//localhost:4321/x` stays a
+ * path instead of naming an origin when it is read again. A render comes
+ * from inside the container, where the site's worker allows its dev-only
+ * routes, so those are never rendered.
+ */
 function localPreviewPath(path: string): string | undefined {
-	const target = new URL(path, "http://localhost:4321");
-	if (target.origin !== "http://localhost:4321") return undefined;
-	return `${target.pathname}${target.search}`;
+	if (!path.startsWith("/")) return undefined;
+	const target = new URL(`http://localhost:4321${path}`);
+	const routePath = siteRoutePath(target);
+	if (routePath === null || isSiteDevOnlyRoute(routePath)) return undefined;
+	return `${target.pathname.replace(/^\/{2,}/, "/")}${target.search}`;
 }
 
 /** What the snapshots need from the Sandbox Durable Object that holds them. */

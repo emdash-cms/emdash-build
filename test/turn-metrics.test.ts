@@ -1,7 +1,8 @@
-import { stepCountIs, streamText, tool } from "ai";
+import { isStepCount, streamText, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { toolCallOutcome } from "../src/worker/turn-gate.js";
 import { TurnMetrics, timeSync, turnMetricsForState } from "../src/worker/turn-metrics.js";
 
 type StreamPart = Record<string, unknown>;
@@ -106,10 +107,10 @@ describe("turn metrics", () => {
 			),
 			prompt: "Build",
 			tools,
-			stopWhen: stepCountIs(5),
-			onStepFinish: (step) => metrics.onStep(step),
-			experimental_onToolCallFinish: (event) => metrics.onToolCallFinish(event),
-			onFinish: ({ finishReason }) => {
+			stopWhen: isStepCount(5),
+			onStepEnd: (step) => metrics.onStep(step),
+			onToolExecutionEnd: (event) => metrics.onToolCallFinish(toolCallOutcome(event)),
+			onEnd: ({ finishReason }) => {
 				finished.push(metrics.finish("finished", { finishReason }));
 			},
 		});
@@ -142,8 +143,8 @@ describe("turn metrics", () => {
 			prompt: "Build",
 			tools,
 			maxRetries: 0,
-			stopWhen: stepCountIs(5),
-			onStepFinish: (step) => metrics.onStep(step),
+			stopWhen: isStepCount(5),
+			onStepEnd: (step) => metrics.onStep(step),
 			onError: ({ error }) => metrics.noteError(error),
 			onFinish: ({ finishReason }) => {
 				records.push(metrics.finish("finished", { finishReason }));
@@ -175,7 +176,7 @@ describe("turn metrics", () => {
 			),
 			prompt: "Build",
 			maxRetries: 0,
-			onStepFinish: (step) => metrics.onStep(step),
+			onStepEnd: (step) => metrics.onStep(step),
 			onError: ({ error }) => metrics.noteError(error),
 			onFinish: ({ finishReason }) => {
 				records.push(metrics.finish("finished", { finishReason }));
@@ -203,7 +204,7 @@ describe("turn metrics", () => {
 			}),
 			prompt: "Build",
 			maxRetries: 0,
-			onStepFinish: (step) => metrics.onStep(step),
+			onStepEnd: (step) => metrics.onStep(step),
 			onError: ({ error }) => metrics.noteError(error),
 			onFinish: () => {
 				finishCalled = true;
@@ -238,7 +239,7 @@ describe("turn metrics", () => {
 			),
 			prompt: "Build",
 			tools,
-			stopWhen: stepCountIs(5),
+			stopWhen: isStepCount(5),
 			abortSignal: controller.signal,
 			onStepFinish: (step) => {
 				metrics.onStep(step);
@@ -297,10 +298,10 @@ describe("turn metrics", () => {
 					execute: async () => ({ success: true }),
 				}),
 			},
-			stopWhen: stepCountIs(5),
-			onStepFinish: (step) => metrics.onStep(step),
-			experimental_onToolCallFinish: (event) => metrics.onToolCallFinish(event),
-			onFinish: ({ finishReason }) => {
+			stopWhen: isStepCount(5),
+			onStepEnd: (step) => metrics.onStep(step),
+			onToolExecutionEnd: (event) => metrics.onToolCallFinish(toolCallOutcome(event)),
+			onEnd: ({ finishReason }) => {
 				finished.push(metrics.finish("finished", { finishReason }));
 			},
 		});
@@ -488,6 +489,25 @@ describe("step timing", () => {
 			},
 		]);
 		expect(record?.modelWaitMs).toBe(11_500);
+	});
+
+	it("times a step's first chunk from the model's output, not the stream's step markers", () => {
+		const time = clock();
+		const metrics = newMetrics(time.now);
+		metrics.stepStarted({});
+		// AI SDK 7 hands every stream part to onChunk, its own markers included.
+		metrics.observeChunk("start-step");
+		time.advance(800);
+		metrics.observeChunk("text-start");
+		time.advance(200);
+		metrics.observeChunk("text-delta");
+		metrics.observeChunk("finish-step");
+		metrics.onStep({ usage: stepUsage(0) });
+
+		expect(metrics.finish("finished")?.stepTimings?.[0]).toMatchObject({
+			firstChunkMs: 1_000,
+			firstOutputMs: 1_000,
+		});
 	});
 
 	it("records a step that streamed nothing and one whose start was not observed", () => {

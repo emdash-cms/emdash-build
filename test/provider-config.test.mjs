@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderStudioWrangler, validateProviderConfig } from "../scripts/provider-config.mjs";
 
@@ -21,7 +22,37 @@ const config = {
 	identityDatabaseId: "11111111-1111-4111-8111-111111111111",
 };
 
+/** The deployed Worker's compatibility settings, as `wrangler.jsonc` declares them. */
+function workerCompatibility() {
+	const source = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+	const date = /"compatibility_date":\s*"([^"]+)"/.exec(source)?.[1];
+	const flags = /"compatibility_flags":\s*(\[[^\]]*\])/.exec(source)?.[1];
+	return { date, flags: flags ? JSON.parse(flags) : undefined };
+}
+
 describe("provider configuration", () => {
+	it("runs provider deployments on the Worker's compatibility date and flags", () => {
+		const wrangler = renderStudioWrangler(validateProviderConfig(config));
+		const worker = workerCompatibility();
+		// The same code: without enable_abortsignal_rpc, a Stop's signal cannot reach the Sandbox.
+		expect(worker.date).toBeDefined();
+		expect(wrangler.compatibility_date).toBe(worker.date);
+		expect(wrangler.compatibility_flags).toEqual(worker.flags);
+	});
+
+	it("leaves out nodejs_compat, which the compatibility date turns on", () => {
+		// On by default from 2026-08-04: workerd reports it as redundant, and Wrangler's setup leaves it out.
+		expect(workerCompatibility().date >= "2026-08-04").toBe(true);
+		expect(workerCompatibility().flags).not.toContain("nodejs_compat");
+	});
+
+	it("runs the worker tests on the Worker's compatibility date and flags", () => {
+		const source = readFileSync(new URL("../vitest.worker.config.ts", import.meta.url), "utf8");
+		const date = /compatibilityDate:\s*"([^"]+)"/.exec(source)?.[1];
+		const flags = /compatibilityFlags:\s*(\[[^\]]*\])/.exec(source)?.[1];
+		expect({ date, flags: flags ? JSON.parse(flags) : undefined }).toEqual(workerCompatibility());
+	});
+
 	it("renders provider-owned names, routes, and capacity", () => {
 		const wrangler = renderStudioWrangler(validateProviderConfig(config));
 		expect(wrangler).toMatchObject({

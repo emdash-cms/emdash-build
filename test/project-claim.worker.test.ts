@@ -6,7 +6,8 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import type { D1Migration } from "@cloudflare/vitest-pool-workers";
+import { isTerminalCloseEvent } from "agents/client";
+import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AccountAuthStore } from "../src/worker/account-auth.js";
 import { resolveOwner } from "../src/worker/owner-auth.js";
@@ -472,6 +473,8 @@ describe("guest project claiming", () => {
 		const agent = testEnv.BuilderAgent.getByName("55555555-5555-4555-8555-555555555555");
 		const closed = new Map<string, number | undefined>();
 		await runInDurableObject(agent, async (instance) => {
+			// Started first: the start broadcasts, which closes expired connections before the check below.
+			await instance.lifecycle.start();
 			const now = Date.now();
 			let active: Array<{
 				id: string;
@@ -521,6 +524,79 @@ describe("guest project claiming", () => {
 				["reconnect", 4404],
 			]),
 		);
+	});
+});
+
+describe("agent connection closes", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	/** A WebSocket connection's server side, recording the code it closes with. */
+	function fakeConnection(emdashAuth: VerifiedAgentAuth) {
+		const connection = {
+			id: "tab",
+			state: { emdashAuth },
+			closeCode: undefined as number | undefined,
+			close(code?: number) {
+				connection.closeCode = code;
+			},
+		};
+		return connection;
+	}
+
+	it("asks open tabs to reconnect when a claim moves the project to the account", async () => {
+		const guestKey = "guest:claimed-tab";
+		const accountKey = "account:claimed-tab";
+		const agent = testEnv.BuilderAgent.getByName("66666666-6666-4666-8666-000000000001");
+		await agent.initializeOwnership(guestKey);
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			const tab = fakeConnection({ ownerKey: guestKey, kind: "guest" });
+			Reflect.set(instance, "getConnections", () => [tab]);
+			const result = await instance.claimOwnership(guestKey, accountKey);
+			return { result, closeCode: tab.closeCode };
+		});
+		// The tab's cookie now names the account, so reconnecting is how it carries on.
+		expect(outcome.result).toBe("claimed");
+		expect(outcome.closeCode).toBeDefined();
+		expect(isTerminalCloseEvent({ code: outcome.closeCode } as CloseEvent)).toBe(false);
+	});
+
+	it("asks a tab to try again when its credential cannot be checked", async () => {
+		const guestKey = "guest:unchecked-tab";
+		const agent = testEnv.BuilderAgent.getByName("66666666-6666-4666-8666-000000000002");
+		await agent.initializeOwnership(guestKey);
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			await instance.lifecycle.start();
+			const env = Reflect.get(instance, "env") as { ProjectCatalog: unknown };
+			const catalog = env.ProjectCatalog;
+			env.ProjectCatalog = {
+				getByName: () => ({
+					authorizeActiveGuest: async () => {
+						throw new Error("The catalogue is unavailable.");
+					},
+				}),
+			};
+			try {
+				const tab = fakeConnection({ ownerKey: guestKey, kind: "guest" });
+				await instance.onMessage(
+					tab as unknown as Parameters<BuilderAgent["onMessage"]>[0],
+					JSON.stringify({ type: "cf_agent_state", state: {} }),
+				);
+				const response = await instance.onRequest(
+					withVerifiedAgentAuth(new Request("https://build.test/agents/BuilderAgent/x"), {
+						ownerKey: guestKey,
+						kind: "guest",
+					}),
+				);
+				return { closeCode: tab.closeCode, status: response.status };
+			} finally {
+				env.ProjectCatalog = catalog;
+			}
+		});
+		expect(outcome.closeCode).toBeDefined();
+		expect(isTerminalCloseEvent({ code: outcome.closeCode } as CloseEvent)).toBe(false);
+		expect(outcome.status).toBe(503);
 	});
 });
 

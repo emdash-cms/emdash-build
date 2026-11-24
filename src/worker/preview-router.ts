@@ -1,3 +1,5 @@
+import { isSiteDevOnlyRoute, siteRoutePath } from "./site-dev-routes.js";
+
 /**
  * Routes public preview hosts (`<port>-<project uuid>-<token>.<preview hostname>`)
  * to the project's Sandbox Durable Object. It runs first in the Worker, before
@@ -54,8 +56,15 @@ export async function routePreviewRequest(
 	request: Request,
 	env: Pick<Env, "Sandbox" | "PREVIEW_HOSTNAME">,
 ): Promise<Response | undefined> {
-	const route = parsePreviewHost(new URL(request.url), env.PREVIEW_HOSTNAME);
+	const url = new URL(request.url);
+	const route = parsePreviewHost(url, env.PREVIEW_HOSTNAME);
 	if (!route) return undefined;
+	// The site's dev-only routes are the container's alone, however the path is spelled.
+	const routePath = siteRoutePath(url);
+	if (routePath === null) return new Response("Bad request", { status: 400 });
+	if (isSiteDevOnlyRoute(routePath)) {
+		return new Response("Not found", { status: 404 });
+	}
 	const headers = new Headers(request.headers);
 	for (const name of PREVIEW_HEADERS) headers.delete(name);
 	headers.set(PREVIEW_PROXY_HEADER, "1");

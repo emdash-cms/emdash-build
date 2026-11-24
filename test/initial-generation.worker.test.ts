@@ -1,9 +1,11 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatResponseResult } from "@cloudflare/ai-chat";
+import { MockLanguageModelV3 } from "ai/test";
 import type { BuilderAgent } from "../src/worker/agent.js";
 import { BuildConvergence } from "../src/worker/build-convergence.js";
 import { shouldSkipSiteReadyTurn } from "../src/worker/turn-gate.js";
+import { TurnMetrics } from "../src/worker/turn-metrics.js";
 
 const testEnv = env as typeof env & { BuilderAgent: DurableObjectNamespace<BuilderAgent> };
 
@@ -15,6 +17,8 @@ describe("initial generation stop", () => {
 	it("stops only the matching unfinished generation and persists across DO access", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000008");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -35,9 +39,58 @@ describe("initial generation stop", () => {
 		});
 	});
 
+	it.each([
+		{ kind: "interview" as const, status: "preparing" },
+		{ kind: "holding" as const, status: "preparing" },
+		{ kind: "initial-build" as const, status: "failed" },
+	])(
+		"leaves the first generation $status after a(n) $kind reply errors",
+		async ({ kind, status }) => {
+			const id = {
+				interview: "000000000031",
+				holding: "000000000033",
+				"initial-build": "000000000032",
+			}[kind];
+			const agent = testEnv.BuilderAgent.getByName(`11111111-1111-4111-8111-${id}`);
+			const after = await runInDurableObject(agent, async (instance) => {
+				await instance.lifecycle.start();
+				instance.setState({
+					...instance.state,
+					siteReady: kind === "initial-build",
+					initialGeneration: {
+						id: "opening-brief",
+						status: kind === "initial-build" ? "building" : "preparing",
+					},
+				});
+				const harness = instance as unknown as {
+					activeInitialRequestId?: string;
+					openTurnMetrics: Map<string, TurnMetrics>;
+					onChatResponse(result: ChatResponseResult): Promise<void>;
+				};
+				harness.activeInitialRequestId = "reply-1";
+				harness.openTurnMetrics.set(
+					"reply-1",
+					new TurnMetrics({ turnId: "reply-1", kind, resumed: false, model: "test", stepCap: 1 }),
+				);
+				// The model's call failed: the chat SDK ends the reply with an error.
+				await harness.onChatResponse({
+					requestId: "reply-1",
+					status: "error",
+					continuation: false,
+					message: { id: "reply", role: "assistant", parts: [] },
+				} as ChatResponseResult);
+				return instance.state.initialGeneration?.status;
+			});
+			// Setup still finishes an errored interview's site and starts its build.
+			expect(after).toBe(status);
+		},
+	);
+
 	it("waits for provisioning and the active mutation before reporting stopped", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-000000000012");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "opening-brief", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 			];
@@ -147,6 +200,8 @@ describe("initial generation stop", () => {
 	it("anchors active Stop to its own user message when another tab has sent a newer one", async () => {
 		const agent = testEnv.BuilderAgent.getByName("11111111-1111-4111-8111-00000000000e");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the transcript it loads does not replace the one set here.
+			await instance.lifecycle.start();
 			instance.messages = [
 				{ id: "user-a", role: "user", parts: [{ type: "text", text: "Build a bakery" }] },
 				{ id: "user-b", role: "user", parts: [{ type: "text", text: "Add a menu" }] },
@@ -214,6 +269,8 @@ describe("initial generation stop", () => {
 				siteReady ? "11111111-1111-4111-8111-00000000000c" : "11111111-1111-4111-8111-00000000000b",
 			);
 			await runInDurableObject(agent, async (instance) => {
+				// Started first, so the transcript it loads does not replace the one set here.
+				await instance.lifecycle.start();
 				const assistant: ChatResponseResult["message"] = {
 					id: "interview",
 					role: "assistant",
@@ -299,5 +356,102 @@ describe("initial generation stop", () => {
 			});
 			expect(instance.state.initialGeneration?.terminalMessageId).toBe("user-a");
 		});
+	});
+});
+
+describe("a first build aborted mid-stream", () => {
+	beforeEach(async () => {
+		await reset();
+	});
+
+	const usage = {
+		inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+		outputTokens: { total: 1, text: 1, reasoning: 0 },
+	};
+
+	/** A step that calls a tool, so the build goes on to a second step. */
+	const toolStep = () =>
+		new ReadableStream({
+			start(controller) {
+				controller.enqueue({ type: "stream-start", warnings: [] });
+				controller.enqueue({
+					type: "tool-call",
+					toolCallId: "call-1",
+					toolName: "no_such_tool",
+					input: "{}",
+				});
+				controller.enqueue({
+					type: "finish",
+					finishReason: { unified: "tool-calls", raw: "tool_calls" },
+					usage,
+				});
+				controller.close();
+			},
+		});
+
+	/** A step whose tool input pads itself with whitespace and never ends. */
+	const runawayStep = () =>
+		new ReadableStream({
+			start(controller) {
+				controller.enqueue({ type: "stream-start", warnings: [] });
+				controller.enqueue({ type: "tool-input-start", id: "call-2", toolName: "write_file" });
+				controller.enqueue({
+					type: "tool-input-delta",
+					id: "call-2",
+					delta: `{${" ".repeat(5_000)}`,
+				});
+			},
+		});
+
+	it("fails, saves and clears a first build the runaway guard stops after a finished step", async () => {
+		const id = "11111111-1111-4111-8111-0000000000f4";
+		const agent = testEnv.BuilderAgent.getByName(id);
+		await agent.initializeOwnership(`guest-${id}`);
+		const outcome = await runInDurableObject(agent, async (instance) => {
+			await instance.persistMessages([
+				{ id: "brief", role: "user", parts: [{ type: "text", text: "Build a bakery site" }] },
+			]);
+			instance.setState({
+				...instance.state,
+				siteReady: true,
+				buildStarted: true,
+				initialBuildInFlight: true,
+				initialGeneration: { id: "brief", status: "building" },
+			});
+			const harness = instance as unknown as {
+				backupSite(): Promise<string | undefined>;
+				createTurnModel(): unknown;
+				getMcpServers(): unknown;
+				loadTemplateGuidance(): Promise<string | undefined>;
+				provisionSite(): Promise<{ ready: boolean }>;
+			};
+			harness.provisionSite = async () => ({ ready: true });
+			(
+				instance.mcp as { waitForConnections(options?: unknown): Promise<void> }
+			).waitForConnections = async () => {};
+			harness.getMcpServers = () => ({ prompts: [], resources: [], servers: {}, tools: [] });
+			harness.loadTemplateGuidance = async () => undefined;
+			let backups = 0;
+			harness.backupSite = async () => {
+				backups += 1;
+				return undefined;
+			};
+			let steps = 0;
+			harness.createTurnModel = () =>
+				new MockLanguageModelV3({
+					doStream: async () => ({ stream: steps++ === 0 ? toolStep() : runawayStep() }),
+				});
+
+			const reply = await instance.onChatMessage(async () => {}, { requestId: "runaway" });
+			await reply.text();
+			return {
+				steps,
+				status: instance.state.initialGeneration?.status,
+				inFlight: instance.state.initialBuildInFlight,
+				backups,
+			};
+		});
+
+		expect(outcome).toEqual({ steps: 2, status: "failed", inFlight: false, backups: 1 });
 	});
 });

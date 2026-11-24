@@ -20,8 +20,11 @@ try {
 	fail(`could not read ${path}: ${error instanceof Error ? error.message : String(error)}`);
 }
 
-const nodeMajor = Number(process.versions.node.split(".")[0]);
-if (nodeMajor < 24) fail(`Node 24+ is required; found ${process.versions.node}`);
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+// jsdom, which the unit tests run on, needs 24.15.
+if (nodeMajor < 24 || (nodeMajor === 24 && nodeMinor < 15)) {
+	fail(`Node 24.15+ is required; found ${process.versions.node}`);
+}
 if (!commandAvailable("docker", ["info"])) fail("a Docker-compatible daemon is required");
 if (!commandAvailable("pnpm", ["exec", "wrangler", "whoami"])) {
 	fail("Wrangler must be installed and authenticated");

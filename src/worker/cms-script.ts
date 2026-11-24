@@ -316,6 +316,8 @@ export class CmsScriptRun {
 					toolCallId: `${this.options.toolCallId}:${++this.seq}`,
 					messages: [],
 					abortSignal: this.signal,
+					// The CMS tools declare no context schema.
+					context: undefined,
 				});
 			})();
 			this.inFlight.add(call);
@@ -420,13 +422,11 @@ export class CmsScriptRun {
 			.execute(code, [
 				{ name: "cms", fns: fns as Record<string, (...args: unknown[]) => Promise<unknown>> },
 			])
-			.catch(
-				(error: unknown): ExecuteResult => ({
-					result: undefined,
-					// Past its first call, a program that ends here (such as at its CPU limit) has made changes.
-					error: `${this.calls > 0 ? "The program stopped" : "The program could not start"}: ${messageOf(error)}`,
-				}),
-			);
+			.catch((error: unknown): ExecuteResult => ({
+				result: undefined,
+				// Past its first call, a program that ends here (such as at its CPU limit) has made changes.
+				error: `${this.calls > 0 ? "The program stopped" : "The program could not start"}: ${messageOf(error)}`,
+			}));
 		let onAbort: (() => void) | undefined;
 		const stopped = new Promise<ExecuteResult & { stop: "aborted" }>((resolve) => {
 			onAbort = () => resolve({ result: undefined, error: "Stopped.", stop: "aborted" });

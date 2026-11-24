@@ -572,6 +572,39 @@ describe("build loop convergence", () => {
 		expect(convergence.hasUnresolvedFailures()).toBe(true);
 	});
 
+	it("carries none of its own notes from one step into the next", () => {
+		const convergence = new BuildConvergence();
+		const failure = { key: "media\0hero.jpg", toolName: "upload_media", error: "HTTP 404" };
+		convergence.recordUnresolvedFailure(failure);
+		const brief = { role: "user" as const, content: [{ type: "text" as const, text: "Build it" }] };
+		const forced = prepareBuildStep(convergence, [brief], ["upload_media"]);
+		expect(JSON.stringify(forced.messages)).toContain("Repair this failure now");
+
+		// AI SDK 7 hands a step's prepared messages, plus its response, to the next step.
+		convergence.resolveUnresolvedFailure(failure.key);
+		const reply = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Uploaded." }],
+		};
+		const next = prepareBuildStep(convergence, [...forced.messages, reply], ["upload_media"]);
+		expect(JSON.stringify(next.messages)).not.toContain("Repair this failure now");
+		expect(next.messages).toEqual([brief, reply]);
+
+		// A note still due appears once, however many steps carry it.
+		convergence.recordUnresolvedFailure({ ...failure, key: "media\0logo.png" });
+		let messages: typeof forced.messages = [brief];
+		for (let step = 0; step < 5; step++) {
+			messages = prepareBuildStep(convergence, messages, ["upload_media"]).messages;
+			convergence.finishStep({
+				toolResults: [{ toolName: "upload_media", output: { success: false } }],
+			});
+		}
+		const notes = (text: string) =>
+			messages.filter((message) => JSON.stringify(message).includes(text)).length;
+		expect(notes("stopped requiring repairs")).toBe(1);
+		expect(notes("Repair this failure now")).toBe(0);
+	});
+
 	it("tells the model which repairs it stopped being made to attempt", () => {
 		const convergence = new BuildConvergence();
 		convergence.recordUnresolvedFailure({
@@ -710,7 +743,11 @@ describe("preview context pruning", () => {
 							type: "content",
 							value: [
 								{ type: "text", text: "current" },
-								{ type: "file-data", data: "current-image", mediaType: "image/png" },
+								{
+									type: "file",
+									mediaType: "image/png",
+									data: { type: "data", data: "current-image" },
+								},
 							],
 						},
 					},

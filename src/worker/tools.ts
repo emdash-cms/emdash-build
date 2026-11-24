@@ -444,33 +444,92 @@ export { PluginBridge };
 const localOnlyDevRoutes = new Set([
 	"/_emdash/api/setup/dev-bypass",
 	"/_emdash/api/setup/dev-reset",
+	// EmDash 1.3+: the dev server runs scheduled maintenance through this route.
+	"/_emdash/api/dev/scheduled-tasks",
+	// What that maintenance published, which the builder reads to refresh its preview.
+	"/_emdash-build/scheduled-publishes",
 ]);
+// Counted here: EmDash's own maintenance route does not say what it published.
+// Kept on globalThis, which outlives the dev server's reloads of this module.
+const scheduledPublishes = ((
+	globalThis as { emdashBuildScheduledPublishes?: { boot: string; published: number } }
+).emdashBuildScheduledPublishes ??= { boot: "", published: 0 });
 const fetchHandler = handler.fetch;
 if (!fetchHandler) throw new Error("The EmDash Worker handler is missing fetch().");
+
+const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+
+/**
+ * Whether a request comes from inside the container. The preview sends public
+ * traffic to localhost too, so the public host shows only in X-Forwarded-Host.
+ */
+function isLoopbackRequest(request: Request, url: URL): boolean {
+	if (!loopbackHosts.has(url.hostname)) return false;
+	const forwarded = request.headers.get("X-Forwarded-Host");
+	if (!forwarded) return true;
+	return forwarded
+		.split(",")
+		.every((host) => loopbackHosts.has(host.trim().replace(/:\\d+$/, "").toLowerCase()));
+}
+
+/**
+ * The path Astro routes on, decoded until it stops changing, with \`\\\` read as
+ * \`/\`, dot segments resolved and repeated slashes collapsed, so \`//x\` and
+ * \`/a/%2e/x\` name the route they reach. Null when the path will not decode.
+ */
+function routePathOf(url: URL): string | null {
+	const parsed = new URL("http://localhost/");
+	let path = url.pathname;
+	for (let pass = 0; pass < 8; pass++) {
+		let decoded: string;
+		try {
+			decoded = decodeURIComponent(path);
+		} catch {
+			return null;
+		}
+		parsed.pathname = decoded;
+		const next = parsed.pathname.replace(/\\/{2,}/g, "/");
+		if (next === path) return next.length > 1 ? next.replace(/\\/$/, "") : next;
+		path = next;
+	}
+	return null;
+}
+
+/**
+ * Whether a path reaches a local-only route. Astro's dev server also routes
+ * \`<route>.html\` and \`<route>/index.html\` to a route, so any path that begins
+ * with one counts, in any letter case.
+ */
+function isLocalOnlyDevRoute(routePath: string): boolean {
+	const path = routePath.toLowerCase();
+	return [...localOnlyDevRoutes].some((route) => path.startsWith(route));
+}
 
 export default {
 	...handler,
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
-		let routePath = url.pathname;
-		for (let pass = 0; pass < 8; pass++) {
-			let decoded: string;
-			try {
-				decoded = decodeURIComponent(routePath);
-			} catch {
-				return new Response("Bad request", { status: 400 });
-			}
-			if (decoded === routePath) break;
-			if (pass === 7) return new Response("Bad request", { status: 400 });
-			routePath = decoded;
-		}
-		if (routePath.length > 1) routePath = routePath.replace(/\\/+$/, "");
-		if (
-			localOnlyDevRoutes.has(routePath) &&
-			url.hostname !== "localhost" &&
-			url.hostname !== "127.0.0.1"
-		) {
+		const routePath = routePathOf(url);
+		if (routePath === null) return new Response("Bad request", { status: 400 });
+		if (isLocalOnlyDevRoute(routePath) && !isLoopbackRequest(request, url)) {
 			return new Response("Not found", { status: 404 });
+		}
+		if (routePath === "/_emdash-build/scheduled-publishes") {
+			// Random values cannot be made at startup, so the first request names this run.
+			scheduledPublishes.boot ||= crypto.randomUUID();
+			return Response.json(scheduledPublishes, { headers: { "Cache-Control": "no-store" } });
+		}
+		if (
+			routePath === "/_emdash/api/dev/scheduled-tasks" &&
+			request.method === "POST" &&
+			import.meta.env.DEV
+		) {
+			// The sweep EmDash's route runs, keeping the count of what it published.
+			const { runScheduledTasks } = await import("emdash/middleware");
+			const { published } = await runScheduledTasks();
+			scheduledPublishes.boot ||= crypto.randomUUID();
+			scheduledPublishes.published += published.length;
+			return new Response(null, { status: 204 });
 		}
 		const response = await fetchHandler(request, env, ctx);
 		if (!response.headers.get("Content-Type")?.includes("text/html")) return response;
@@ -819,7 +878,8 @@ type PreviewModelOutput =
 	| {
 			type: "content";
 			value: Array<
-				{ type: "text"; text: string } | { type: "file-data"; data: string; mediaType: string }
+				| { type: "text"; text: string }
+				| { type: "file"; mediaType: string; data: { type: "data"; data: string } }
 			>;
 	  };
 
@@ -1175,6 +1235,8 @@ async function uploadOneMedia(
 	const safeName = (filename ?? "image").replace(/[^A-Za-z0-9._-]/g, "_");
 	const form = new FormData();
 	form.append("file", new File([bytes], safeName, { type: contentType }));
+	// EmDash 1.2 and later keep it as the media item's alt text; 1.1 ignores the field.
+	if (alt) form.append("alt", alt);
 	let upRes: Response;
 	let text: string;
 	try {
@@ -1422,19 +1484,17 @@ export function createTools(
 		callbacks.runSandboxRead ??
 		(<T>(operation: (sandbox: SandboxOps) => Promise<T>) => operation(currentSandbox()));
 	const convergence = options.convergence ?? new BuildConvergence(options.abortSignal);
-	// AI SDK 6 converts an intermediate tool result twice: once for the
-	// completed step and once for the next model request. Retain each image for
-	// both conversions, then release it. The result itself only contains a UUID,
-	// so screenshot bytes are never persisted in chat history. The optional
-	// callback keeps a bounded copy separately for the details UI.
+	// AI SDK 7 converts a tool result for the model once, and hands the same
+	// converted message to every later step. Retain each image until then, and
+	// release it. The result itself only contains a UUID, so screenshot bytes
+	// are never persisted in chat history. The optional callback keeps a
+	// bounded copy separately for the details UI.
 	const previewShots = new Map<
 		string,
 		{
 			base64: string;
 			mediaType: string;
 			revision: number;
-			conversions: number;
-			modelOutput?: PreviewModelOutput;
 		}
 	>();
 	const previewAcknowledgements = new Set<string>();
@@ -1467,14 +1527,10 @@ export function createTools(
 			base64: shot.base64,
 			mediaType: shot.mediaType,
 			revision: observation.revision,
-			conversions: 0,
 		});
 		return { shotId, revision: observation.revision };
 	};
-	/**
-	 * The model's view of a captured shot. The SDK converts a result twice, so
-	 * the bytes are kept for two conversions and then released.
-	 */
+	/** The model's view of a captured shot; the bytes go once the SDK has converted it. */
 	const deliverPreviewShot = (shotId: string): PreviewModelOutput => {
 		const shot = previewShots.get(shotId);
 		if (!shot) {
@@ -1483,43 +1539,35 @@ export function createTools(
 				value: "The preview screenshot could not be attached. Capture the current revision again.",
 			};
 		}
+		previewShots.delete(shotId);
 		if (!convergence.isObservationCurrent({ revision: shot.revision })) {
-			previewShots.delete(shotId);
 			return {
 				type: "error-text" as const,
 				value: "The site changed before the screenshot could be attached. Capture it again.",
 			};
 		}
-		if (shot.modelOutput) {
-			shot.conversions += 1;
-			const converted = shot.modelOutput;
-			if (shot.conversions >= 2) previewShots.delete(shotId);
-			return converted;
-		}
-		shot.conversions += 1;
 		const maxPreviewImages = options.maxPreviewImages ?? 1;
 		const isFinalPreview = convergence.hasCurrentValidation();
 		const canDeliverExploratory = exploratoryPreviewImagesDelivered < maxPreviewImages;
 		if (!options.previewImagesEnabled || (!isFinalPreview && !canDeliverExploratory)) {
-			shot.modelOutput = {
+			return {
 				type: "text" as const,
 				value:
 					"The exploratory screenshot budget is full. Validate the current revision, then call view_preview once for the final image.",
 			};
-			if (shot.conversions >= 2) previewShots.delete(shotId);
-			return shot.modelOutput;
 		}
-		if (!isFinalPreview && shot.conversions === 1) exploratoryPreviewImagesDelivered += 1;
-		const converted: PreviewModelOutput = {
+		if (!isFinalPreview) exploratoryPreviewImagesDelivered += 1;
+		return {
 			type: "content" as const,
 			value: [
 				{ type: "text" as const, text: PREVIEW_IMAGE_CAPTION },
-				{ type: "file-data" as const, data: shot.base64, mediaType: shot.mediaType },
+				{
+					type: "file" as const,
+					mediaType: shot.mediaType,
+					data: { type: "data" as const, data: shot.base64 },
+				},
 			],
 		};
-		shot.modelOutput = converted;
-		if (shot.conversions >= 2) previewShots.delete(shotId);
-		return converted;
 	};
 	const trackedMutation = async <T>(
 		operation: () => Promise<T>,
@@ -2459,7 +2507,7 @@ export function createTools(
 					return { success: true as const, ...captured };
 				}),
 			// Hand the first-build screenshot to the multimodal coordinator,
-			// not as JSON. `file-data` carries base64 image bytes inline.
+			// not as JSON. The `file` part carries base64 image bytes inline.
 			toModelOutput: ({ output }) => {
 				const o = output as
 					| { success: true; shotId: string; revision: number }

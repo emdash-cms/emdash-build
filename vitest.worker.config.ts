@@ -1,4 +1,4 @@
-import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 const migrations = await readD1Migrations("migrations");
@@ -8,8 +8,8 @@ export default defineConfig({
 		cloudflareTest({
 			main: "./src/worker/index.ts",
 			miniflare: {
-				compatibilityDate: "2026-03-24",
-				compatibilityFlags: ["nodejs_compat"],
+				compatibilityDate: "2026-11-17",
+				compatibilityFlags: ["enable_abortsignal_rpc"],
 				d1Databases: ["AUTH_DB"],
 				r2Buckets: ["SITE_MEDIA", "WFP_RELEASES"],
 				durableObjects: {

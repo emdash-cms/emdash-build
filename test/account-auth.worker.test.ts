@@ -1,5 +1,5 @@
 import { applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:test";
-import type { D1Migration } from "@cloudflare/vitest-pool-workers";
+import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { IdentityAdapter } from "../src/platform/identity.js";
 import {

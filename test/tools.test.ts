@@ -917,7 +917,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(exec).toHaveBeenCalledTimes(2);
 	});
 
-	it("keeps screenshot bytes through both AI SDK model-output conversions", async () => {
+	it("hands the model a screenshot once, then releases its bytes", async () => {
 		const capturePreview = vi.fn(async () => ({
 			ok: true as const,
 			base64: "cHJldmlldw==",
@@ -930,15 +930,16 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const convert = tools.view_preview.toModelOutput as (input: { output: unknown }) => unknown;
 
 		const first = convert({ output });
-		const second = convert({ output });
+		// AI SDK 7 converts a result once and reuses the message for every later step.
+		const later = convert({ output });
 
-		expect(first).toEqual(second);
 		expect(first).toMatchObject({
 			type: "content",
 			value: expect.arrayContaining([
-				expect.objectContaining({ type: "file-data", data: "cHJldmlldw==" }),
+				expect.objectContaining({ type: "file", data: { type: "data", data: "cHJldmlldw==" } }),
 			]),
 		});
+		expect(later).toMatchObject({ type: "error-text" });
 	});
 
 	it("stores a separate thumbnail without adding image bytes to the chat tool result", async () => {
@@ -1175,7 +1176,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const currentOutput = await viewPreview();
 		expect(convert({ output: currentOutput })).toMatchObject({
 			type: "content",
-			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
+			value: expect.arrayContaining([expect.objectContaining({ type: "file" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
 	});
@@ -1195,7 +1196,6 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		const convert = tools.view_preview.toModelOutput as (input: { output: unknown }) => unknown;
 
 		const captured = await viewPreview();
-		convert({ output: captured });
 		convert({ output: captured });
 		const cached = await viewPreview();
 		const finishMutation = convergence.beginMutation();
@@ -1233,7 +1233,6 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 
 		const exploratory = await viewPreview();
 		convert({ output: exploratory });
-		convert({ output: exploratory });
 		const finishMutation = convergence.beginMutation();
 		finishMutation();
 
@@ -1246,7 +1245,7 @@ declare module "emdash" { interface EmDashCollections { pages: { layout?: PageLa
 		expect(validated).toMatchObject({ success: true, preview: { shotId: expect.any(String) } });
 		expect(convertValidation({ output: validated })).toMatchObject({
 			type: "content",
-			value: expect.arrayContaining([expect.objectContaining({ type: "file-data" })]),
+			value: expect.arrayContaining([expect.objectContaining({ type: "file" })]),
 		});
 		expect(capturePreview).toHaveBeenCalledTimes(2);
 		expect(convergence.hasCurrentPreviewCapture()).toBe(true);
@@ -1401,6 +1400,32 @@ describe("image uploads", () => {
 		vi.stubGlobal("fetch", fetchMock);
 		return fetchMock;
 	}
+
+	it("sends each image's alt text with its upload", async () => {
+		const fetchMock = serveImages();
+		const tools = createTools({} as never, toolCallbacks() as never, {
+			apiToken: "test-token",
+			cmsBaseUrl: "https://site.example/",
+			imageSources: new ImageSources(),
+		});
+		const upload = tools.upload_media.execute as (input: {
+			images: Array<{ url: string; alt?: string }>;
+		}) => Promise<unknown>;
+
+		await expect(
+			upload({
+				images: [
+					{ url: "https://example.com/bread.jpg", alt: "A sourdough loaf on a board" },
+					{ url: "https://example.com/oven.jpg" },
+				],
+			}),
+		).resolves.toMatchObject({ success: true, uploaded: 2 });
+		const forms = fetchMock.mock.calls
+			.filter(([, init]) => init?.method === "POST")
+			.map(([, init]) => init!.body as FormData);
+		// EmDash 1.2 and later store it as the media item's alt text; 1.1 ignores the field.
+		expect(forms.map((form) => form.get("alt"))).toEqual(["A sourdough loaf on a board", null]);
+	});
 
 	it("refuses a stock photo written from memory, and never fetches it", async () => {
 		const fetchMock = serveImages();
@@ -2484,7 +2509,10 @@ describe("tools while a restore is unheard", () => {
 			() => unreported,
 		);
 		const update = () =>
-			tools.content_update.execute!({}, { toolCallId: "call", messages: [] }) as Promise<unknown>;
+			tools.content_update.execute!(
+				{},
+				{ toolCallId: "call", messages: [], context: undefined },
+			) as Promise<unknown>;
 
 		await expect(update()).rejects.toThrow(RESTORED);
 		expect(execute).not.toHaveBeenCalled();

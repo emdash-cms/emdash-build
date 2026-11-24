@@ -408,6 +408,74 @@ describe("Sandbox lifetime", () => {
 		});
 	});
 
+	it("refreshes the preview once each time EmDash publishes scheduled content", async () => {
+		await runInDurableObject(stub(), async (instance) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const base = Date.now();
+			vi.setSystemTime(base);
+			// What the site's worker has counted: a dev server restart starts a new run.
+			let count: unknown = { boot: "run-1", published: 0 };
+			const container = fakeContainer(async (request) =>
+				new URL(request.url).pathname === "/_emdash-build/scheduled-publishes"
+					? Response.json(count)
+					: new Response("live"),
+			);
+			install(instance, container);
+			await instance.ensureRunning();
+			let refreshFails = false;
+			const refreshPreviewAfterScheduledPublish = vi.fn(async () => {
+				if (refreshFails) throw new Error("BuilderAgent unavailable");
+			});
+			Reflect.set(Reflect.get(instance, "env") as object, "BuilderAgent", {
+				getByName: () => ({
+					refreshPreviewAfterScheduledPublish,
+					prepareSandboxStop: async () => ({ busy: false }),
+					markSandboxStopped: async () => {},
+				}),
+			});
+			const generation = instance.getPreviewGeneration();
+
+			await instance.alarm();
+			expect(refreshPreviewAfterScheduledPublish).not.toHaveBeenCalled();
+
+			count = { boot: "run-1", published: 2 };
+			await instance.alarm();
+			await instance.alarm();
+			expect(refreshPreviewAfterScheduledPublish).toHaveBeenCalledOnce();
+			// Visitors get a fresh render too, even before BuilderAgent re-renders.
+			expect(instance.getPreviewGeneration()).toBeGreaterThan(generation);
+
+			count = { boot: "run-2", published: 0 };
+			await instance.alarm();
+			expect(refreshPreviewAfterScheduledPublish).toHaveBeenCalledOnce();
+
+			// A refresh that fails is asked for again at the next alarm.
+			count = { boot: "run-2", published: 1 };
+			refreshFails = true;
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				await instance.alarm();
+			} finally {
+				warn.mockRestore();
+			}
+			refreshFails = false;
+			await instance.alarm();
+			await instance.alarm();
+			expect(refreshPreviewAfterScheduledPublish).toHaveBeenCalledTimes(3);
+
+			// A worker from before the count, or a dev server not up yet, says nothing.
+			count = "Not a count";
+			await instance.alarm();
+			expect(refreshPreviewAfterScheduledPublish).toHaveBeenCalledTimes(3);
+
+			// Reading the count is not activity: an idle container still stops.
+			count = { boot: "run-2", published: 1 };
+			vi.setSystemTime(base + 10 * 60_000);
+			await instance.alarm();
+			expect(container.state.running).toBe(false);
+		});
+	});
+
 	it("counts preview page loads as activity, but not HMR or CMS-connection traffic", async () => {
 		await runInDurableObject(stub(), async (instance) => {
 			vi.useFakeTimers({ toFake: ["Date"] });

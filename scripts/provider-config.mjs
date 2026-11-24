@@ -102,8 +102,9 @@ export function renderStudioWrangler(config) {
 	return {
 		$schema: "node_modules/wrangler/config-schema.json",
 		name: `${config.providerId}-emdash-build`,
-		compatibility_date: "2026-09-13",
-		compatibility_flags: ["nodejs_compat"],
+		// As in wrangler.jsonc: the same Worker code runs here.
+		compatibility_date: "2026-11-17",
+		compatibility_flags: ["enable_abortsignal_rpc"],
 		main: "./src/worker/index.ts",
 		observability: { enabled: true },
 		workers_dev: true,

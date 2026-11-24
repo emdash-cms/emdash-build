@@ -7,6 +7,7 @@ import {
 	PREVIEW_TOKEN_HEADER,
 } from "./preview-router.js";
 import { settleWithin } from "./preview-cache.js";
+import { SCHEDULED_PUBLISHES_PATH } from "./site-dev-routes.js";
 import { PreviewSnapshots, type PreviewRefreshResult } from "./preview-snapshots.js";
 import {
 	deletePortToken,
@@ -52,12 +53,27 @@ const PREVIEW_ACTIVITY_KEY = "v1:previewActivityAt";
  * could otherwise hold a container and its slot for good.
  */
 const PREVIEW_ONLY_MAX_MS = 2 * 60 * 60_000;
+/** How long the alarm waits on the site, then BuilderAgent, after a scheduled publish. */
+const SCHEDULED_PUBLISHES_ANSWER_MS = 5_000;
+const SCHEDULED_PUBLISHES_KEY = "v1:scheduledPublishes";
 const NAME_KEY = "v1:name";
 /** Where the 0.12 SDK kept the sandbox's name. */
 const LEGACY_NAME_KEY = "sandboxName";
 /** Close code for sockets of a container that stopped: the client should reconnect later. */
 const SERVICE_RESTART = 1012;
 const INSTANCE = { vcpu: 4, memoryMib: 12288, diskMb: 10240 };
+
+/** What the site's worker has counted since it started: `boot` names that run. */
+interface ScheduledPublishes {
+	boot: string;
+	published: number;
+}
+
+function isScheduledPublishes(value: unknown): value is ScheduledPublishes {
+	if (value === null || typeof value !== "object") return false;
+	const { boot, published } = value as Record<string, unknown>;
+	return typeof boot === "string" && boot !== "" && Number.isInteger(published);
+}
 
 function paused(message: string): Response {
 	return new Response(message, {
@@ -313,6 +329,9 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			await this.releaseSlot(name);
 			return;
 		}
+		await this.checkScheduledPublishes(name);
+		// Deleted meanwhile: deleteProjectData did the rest.
+		if (this.deleted) return;
 		const idleFor = Date.now() - (await this.lastActivity());
 		if (idleFor >= this.idleStopMs()) {
 			const lastActivity = await this.lastActivity();
@@ -330,6 +349,65 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 			container.setInactivityTimeout(SAFETY_INACTIVITY_MS),
 		);
 		if (!this.deleted) await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+	}
+
+	/**
+	 * EmDash publishes scheduled content by itself, about once a minute, and
+	 * nothing of it passes through the preview, so no snapshot would learn of
+	 * it. The site's worker counts what it published; a count that grew marks
+	 * every snapshot stale and has BuilderAgent re-render and reload the preview.
+	 * Reading the count is not activity: it must not keep an idle container.
+	 */
+	private async checkScheduledPublishes(name: string): Promise<void> {
+		const count = await this.readScheduledPublishes();
+		if (!count) return;
+		const seen = await this.ctx.storage.get<ScheduledPublishes>(SCHEDULED_PUBLISHES_KEY);
+		if (seen?.boot === count.boot && seen.published === count.published) return;
+		// A new run of the worker, after a dev server restart, counts from zero.
+		const grew = seen?.boot === count.boot ? count.published > seen.published : count.published > 0;
+		if (grew) {
+			this.previews.invalidatePreviewSnapshots();
+			const refreshed = await settleWithin(
+				this.env.BuilderAgent.getByName(name).refreshPreviewAfterScheduledPublish(),
+				SCHEDULED_PUBLISHES_ANSWER_MS,
+			);
+			if (refreshed.status !== "fulfilled") {
+				// Unrecorded, so the next alarm asks again.
+				console.warn(
+					"[Sandbox] could not refresh the preview after a scheduled publish:",
+					refreshed.status === "rejected" ? refreshed.reason : "no answer in time",
+				);
+				return;
+			}
+		}
+		// Nothing may be written back into a site deleted while BuilderAgent was asked.
+		if (!this.deleted) await this.ctx.storage.put(SCHEDULED_PUBLISHES_KEY, count);
+	}
+
+	/** The site worker's count, or undefined when its dev server does not give one. */
+	private async readScheduledPublishes(): Promise<ScheduledPublishes | undefined> {
+		const container = this.container();
+		if (!container?.running) return undefined;
+		const controller = new AbortController();
+		const read = (async () => {
+			const response = await container
+				.getTcpPort(4321)
+				.fetch(new URL(SCHEDULED_PUBLISHES_PATH, "http://localhost:4321"), {
+					signal: controller.signal,
+				});
+			// A dev server not up yet, or one started with an older worker.
+			if (!response.ok) {
+				await response.body?.cancel().catch(() => undefined);
+				return undefined;
+			}
+			const body: unknown = await response.json();
+			return isScheduledPublishes(body) ? body : undefined;
+		})();
+		const settled = await settleWithin(read, SCHEDULED_PUBLISHES_ANSWER_MS);
+		if (settled.status === "fulfilled") return settled.value;
+		controller.abort();
+		read.catch(() => undefined);
+		return undefined;
 	}
 
 	/** Wait on a container call, but go on, with a warning, if it fails or does not answer. */
@@ -630,7 +708,7 @@ export class Sandbox extends DurableObject<Env> implements SandboxOps {
 		// A stopped container serves the last good snapshot instead of waiting for a render.
 		if (!container?.running) return Promise.resolve(paused("The preview is paused."));
 		// The signal goes in fetch's own options: workerd ignores a Request's signal there.
-		return container.getTcpPort(4321).fetch(new URL(cachePath, "http://localhost:4321"), {
+		return container.getTcpPort(4321).fetch(new URL(`http://localhost:4321${cachePath}`), {
 			headers: { Accept: "text/html" },
 			redirect: "manual",
 			signal,

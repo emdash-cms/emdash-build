@@ -142,9 +142,10 @@ export function CloneCard({
 
 			{loading ? (
 				<span className="text-xs text-text-tertiary">Generating a clone link...</span>
-			) : error ? (
+			) : error || (info && !info.ok) ? (
+				// Every reason a link is not ready yet passes, so each offers Retry.
 				<div className="flex items-center gap-3">
-					<span className="text-xs text-text-secondary">{error}</span>
+					<span className="text-xs text-text-secondary">{error ?? info?.reason}</span>
 					<button
 						type="button"
 						onClick={() => void load()}
@@ -153,8 +154,6 @@ export function CloneCard({
 						Retry
 					</button>
 				</div>
-			) : info && !info.ok ? (
-				<span className="text-xs text-text-secondary">{info.reason}</span>
 			) : info?.command ? (
 				<>
 					<div>

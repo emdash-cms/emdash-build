@@ -539,6 +539,17 @@ export const PREVIEW_IMAGE_CAPTION =
 const OMITTED_PREVIEW_TEXT =
 	"A superseded preview image was omitted from the current build context.";
 
+/**
+ * The base64 bytes of a screenshot in a tool result: a `file` part with inline
+ * data, or the `file-data` part AI SDK 6 used.
+ */
+function previewImageData(item: { type: string; data?: unknown }): string | undefined {
+	if (item.type === "file-data") return typeof item.data === "string" ? item.data : undefined;
+	if (item.type !== "file" || typeof item.data !== "object" || item.data === null) return undefined;
+	const data = item.data as { type?: unknown; data?: unknown };
+	return data.type === "data" && typeof data.data === "string" ? data.data : undefined;
+}
+
 export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean): ModelMessage[] {
 	const imageLocations: Array<{ messageIndex: number; partIndex: number }> = [];
 	for (const [messageIndex, message] of messages.entries()) {
@@ -548,7 +559,7 @@ export function prunePreviewImages(messages: ModelMessage[], keepLatest: boolean
 				part.type !== "tool-result" ||
 				!PREVIEW_IMAGE_TOOLS.has(part.toolName) ||
 				part.output.type !== "content" ||
-				!part.output.value.some((item) => item.type === "file-data")
+				!part.output.value.some((item) => previewImageData(item) !== undefined)
 			) {
 				continue;
 			}
@@ -625,16 +636,17 @@ export function promoteLatestPreviewImage(
 			) {
 				continue;
 			}
-			const file = part.output.value.find((item) => item.type === "file-data");
-			if (!file || typeof file.data !== "string") continue;
+			const file = part.output.value.find((item) => previewImageData(item) !== undefined);
+			const data = file && previewImageData(file);
+			if (!file || data === undefined || !("mediaType" in file)) continue;
 			latest = {
 				text:
 					part.output.value
 						.filter((item): item is { type: "text"; text: string } => item.type === "text")
 						.map((item) => item.text)
 						.join("\n") || PREVIEW_USER_TEXT,
-				data: file.data,
-				mediaType: file.mediaType,
+				data,
+				mediaType: file.mediaType as string,
 			};
 		}
 	}
@@ -672,6 +684,26 @@ const ABANDONED_REPAIR_NOTE =
 const BYPASSED_REPAIR_NOTE =
 	"A later call of the same tool succeeded, but not as these failed calls; one may have been retried under another name or slug. Check each is covered (for example with content_list) before creating it again; otherwise say in your final summary what is still missing:";
 
+const FORCED_REPAIR_NOTE = "Repair this failure now with ";
+
+/**
+ * Drop the notes an earlier step added. AI SDK 7 hands a step's prepared
+ * messages on to the next step, so each step would otherwise keep every note
+ * before it, including a forced repair already done.
+ */
+function withoutBuilderNotes(messages: ModelMessage[]): ModelMessage[] {
+	return messages.filter((message) => {
+		if (message.role !== "user" || !Array.isArray(message.content)) return true;
+		const [part, ...rest] = message.content;
+		if (rest.length > 0 || part?.type !== "text") return true;
+		return !(
+			part.text.startsWith(FORCED_REPAIR_NOTE) ||
+			part.text.startsWith(ABANDONED_REPAIR_NOTE) ||
+			part.text.startsWith(BYPASSED_REPAIR_NOTE)
+		);
+	});
+}
+
 /**
  * Say which failure a forced step is for: two calls of one tool can fail the
  * same way, and a retry of the other would look like the repair.
@@ -683,7 +715,7 @@ function withForcedRepairNote(
 	// Keys end with what failed: a collection, locale and entry, or an image.
 	const subject = failure.key.split("\0").slice(1).filter(Boolean).join(" / ");
 	// "Repair", not "retry": a content_update of a missing entry is repaired with content_create.
-	const text = `Repair this failure now with ${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
+	const text = `${FORCED_REPAIR_NOTE}${failure.toolName}${subject ? `, for ${subject}` : ""}: ${failure.error.slice(0, 200)}`;
 	return [...messages, { role: "user", content: [{ type: "text", text }] }];
 }
 
@@ -729,7 +761,7 @@ export function prepareBuildStep<TOOL_NAME extends string>(
 	toolNames: readonly TOOL_NAME[],
 ): PreparedBuildStep<TOOL_NAME> {
 	const preparedPreview = promoteLatestPreviewImage(
-		messages,
+		withoutBuilderNotes(messages),
 		convergence.hasCurrentPreviewCapture(),
 	);
 	if (preparedPreview.promoted) {

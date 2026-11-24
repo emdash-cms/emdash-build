@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { parsePreviewHost, routePreviewRequest } from "../src/worker/preview-router.js";
+import { SITE_DEV_ONLY_ROUTES } from "../src/worker/site-dev-routes.js";
 
 const ID = "77777777-7777-4777-8777-777777777777";
 const HOST = "build.emdashcms.com";
@@ -99,6 +100,58 @@ describe("preview routing", () => {
 			"x-sandbox-preview-sandbox-id": ID,
 		});
 	});
+
+	it.each(
+		[...SITE_DEV_ONLY_ROUTES].flatMap((route) => {
+			const cut = route.lastIndexOf("/");
+			const [head, tail] = [route.slice(0, cut), route.slice(cut + 1)];
+			return [
+				route,
+				`/${route}`,
+				`${head}%5C${tail}`,
+				`${head}/%252e/${tail}/`,
+				route.toUpperCase(),
+				`${route}.html`,
+				`${route}/index.html`,
+				`${route}.htm%6c`,
+			];
+		}),
+	)("refuses %s without waking the Sandbox", async (path) => {
+		const { getByName, env } = sandbox();
+		for (const method of ["GET", "POST"]) {
+			const response = await routePreviewRequest(
+				new Request(`https://4321-${ID}-tok.${HOST}${path}?token=1`, { method }),
+				env,
+			);
+			expect(response?.status).toBe(404);
+		}
+		expect(getByName).not.toHaveBeenCalled();
+	});
+
+	it("refuses a path that will not decode without waking the Sandbox", async () => {
+		const { getByName, env } = sandbox();
+		const response = await routePreviewRequest(
+			new Request(`https://4321-${ID}-tok.${HOST}/100%`),
+			env,
+		);
+
+		expect(response?.status).toBe(400);
+		expect(getByName).not.toHaveBeenCalled();
+	});
+
+	it.each(["/_emdash/api/setup/status", "/_emdash/api/dev/emails", "/blog//first-post"])(
+		"forwards %s, which is not dev-only",
+		async (path) => {
+			const { fetch, env } = sandbox();
+			const response = await routePreviewRequest(
+				new Request(`https://4321-${ID}-tok.${HOST}${path}`),
+				env,
+			);
+
+			expect(await response?.text()).toBe("ok");
+			expect(fetch.mock.calls[0]![0].url).toBe(`https://4321-${ID}-tok.${HOST}${path}`);
+		},
+	);
 
 	it("keeps a request's method, body and WebSocket upgrade", async () => {
 		const { fetch, env } = sandbox();

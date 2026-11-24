@@ -144,6 +144,8 @@ describe("waiting for a sandbox slot", () => {
 	it("lets Stop end a follow-up whose site waits for a slot", async () => {
 		const agent = testEnv.BuilderAgent.getByName("99999999-9999-4999-8999-000000000004");
 		await runInDurableObject(agent, async (instance) => {
+			// Started first, so the call below runs at once rather than after the agent starts.
+			await instance.lifecycle.start();
 			const harness = instance as unknown as {
 				doRecoverSite: (hostname: string) => Promise<{ ready: boolean }>;
 				provisionSite: (hostname: string, signal?: AbortSignal) => Promise<unknown>;
